@@ -37,7 +37,7 @@ typedef struct {
 
 enum {
     Z8_LUT_OK, Z8_LUT_BAD_BUNDLE, Z8_LUT_BAD_SELECTION,
-    Z8_LUT_BAD_GEOMETRY, Z8_LUT_BAD_SPAN, Z8_LUT_BAD_LOOK
+    Z8_LUT_BAD_GEOMETRY, Z8_LUT_BAD_SPAN, Z8_LUT_BAD_LOOK, Z8_LUT_CANCELLED
 };
 
 uint32_t z8_lut_crc32(const void *, uint32_t);
@@ -47,6 +47,9 @@ void z8_lut_rgb(const Z8Look *, const uint8_t rgb[3], uint8_t output[3]);
 unsigned z8_lut_surface(const Z8Surface *, const Z8Look *);
 unsigned z8_lut_preview_build(const Z8Look *,uint64_t *table,uint32_t bytes);
 unsigned z8_lut_preview_surface(const Z8Surface *,const uint64_t *table,uint32_t bytes);
+unsigned z8_lut_surface_cancel(const Z8Surface *,const Z8Look *,const volatile uint32_t *cancel);
+unsigned z8_lut_preview_build_cancel(const Z8Look *,uint64_t *,uint32_t,const volatile uint32_t *cancel);
+unsigned z8_lut_preview_surface_cancel(const Z8Surface *,const uint64_t *,uint32_t,const volatile uint32_t *cancel);
 
 _Static_assert(sizeof(Z8LookEntry)==96, "look entry ABI");
 _Static_assert(sizeof(Z8LookBundle)==832, "bundle ABI");

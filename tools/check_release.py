@@ -107,6 +107,22 @@ SOURCE_FILES=(
     'z8prores/menu.py',
     'z8prores/package.py',
     'z8prores/patcher.py',
+    'photo_lut.py',
+    'resources/photo-lut.json',
+    'tests/photo_lut_native.c',
+    'tests/test_photo_lut.py',
+    'tests/test_photo_lut_hooks.py',
+    'tools/build_photo_lut_toolkit.py',
+    'tools/measure_photo_lut_kernel.py',
+    'z8photolut/__init__.py',
+    'z8photolut/cube.py',
+    'z8photolut/patcher.py',
+    'z8photolut/src/firmware.c',
+    'z8photolut/src/firmware.h',
+    'z8photolut/src/hooks.S',
+    'z8photolut/src/link.ld',
+    'z8photolut/src/lut.c',
+    'z8photolut/src/lut.h',
 )
 CODE_FILES=('resources/precapture.bin','resources/pixelshift.bin','resources/pixelshift-af.bin','resources/opengate.bin')
 MANIFEST='release-manifest.json'

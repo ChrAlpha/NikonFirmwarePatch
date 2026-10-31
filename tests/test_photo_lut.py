@@ -42,6 +42,9 @@ class PhotoLutTests(unittest.TestCase):
         cls.lib.z8_lut_surface.restype=C.c_uint
         cls.lib.z8_lut_preview_build.argtypes=[C.POINTER(Look),C.POINTER(C.c_uint64),C.c_uint32]
         cls.lib.z8_lut_preview_surface.argtypes=[C.POINTER(Surface),C.POINTER(C.c_uint64),C.c_uint32]
+        cls.lib.z8_lut_surface_cancel.argtypes=cls.lib.z8_lut_surface.argtypes+[C.POINTER(C.c_uint32)]
+        cls.lib.z8_lut_preview_build_cancel.argtypes=cls.lib.z8_lut_preview_build.argtypes+[C.POINTER(C.c_uint32)]
+        cls.lib.z8_lut_preview_surface_cancel.argtypes=cls.lib.z8_lut_preview_surface.argtypes+[C.POINTER(C.c_uint32)]
         cls.identity,_=bundle([parse(cube_text())],grid=17)
         cls.cycle,_=bundle([parse(cube_text(cycle=True))],grid=17)
 
@@ -124,6 +127,19 @@ class PhotoLutTests(unittest.TestCase):
             self.assertNotEqual(bytes(y),y_before)
             for row in range(height):self.assertEqual(bytes(y)[row*stride+width:(row+1)*stride],y_before[row*stride+width:(row+1)*stride])
             for row in range(height//divisor):self.assertEqual(bytes(uv)[row*stride+width:(row+1)*stride],uv_before[row*stride+width:(row+1)*stride])
+
+    def test_cancelled_work_never_writes_a_surface_or_table(self):
+        storage,look=self.native_look(self.cycle)
+        y=(C.c_uint8*64)(*range(64));uv=(C.c_uint8*32)(*range(32))
+        surface=Surface(y,uv,64,32,8,8,8,8,2)
+        cache=(C.c_uint64*(256*65*65))()
+        C.memset(cache,0x59,C.sizeof(cache))
+        before=(bytes(y),bytes(uv),bytes(cache))
+        cancel=C.c_uint32(1)
+        self.assertEqual(self.lib.z8_lut_surface_cancel(C.byref(surface),C.byref(look),C.byref(cancel)),6)
+        self.assertEqual(self.lib.z8_lut_preview_build_cancel(C.byref(look),cache,C.sizeof(cache),C.byref(cancel)),6)
+        self.assertEqual(self.lib.z8_lut_preview_surface_cancel(C.byref(surface),cache,C.sizeof(cache),C.byref(cancel)),6)
+        self.assertEqual((bytes(y),bytes(uv),bytes(cache)),before)
 
     def test_preview_cache_matches_rgb_reference_with_bounded_quantization(self):
         storage,look=self.native_look(self.cycle)

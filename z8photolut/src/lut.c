@@ -131,7 +131,7 @@ static inline __attribute__((always_inline)) void transform(const Z8Look *look,u
     for(unsigned c=0;c<3;c++) output[c]=(uint8_t)((result[c]*look->strength+original[c]*(256-look->strength)+128)>>8);
 }
 
-unsigned z8_lut_surface(const Z8Surface *f,const Z8Look *look)
+unsigned z8_lut_surface_cancel(const Z8Surface *f,const Z8Look *look,const volatile uint32_t *cancel)
 {
     if(!f || !f->width || !f->height || ((f->width|f->height)&1) ||
        f->width>16384 || f->height>8192 || f->y_stride<f->width || f->uv_stride<f->width ||
@@ -146,6 +146,7 @@ unsigned z8_lut_surface(const Z8Surface *f,const Z8Look *look)
     if(look->identity || !look->strength) return Z8_LUT_OK;
     const Z8Look selected=*look;
     for(unsigned row=0;row<f->height;row+=f->uv_divisor) {
+        if(cancel && __atomic_load_n(cancel,__ATOMIC_ACQUIRE)) return Z8_LUT_CANCELLED;
         uint8_t *chroma=f->uv+(uint64_t)(row/f->uv_divisor)*f->uv_stride;
         for(unsigned x=0;x<f->width;x+=2) {
             uint8_t u=chroma[x],v=chroma[x+1];
@@ -166,18 +167,22 @@ unsigned z8_lut_surface(const Z8Surface *f,const Z8Look *look)
     return Z8_LUT_OK;
 }
 
+unsigned z8_lut_surface(const Z8Surface *f,const Z8Look *look)
+{ return z8_lut_surface_cancel(f,look,0); }
+
 /* Preview cache keeps every 8-bit luma value and 65 chroma coordinates.
  * RGB LUT evaluation and color conversion occur once per selected look.
  * Three 8-bit outputs occupy independent16-bit lanes, allowing exact
  * rounded bilinear lane arithmetic with two64-bit multiplies per lerp.
  * JPEG continues to use the original per-pixel RGB tetrahedral transform. */
-unsigned z8_lut_preview_build(const Z8Look *look,uint64_t *table,uint32_t bytes)
+unsigned z8_lut_preview_build_cancel(const Z8Look *look,uint64_t *table,uint32_t bytes,const volatile uint32_t *cancel)
 {
     if(!table || ((uintptr_t)table&7) || bytes!=Z8_PREVIEW_TABLE_BYTES || !look ||
        !look->samples || look->strength!=256 || look->identity ||
        (look->grid!=17 && look->grid!=33 && look->grid!=65)) return Z8_LUT_BAD_LOOK;
     unsigned at=0;
     for(unsigned u=0;u<Z8_PREVIEW_GRID;u++) for(unsigned v=0;v<Z8_PREVIEW_GRID;v++) {
+        if(cancel && __atomic_load_n(cancel,__ATOMIC_ACQUIRE)) return Z8_LUT_CANCELLED;
         uint8_t cb=(uint8_t)(u==64?255:u*4),cr=(uint8_t)(v==64?255:v*4);
         for(unsigned y=0;y<256;y++) {
             uint8_t output[3];transform(look,(uint8_t)y,cb,cr,output);
@@ -187,40 +192,50 @@ unsigned z8_lut_preview_build(const Z8Look *look,uint64_t *table,uint32_t bytes)
     return Z8_LUT_OK;
 }
 
+unsigned z8_lut_preview_build(const Z8Look *look,uint64_t *table,uint32_t bytes)
+{ return z8_lut_preview_build_cancel(look,table,bytes,0); }
+
 static inline uint64_t preview_lerp(uint64_t a,uint64_t b,unsigned fraction)
 {
     return ((a*(256-fraction)+b*fraction+UINT64_C(0x008000800080))>>8)&UINT64_C(0x00ff00ff00ff);
 }
 
-unsigned z8_lut_preview_surface(const Z8Surface *f,const uint64_t *table,uint32_t bytes)
+unsigned z8_lut_preview_surface_cancel(const Z8Surface *f,const uint64_t *table,uint32_t bytes,const volatile uint32_t *cancel)
 {
     Z8Look off={0,17,1,0};
     unsigned error=z8_lut_surface(f,&off);
     if(error) return error;
     if(!table || ((uintptr_t)table&7) || bytes!=Z8_PREVIEW_TABLE_BYTES) return Z8_LUT_BAD_LOOK;
     for(unsigned row=0;row<f->height;row+=f->uv_divisor) {
+        if(cancel && __atomic_load_n(cancel,__ATOMIC_ACQUIRE)) return Z8_LUT_CANCELLED;
         uint8_t *chroma=f->uv+(uint64_t)(row/f->uv_divisor)*f->uv_stride;
         for(unsigned x=0;x<f->width;x+=2) {
             unsigned u=chroma[x],v=chroma[x+1];
             unsigned fu=u<252?(u&3)*64:((u-252)*256+1)/3;
             unsigned fv=v<252?(v&3)*64:((v-252)*256+1)/3;
             const uint64_t *base=table+(((u>>2)*65+(v>>2))*256);
-            uint32_t usum=0,vsum=0;
+            uint64_t sum=0;
             for(unsigned dy=0;dy<f->uv_divisor;dy++) {
                 uint8_t *luma=f->y+(uint64_t)(row+dy)*f->y_stride+x;
                 for(unsigned dx=0;dx<2;dx++) {
                     unsigned y=luma[dx];
-                    uint64_t low=preview_lerp(base[y],base[256+y],fv);
-                    uint64_t high=preview_lerp(base[65*256+y],base[66*256+y],fv);
-                    uint64_t result=preview_lerp(low,high,fu);
+                    uint64_t low=fv?preview_lerp(base[y],base[256+y],fv):base[y];
+                    uint64_t result=low;
+                    if(fu) {
+                        uint64_t high=fv?preview_lerp(base[65*256+y],base[66*256+y],fv):base[65*256+y];
+                        result=preview_lerp(low,high,fu);
+                    }
                     luma[dx]=(uint8_t)result;
-                    usum+=(result>>16)&255;vsum+=(result>>32)&255;
+                    sum+=result;
                 }
             }
-            unsigned count=2*f->uv_divisor;
-            chroma[x]=(uint8_t)((usum+count/2)/count);
-            chroma[x+1]=(uint8_t)((vsum+count/2)/count);
+            /* At most four 8-bit values occupy each16-bit lane. */
+            chroma[x]=(uint8_t)(((sum>>16)+f->uv_divisor)>>f->uv_divisor);
+            chroma[x+1]=(uint8_t)(((sum>>32)+f->uv_divisor)>>f->uv_divisor);
         }
     }
     return Z8_LUT_OK;
 }
+
+unsigned z8_lut_preview_surface(const Z8Surface *f,const uint64_t *table,uint32_t bytes)
+{ return z8_lut_preview_surface_cancel(f,table,bytes,0); }
