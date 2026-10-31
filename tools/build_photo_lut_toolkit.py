@@ -14,7 +14,7 @@ from z8photolut.patcher import compile_code
 from z8prores.package import require,sha
 
 SOURCES=(
-    'LICENSE','NOTICE.md','requirements.txt','photo_lut.py','verify.py',
+    'LICENSE','NOTICE.md','requirements.txt','photo_lut.py','verify.py','tools/check_photo_lut_capture.py',
     'resources/input.json','resources/photo-lut.json',
     'z8photolut/__init__.py','z8photolut/cube.py','z8photolut/patcher.py',
     'z8photolut/src/firmware.c','z8photolut/src/firmware.h','z8photolut/src/hooks.S',
