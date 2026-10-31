@@ -49,7 +49,7 @@ PRIVATE_THUMBNAIL=b'private JPEG thumbnail with a different length\xff\xd9'
 
 class NativeGraphMachine:
     def __init__(self,rom):
-        self.m=Uc(UC_ARCH_ARM64,UC_MODE_ARM)
+        self.m=Uc(UC_ARCH_ARM64,UC_MODE_ARM);self.tasks=[]
         self.m.mem_map(BASE,(len(rom)+4095)&~4095)
         self.m.mem_write(BASE,rom)
         self.m.mem_map(0xa02000000,0x2000000)
@@ -90,6 +90,16 @@ class NativeGraphMachine:
     def _instruction(self,machine,address,size,user):
         if address==0x40d2b940:
             pass
+        elif address==0x40d2c408:
+            # Isolated heap and OS event/task creation for the LUT JPEG worker
+            # that a transform reservation starts.
+            pointer=CAPTURE+0x80000+0x100*len(self.tasks);self.tasks.append(address)
+            machine.reg_write(regs.UC_ARM64_REG_X0,pointer)
+        elif address in (0x40d2bc28,0x40d2d498):
+            self.tasks.append(address)
+            machine.mem_write(machine.reg_read(regs.UC_ARM64_REG_X0),struct.pack('<i',100+len(self.tasks)))
+        elif address==0x40d2d5cc:
+            self.tasks.append(address)
         elif address==0x4127a900:
             target=machine.reg_read(regs.UC_ARM64_REG_X0)
             source=machine.reg_read(regs.UC_ARM64_REG_X1)

@@ -42,6 +42,27 @@ typedef struct {
     Z8PreviewSlot slots[Z8_PREVIEW_SLOTS];
 } Z8Preview;
 
+#define Z8_JPEG_JOBS 8u
+
+/* One JPEG copy/LUT request handed from its native encoder task to the
+ * photo LUT JPEG worker. The requester retains job ownership throughout. */
+typedef struct {
+    uint32_t state,error;
+    uint64_t sequence;
+    uint64_t source_y,source_uv;
+    Z8Surface surface;
+    Z8Look look;
+} Z8JpegJob;
+
+typedef struct {
+    uint64_t worker;                    /* retained task block and wake event */
+    uint32_t worker_id,worker_state;
+    uint32_t event_ready,alive;
+    uint32_t submit_lock,queue_peak;
+    uint64_t sequence,submitted,completed,start_failures,waits;
+    Z8JpegJob jobs[Z8_JPEG_JOBS];
+} Z8JpegWorker;
+
 typedef struct {
     uint64_t magic;
     uint32_t version, bytes, choice, strength, ready, error;
@@ -54,6 +75,7 @@ typedef struct {
     uint32_t jpeg_busy,cache_cleanup_lock;
     uint64_t jpeg_previews_applied,jpeg_preview_pixels,jpeg_preview_rejected;
     uint32_t jpeg_preview_error,reserved;
+    Z8JpegWorker jpeg;
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)
@@ -82,5 +104,7 @@ void z8_photo_lut_menu_ok(void *context);
 int z8_photo_lut_photo_refresh(void *page);
 _Static_assert(offsetof(Z8LutState,preview)==120,"telemetry prefix ABI");
 _Static_assert(sizeof(Z8PreviewSlot)==256,"preview slot ABI");
+_Static_assert(sizeof(Z8JpegJob)==112,"JPEG job ABI");
+_Static_assert(offsetof(Z8JpegWorker,jobs)==72,"JPEG worker ABI");
 _Static_assert(sizeof(Z8LutState)<=4096,"private runtime region");
 #endif

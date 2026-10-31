@@ -51,6 +51,7 @@ class NativeOutputMachine:
         self.allocations=[]
         self.frees=[]
         self.constructed=[]
+        self.tasks=[]
         self.native_bytes=0
         self.m.mem_map(BASE,(len(rom)+4095)&~4095)
         self.m.mem_write(BASE,rom)
@@ -128,6 +129,15 @@ class NativeOutputMachine:
             self._return(pointer)
         elif address in (0x40d2c448,0x40d2c674,0x40d2c660,0x41050d1c,0x41051a70,0x41047a00,0x40d2b9c8):
             self._return(1)
+        elif address in (0x40d2bc28,0x40d2d498):
+            # Isolated OS event/task creation for the LUT JPEG worker that a
+            # transform reservation starts; record it, return a valid id.
+            self.tasks.append(address)
+            machine.mem_write(x0,struct.pack('<i',100+len(self.tasks)))
+            self._return()
+        elif address==0x40d2d5cc:
+            self.tasks.append(address)
+            self._return()
         elif address==0x4127ab40:
             value=machine.reg_read(regs.UC_ARM64_REG_X1)&255
             length=machine.reg_read(regs.UC_ARM64_REG_X2)

@@ -69,7 +69,7 @@ def compile_code(compiler='clang-19'):
     layout=dict(zip(('state_bytes','preview_offset','slots_offset','slot_bytes','request_offset','channel_offset',
                      'cache_resource_offset','paused_offset','apply_sequence_offset','flags_offset',
                      'apply_counter_offset','display_epoch_offset','slot_count','power_paused_offset',
-                     'jpeg_busy_offset','jpeg_preview_offset'),struct.unpack_from('<16I',raw,offset)))
+                     'jpeg_busy_offset','jpeg_preview_offset','jpeg_worker_offset'),struct.unpack_from('<17I',raw,offset)))
     return raw,symbols,dict(sha256=sha(raw),bytes=len(raw),flags=flags,
         compiler=subprocess.check_output([cc,'--version'],text=True).splitlines()[0],
         sources=sources,runtime_layout=layout)

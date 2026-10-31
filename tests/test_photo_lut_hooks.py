@@ -36,6 +36,137 @@ except ImportError:
     Uc=None
 
 
+class NativeScheduler:
+    """Priority-preemptive per-CPU task model over one Unicorn engine.
+
+    Each round, every CPU runs its highest-priority runnable task for a bounded
+    instruction slice (one tick). Native sleep and event waits block the caller
+    and return control here; the task later resumes at its return address.
+    Task, event and heap services are recorded stubs at their C3.11 addresses.
+    Smaller numbers are higher priority, as in the native kernel.
+    """
+    SLEEP,WAIT,SET,CREATE,START,EVENT,ALLOC,FREE=(0x40d2d654,0x40d2bdac,0x40d2bc8c,0x40d2d498,
+                                                0x40d2d5cc,0x40d2bc28,0x40d2c408,0x40d2c448)
+    STOP=0x65000000
+
+    def __init__(self,m,stacks,heap=0xa11000000):
+        self.m=m;self.tasks=[];self.current=None;self.round=0;self.stacks=list(stacks)
+        self.heap=heap;self.created=[];self.events={};self.sets=[];self.on_sleep=None
+        self.fail=dict(alloc=0,event=0,create=0);self.allocations=[];self.event_calls=[];self.create_calls=[];self.starts=[]
+        m.mem_map(0x40d2b000,4096);m.mem_map(0x40d2e000,4096);m.mem_map(heap,0x10000)
+        for at in (self.SLEEP,self.WAIT,self.SET,self.CREATE,self.START,self.EVENT,self.ALLOC,self.FREE):
+            m.mem_write(at,bytes.fromhex('c0035fd6'))
+        m.hook_add(UC_HOOK_CODE,self._service)
+
+    def task(self,name,cpu,priority,pc,arguments=()):
+        context=self.m.context_save()
+        task=dict(name=name,cpu=cpu,priority=priority,state='ready',wake=0,event=None,
+                  slices=[],sleeps=0,finished=False)
+        self.m.reg_write(regs.UC_ARM64_REG_PC,pc)
+        self.m.reg_write(regs.UC_ARM64_REG_SP,self.stacks.pop(0))
+        self.m.reg_write(regs.UC_ARM64_REG_X30,self.STOP)
+        for index,value in enumerate(arguments):self.m.reg_write(getattr(regs,f'UC_ARM64_REG_X{index}'),value)
+        task['context']=self.m.context_save();self.m.context_restore(context)
+        self.tasks.append(task)
+        return task
+
+    def _return(self,value=None):
+        if value is not None:self.m.reg_write(regs.UC_ARM64_REG_X0,value)
+        self.m.reg_write(regs.UC_ARM64_REG_PC,self.m.reg_read(regs.UC_ARM64_REG_X30))
+
+    def _block(self,state,value=1):
+        self.current['state']=state;self._return(value);self.m.emu_stop()
+
+    def _service(self,uc,at,size,user):
+        x=lambda i:uc.reg_read(getattr(regs,f'UC_ARM64_REG_X{i}'))
+        if at==self.SLEEP:
+            self.current['sleeps']+=1;self.current['wake']=self.round+max(1,x(0))
+            if self.on_sleep:self.on_sleep(self.current)
+            self._block('sleep')
+        elif at==self.WAIT:
+            event=struct.unpack('<i',uc.mem_read(x(0),4))[0]
+            if self.events.get(event,0)&x(1):self.events[event]&=~x(1);self._return(1)
+            else:self.current['event']=(event,x(1));self._block('wait')
+        elif at==self.SET:
+            event=struct.unpack('<i',uc.mem_read(x(0),4))[0]
+            self.events[event]=self.events.get(event,0)|x(1)
+            self.sets.append((self.current['name'] if self.current else None,event,x(1),self.round));self._return(1)
+        elif at==self.EVENT:
+            identifier=300+len(self.events)
+            if self.fail['event']:self.fail['event']-=1;identifier=-0x22
+            else:self.events[identifier]=x(1)
+            self.event_calls.append(identifier)
+            uc.mem_write(x(0),struct.pack('<i',identifier));self._return()
+        elif at==self.CREATE:
+            raw=bytes(uc.mem_read(x(2),28))
+            cpu,priority,stack=struct.unpack_from('<3I',raw)
+            record=dict(cpu=cpu,priority=priority,stack=stack,attribute=raw[12],
+                        name=raw[13:].split(b'\0')[0].decode(),entry=x(1),block=x(0))
+            if self.fail['create']:self.fail['create']-=1;identifier=-0x22
+            else:identifier=self.create_identifier(record)
+            self.create_calls.append(identifier)
+            if identifier>0:self.created.append(record)
+            uc.mem_write(x(0),struct.pack('<i',identifier));self._return()
+        elif at==self.START:
+            self.starts.append(struct.unpack('<i',uc.mem_read(x(0),4))[0])
+            record=next(r for r in self.created if r['block']==x(0))
+            context=uc.context_save()
+            self.task(record['name'],record['cpu'],record['priority'],record['entry'],(x(1),))
+            uc.context_restore(context);self._return()
+        elif at==self.ALLOC:
+            if self.fail['alloc']:self.fail['alloc']-=1;self.allocations.append(0);self._return(0);return
+            pointer=self.heap;self.heap+=(x(0)+63)&~63;self.allocations.append(pointer);self._return(pointer)
+        elif at==self.FREE:
+            self._return()
+
+    def create_identifier(self,record):
+        return 100+len(self.create_calls)
+
+    def runnable(self,task):
+        if task['finished']:return False
+        if task['state']=='sleep':return self.round>=task['wake']
+        if task['state']=='wait':
+            event,bits=task['event']
+            return bool(self.events.get(event,0)&bits)
+        return True
+
+    def run(self,until,tick=4000,rounds=2000):
+        """Each round is one tick of `tick` instructions per CPU. A task that
+        blocks leaves the rest of its tick to lower-priority runnable tasks."""
+        for self.round in range(rounds):
+            if until():return
+            for cpu in sorted({t['cpu'] for t in self.tasks}):
+                budget=tick() if callable(tick) else tick
+                while budget>0:
+                    ready=[t for t in self.tasks if t['cpu']==cpu and self.runnable(t)]
+                    if not ready:break
+                    task=min(ready,key=lambda t:t['priority'])
+                    if task['state']=='wait':
+                        event,bits=task['event'];self.events[event]&=~bits
+                    task['state']='ready';self.current=task
+                    self.m.context_restore(task['context'])
+                    executed=[0]
+                    counter=self.m.hook_add(UC_HOOK_CODE,lambda uc,a,s,u:executed.__setitem__(0,executed[0]+1))
+                    self.m.emu_start(self.m.reg_read(regs.UC_ARM64_REG_PC),self.STOP,count=budget)
+                    self.m.hook_del(counter)
+                    budget-=executed[0]
+                    task['slices'].append((self.round,executed[0]))
+                    if self.m.reg_read(regs.UC_ARM64_REG_PC)==self.STOP:
+                        task['finished']=True;task['result']=self.m.reg_read(regs.UC_ARM64_REG_X0)
+                    task['context']=self.m.context_save()
+                    self.current=None
+                    if task['state']=='ready' and not task['finished']:break
+        raise AssertionError('Native tasks did not reach the expected state')
+
+
+# A periodic lower-priority CPU1 service: count one unit of progress, then
+# sleep one tick. x19 keeps the counter pointer across the native call.
+SERVICE=0x40d2e000
+def service_code():
+    return (struct.pack('<5I',0xaa0003f3,0xb9400261,0x11000421,0xb9000261,0x52800020)+
+            patcher.branch(SERVICE+20,NativeScheduler.SLEEP,True)+patcher.branch(SERVICE+24,SERVICE+4))
+
+
 @unittest.skipIf(Uc is None,'Unicorn is required for AArch64 hook ABI checks')
 class PhotoLutHookTests(unittest.TestCase):
     @classmethod
@@ -290,7 +421,14 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(len(waited),1)
         self.assertEqual(int.from_bytes(m.mem_read(cleanup,4),'little'),0)
 
-    def jpeg_fixture(self,selected=1,capacity=None,available=True,jpeg_enabled=True):
+    SERVICE_COUNTER=0xa0301f800
+    PRIVATE=0x820001000
+    SOURCE=bytes([100])*64+bytes([100,180])*32
+    FILTERED=bytes([71])*64+bytes([186,129])*32
+
+    STACKS=(0xa03015000,0xa03017800,0xa0301a000,0xa0301c800,0xa0301f000)
+
+    def jpeg_fixture(self,selected=1,capacity=None,available=True,jpeg_enabled=True,fail=None,width=8,height=8):
         from z8photolut.cube import parse,bundle
         m,state,slot,request,stack,original,before,ids=self.fixture()
         rows=['TITLE "Cycle"','LUT_3D_SIZE 2']+['%d %d %d'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1)]
@@ -311,7 +449,12 @@ class PhotoLutQueueTests(unittest.TestCase):
         footer=raw+0x400000000+capacity-128
         if footer>=raw+0x400000000+8192:m.mem_map(footer&~4095,4096)
         m.mem_write(0xa03d482ba,bytes([selected]))
-        allocations=[];freed=[];encodes=[]
+        allocations=[];freed=[];encodes=[];self.encode_log=[]
+        pixels=width*height
+        self.source=bytes([100])*pixels+bytes([100,180])*(pixels//2)
+        self.filtered=bytes([71])*pixels+bytes([186,129])*(pixels//2)
+        self.scheduler=NativeScheduler(m,self.STACKS)
+        if fail:self.scheduler.fail[fail]=1
         def native(uc,at,size,user):
             if at==0x41047478:
                 allocations.append(tuple(uc.reg_read(getattr(regs,f'UC_ARM64_REG_X{i}')) for i in range(3)))
@@ -325,10 +468,18 @@ class PhotoLutQueueTests(unittest.TestCase):
                 desc=int.from_bytes(uc.mem_read(params+8,8),'little')
                 planes=struct.unpack('<2Q',uc.mem_read(desc+24,16))
                 encodes.append((uc.reg_read(regs.UC_ARM64_REG_X0),desc,planes))
-                self.assertEqual(bytes(uc.mem_read(0xc10000000,128)),bytes([100])*64+bytes([100,180])*32)
+                # The NEF/native source is never modified by the LUT path, and
+                # every private Y/UV byte equals the exact LUT result.
+                self.assertEqual(bytes(uc.mem_read(0xc10000000,len(self.source))),self.source)
+                private=None
                 if planes[0]!=0x810000000:
-                    self.assertEqual(bytes(uc.mem_read(planes[0]+0x400000000,128)),bytes([71])*64+bytes([186,129])*32)
-                    self.assertEqual(int.from_bytes(uc.mem_read(state+self.metadata['runtime_layout']['jpeg_busy_offset'],4),'little'),1)
+                    whole=bytes(uc.mem_read(planes[0]+0x400000000,len(self.filtered)))
+                    self.assertEqual(whole,self.filtered)
+                    private=whole[:128]
+                    self.assertGreaterEqual(int.from_bytes(uc.mem_read(state+self.metadata['runtime_layout']['jpeg_busy_offset'],4),'little'),1)
+                task=self.scheduler.current['name'] if self.scheduler and self.scheduler.current else None
+                self.encode_log.append(dict(task=task,planes=planes,private=private,round=self.scheduler.round,
+                    service=int.from_bytes(uc.mem_read(self.SERVICE_COUNTER,4),'little')))
                 # Native inline control changes must reach the original caller.
                 uc.mem_write(params+0x24,struct.pack('<I',0x12345678))
                 output=int.from_bytes(uc.mem_read(params+0x10,8),'little')
@@ -343,10 +494,67 @@ class PhotoLutQueueTests(unittest.TestCase):
         parameters=0xa03008000;descriptor=parameters+0x100
         m.mem_write(parameters+8,struct.pack('<2Q',descriptor,owner+0x38))
         image=bytearray(0x28);struct.pack_into('<I',image,0,1)
-        struct.pack_into('<2H',image,8,8,8);struct.pack_into('<2H',image,16,8,8)
-        struct.pack_into('<2Q',image,24,0x810000000,0x810000040);m.mem_write(descriptor,bytes(image))
-        m.mem_write(0xc10000000,bytes([100])*64+bytes([100,180])*32)
+        struct.pack_into('<2H',image,8,width,width);struct.pack_into('<2H',image,16,width,height)
+        struct.pack_into('<2Q',image,24,0x810000000,0x810000000+width*height);m.mem_write(descriptor,bytes(image))
+        m.mem_write(0xc10000000,self.source)
         return m,state,stack,parameters,descriptor,bytes(image),allocations,freed,encodes,allocation,footer
+
+    def preview_request(self,m,owner,kind,parameters=0xa03008800):
+        """A medium/small JPEG request for the same capture as the main JPEG."""
+        descriptor=parameters+0x100;capture=0xa03002000
+        m.mem_write(capture+0x6a8,struct.pack('<Q',owner))
+        image=bytearray(0x28);struct.pack_into('<I',image,0,1)
+        struct.pack_into('<2H',image,8,8,8);struct.pack_into('<2H',image,16,8,8)
+        struct.pack_into('<2Q',image,24,0x810000000,0x810000040)
+        m.mem_write(descriptor,bytes(image))
+        m.mem_write(parameters+8,struct.pack('<2Q',descriptor,owner+(0xc0 if kind==1 else 0xa0)))
+        private=self.PRIVATE+8256*5504*2+(1920*1080*2 if kind==2 else 0)
+        try:m.mem_map((private+0x400000000)&~4095,8192)
+        except Exception:pass # Already mapped for the same capture.
+        return parameters,capture,private
+
+    def run_jpeg(self,m,requests,service=True,on_sleep=None,heavy=False,tick=4000,rounds=2000):
+        """Native encoder tasks at priority22 (CPU1 unless given) and an optional
+        CPU1 priority30 periodic service, as observed for STGJPEGB and EXMCUSRV."""
+        scheduler=self.scheduler;scheduler.on_sleep=on_sleep
+        jobs=[scheduler.task(request[0],request[3] if len(request)>3 else 1,22,self.symbols[request[1]],request[2])
+              for request in requests]
+        if service:
+            m.mem_write(SERVICE,service_code())
+            scheduler.task('service',1,30,SERVICE,(self.SERVICE_COUNTER,))
+        executed={}
+        if heavy:
+            # Instructions per task in the full-surface CPU paths: the shared
+            # LUT kernel and the copy/cache routine feeding it. Geometry
+            # validation alone enters the kernel briefly before its pixel loop.
+            names=sorted(self.symbols.items(),key=lambda item:item[1])
+            ranges={name:(address,names[index+1][1]) for index,(name,address) in enumerate(names)
+                    if name in ('jpeg_worker','z8_lut_surface_cancel')}
+            def count(uc,at,size,user):
+                if not scheduler.current:return
+                for name,(first,end) in ranges.items():
+                    if first<=at<end:
+                        key=(scheduler.current['name'],name);executed[key]=executed.get(key,0)+1
+            m.hook_add(UC_HOOK_CODE,count)
+        scheduler.run(lambda:all(job['finished'] for job in jobs),tick=tick,rounds=rounds)
+        return scheduler,jobs,executed
+
+    def assert_full_surface_work(self,executed,performers):
+        """Only `performers` copy or transform pixels; others at most validate."""
+        for (task,name),instructions in executed.items():
+            if name=='jpeg_worker':self.assertEqual(task,'PhotoJPG')
+            elif task not in performers:self.assertLess(instructions,100,(task,name))
+        for task in performers:
+            self.assertGreater(executed.get((task,'z8_lut_surface_cancel'),0),2000,task)
+
+    def jpeg_worker_state(self,m,state):
+        base=state+self.metadata['runtime_layout']['jpeg_worker_offset']
+        fields=struct.unpack('<Q2I4I5Q',m.mem_read(base,72))
+        record=dict(zip(('worker','id','state','event_ready','alive','submit_lock','peak','sequence','submitted',
+                         'completed','start_failures','waits'),fields))
+        record['jobs']=[struct.unpack('<IIQ',m.mem_read(base+72+i*112,16)) for i in range(8)]
+        record['job_states']=[job[0] for job in record['jobs']]
+        return record
 
     def test_main_jpeg_uses_owned_copy_and_preserves_nef_source_while_power_paused(self):
         m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
@@ -356,8 +564,8 @@ class PhotoLutQueueTests(unittest.TestCase):
         m.mem_write(preview+layout['power_paused_offset'],struct.pack('<I',1))
         # A menu change after reservation does not alter this capture's look.
         m.mem_write(0xa03d482ba,b'\0')
-        self.call(m,'z8_photo_lut_jpeg',stack,x0=0,x1=params)
-        self.assertEqual(m.reg_read(regs.UC_ARM64_REG_X0),1)
+        _,jobs,_=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
+        self.assertEqual(jobs[0]['result'],1)
         self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,1,64))
         self.assertEqual(int.from_bytes(m.mem_read(state+layout['jpeg_busy_offset'],4),'little'),0)
         self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
@@ -368,12 +576,186 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(freed,[]) # The native output owner retains the tail.
         self.assertEqual(int.from_bytes(m.mem_read(footer,8),'little'),0x3154504f4c385a4a)
 
+    def test_full_surface_work_runs_in_low_priority_worker_while_cpu1_services_progress(self):
+        # 64x32 keeps the worker's LUT computation busy for many ticks.
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(width=64,height=32)
+        scheduler=self.scheduler
+        # The transform reservation started exactly one worker: below every
+        # native C3.11 priority (2..40), CPU3, attribute byte zero, name at +13.
+        self.assertEqual([(r['cpu'],r['priority'],r['stack'],r['attribute'],r['name']) for r in scheduler.created],
+                         [(3,48,16384,0,'PhotoJPG')])
+        self.assertGreater(scheduler.created[0]['priority'],40)
+        self.assertEqual(scheduler.starts,[scheduler.create_calls[0]])
+        scheduler,jobs,heavy=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],heavy=True)
+        self.assertEqual(jobs[0]['result'],1)
+        self.assert_full_surface_work(heavy,{'PhotoJPG'})
+        # The lower-priority CPU1 service advanced while the encoder task
+        # waited; the native encoder call itself stayed with the requester.
+        self.assertEqual([(row['task'],row['private']) for row in self.encode_log],[('STGJPEGB',self.filtered[:128])])
+        # Sustained fairness: the periodic priority30 service (the EXMCUSRV
+        # role) completed a period in essentially every tick the request was
+        # outstanding, not just once.
+        submitted=[row[3] for row in scheduler.sets if row[0]=='STGJPEGB'][0]
+        encoded=self.encode_log[0]['round']
+        self.assertGreaterEqual(encoded-submitted,20)
+        self.assertGreaterEqual(self.encode_log[0]['service'],encoded-1)
+        requester=jobs[0]
+        self.assertGreater(requester['sleeps'],0)
+        self.assertLess(max(count for _,count in requester['slices'][1:]),600)
+        worker=self.jpeg_worker_state(m,state)
+        self.assertEqual((worker['state'],worker['event_ready'],worker['alive'],worker['submit_lock']),(2,1,1,0))
+        self.assertEqual((worker['sequence'],worker['submitted'],worker['completed'],worker['start_failures'],worker['peak']),(1,1,1,0,1))
+        self.assertEqual(worker['job_states'],[0]*8)
+        self.assertEqual(int.from_bytes(m.mem_read(state+self.metadata['runtime_layout']['jpeg_busy_offset'],4),'little'),0)
+
+    def test_concurrent_jpeg_jobs_do_not_monopolize_cpu1(self):
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+        medium,capture,private=self.preview_request(m,owner,1)
+        scheduler,jobs,heavy=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params)),
+                                              ('STGPJPEG','z8_photo_lut_medium',(0,medium,capture,0))],heavy=True)
+        self.assertEqual([job['result'] for job in jobs],[1,1])
+        self.assertEqual(len(scheduler.created),1)
+        self.assert_full_surface_work(heavy,{'PhotoJPG'})
+        self.assertEqual(sorted(row['task'] for row in self.encode_log),['STGJPEGB','STGPJPEG'])
+        self.assertEqual(sorted(row['planes'][0] for row in self.encode_log),sorted([self.PRIVATE,private]))
+        self.assertEqual([row['private'] for row in self.encode_log],[self.FILTERED]*2)
+        # Equal-priority encoders both block: the service still progresses.
+        self.assertGreaterEqual(min(row['service'] for row in self.encode_log),1)
+        for job in jobs:self.assertLess(max(count for _,count in job['slices'][1:]),600,job['name'])
+        worker=self.jpeg_worker_state(m,state)
+        self.assertEqual((worker['submitted'],worker['completed'],worker['start_failures'],worker['peak']),(2,2,0,2))
+        self.assertEqual(worker['job_states'],[0]*8)
+        statistics=state+self.metadata['runtime_layout']['jpeg_preview_offset']
+        self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,1,64))
+        self.assertEqual(struct.unpack('<3Q',m.mem_read(statistics,24)),(1,64,0))
+
+    def served_order(self,m,state):
+        """Sequence of each request at the moment the worker starts its pixels."""
+        base=state+self.metadata['runtime_layout']['jpeg_worker_offset']+72;served=[]
+        def observe(uc,at,size,user):
+            if self.scheduler.current and self.scheduler.current['name']=='PhotoJPG':
+                rows=[struct.unpack('<IIQ',uc.mem_read(base+i*112,16)) for i in range(8)]
+                running=[sequence for status,error,sequence in rows if status==3]
+                self.assertEqual(len(running),1)
+                served.append(running[0])
+        m.hook_add(UC_HOOK_CODE,observe,begin=self.symbols['z8_lut_surface_cancel'],end=self.symbols['z8_lut_surface_cancel'])
+        return served
+
+    def test_requests_are_served_in_exact_publication_order_under_parallel_preemption(self):
+        import random
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                rng=random.Random(seed)
+                m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+                medium,capture,_=self.preview_request(m,owner,1)
+                small,_,_=self.preview_request(m,owner,2,parameters=0xa03008c00)
+                # Encoders on three CPUs with ticks of a few instructions, so a
+                # producer can be preempted anywhere, including between its
+                # sequence assignment and publication or mid worker scan.
+                requests=[('STGJPEGB','z8_photo_lut_jpeg',(0,params),1),
+                          ('STGPJPEG','z8_photo_lut_medium',(0,medium,capture,0),2),
+                          ('STGJPEGA','z8_photo_lut_small',(0,small,capture,0),3)]
+                rng.shuffle(requests)
+                served=self.served_order(m,state)
+                scheduler,jobs,_=self.run_jpeg(m,requests,service=False,tick=lambda:rng.randint(3,40),rounds=100000)
+                self.assertEqual([job['result'] for job in jobs],[1,1,1])
+                self.assertEqual(served,[1,2,3])
+                self.assertEqual([row['private'] for row in self.encode_log],[self.FILTERED]*3)
+                worker=self.jpeg_worker_state(m,state)
+                self.assertEqual((worker['sequence'],worker['completed'],worker['submit_lock']),(3,3,0))
+                self.assertEqual(worker['job_states'],[0]*8)
+
+    def test_worker_start_failure_refuses_transform_reservation_and_retry_reuses_resources(self):
+        for step in ('alloc','event','create'):
+            with self.subTest(step=step):
+                m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(fail=step)
+                scheduler=self.scheduler
+                # Refused before the native pool allocation: the ordinary
+                # native allocation-failure path, with no task started.
+                self.assertEqual(owner,0)
+                self.assertEqual(allocations,[])
+                self.assertEqual(scheduler.starts,[])
+                worker=self.jpeg_worker_state(m,state)
+                self.assertEqual((worker['state'],worker['start_failures'],worker['id']),(0,1,0))
+                # Steps that completed are retained, never leaked or repeated.
+                self.assertEqual(worker['worker']!=0,step!='alloc')
+                self.assertEqual(worker['event_ready'],int(step=='create'))
+                self.call(m,'z8_photo_lut_output_alloc',stack,x0=42,x1=0x38,x2=4096,x3=0xa03000000)
+                self.assertEqual(m.reg_read(regs.UC_ARM64_REG_X0),0xa03009000)
+                self.assertEqual(len(allocations),1)
+                self.assertEqual([a for a in scheduler.allocations if a],[worker['worker'] or scheduler.allocations[-1]])
+                self.assertEqual([e for e in scheduler.event_calls if e>0],scheduler.event_calls[-1:])
+                self.assertEqual(len(scheduler.event_calls),2 if step=='event' else 1 if step!='alloc' else 1)
+                self.assertEqual(len(scheduler.create_calls),2 if step=='create' else 1)
+                # Started once, only with a positive task id from a fresh create.
+                self.assertEqual(scheduler.starts,[scheduler.create_calls[-1]])
+                self.assertGreater(scheduler.starts[0],0)
+                worker=self.jpeg_worker_state(m,state)
+                self.assertEqual((worker['state'],worker['start_failures'],worker['event_ready']),(2,1,1))
+                _,jobs,heavy=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],heavy=True)
+                self.assertEqual(jobs[0]['result'],1)
+                self.assert_full_surface_work(heavy,{'PhotoJPG'})
+                self.assertEqual([row['private'] for row in self.encode_log],[self.FILTERED])
+
+    def test_identity_and_off_reservations_do_not_start_the_worker(self):
+        for selected in (0,2):
+            with self.subTest(selected=selected):
+                self.jpeg_fixture(selected)
+                self.assertEqual((self.scheduler.created,self.scheduler.allocations,self.scheduler.event_calls),([],[],[]))
+
+    def test_transform_without_running_worker_never_runs_inline(self):
+        # Unreachable through admission; the guard must not restore the
+        # starving inline path even if the invariant were violated.
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+        base=state+self.metadata['runtime_layout']['jpeg_worker_offset']
+        m.mem_write(base+12,struct.pack('<I',0))
+        scheduler,jobs,heavy=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False,heavy=True)
+        self.assertEqual(jobs[0]['result'],1)
+        self.assert_full_surface_work(heavy,set())
+        self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,0,0))
+        self.assertEqual(int.from_bytes(m.mem_read(state+92,4),'little'),7) # jpeg_error: Z8_LUT_NO_WORKER
+        self.assertEqual(self.jpeg_worker_state(m,state)['submitted'],0)
+
+    def test_queued_request_survives_shutdown_and_mode_quiescing(self):
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+        layout=self.metadata['runtime_layout'];preview=state+layout['preview_offset']
+        saved=0xa03007800;m.mem_write(saved,struct.pack('<Q',0x05020102)+bytes(248))
+        control=[]
+        def quiesce(task):
+            # Power-off notification (and its mode/pool transition entry) and a
+            # separate mode transition arrive while the request is outstanding.
+            if control or task['name']!='STGJPEGB':return
+            control.append(self.scheduler.task('BSShutdown',2,10,self.symbols['z8_photo_lut_shutdown'],(saved,)))
+            control.append(self.scheduler.task('mode',2,12,self.symbols['z8_photo_lut_mode_enter']))
+        scheduler,jobs,heavy=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False,
+                                           on_sleep=quiesce,heavy=True,tick=1500)
+        self.assertEqual(jobs[0]['result'],1)
+        self.assertTrue(all(task['finished'] for task in control))
+        # Both quiescing calls completed while the request was still queued
+        # or running, without cancelling or waiting for it.
+        self.assertLess(max(task['slices'][-1][0] for task in control),self.encode_log[0]['round'])
+        self.assertEqual(int.from_bytes(m.mem_read(preview+layout['power_paused_offset'],4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(preview+layout['paused_offset'],4),'little'),2)
+        self.assert_full_surface_work(heavy,{'PhotoJPG'})
+        self.assertEqual([row['private'] for row in self.encode_log],[self.FILTERED])
+        self.assertEqual(self.jpeg_worker_state(m,state)['job_states'],[0]*8)
+        self.assertEqual(freed,[])
+
+    def test_preview_worker_name_uses_native_task_parameter_layout(self):
+        m,state,slot,request,stack,original,before,ids=self.fixture()
+        scheduler=NativeScheduler(m,[0xa03011800,0xa0301b800]);self.scheduler=scheduler
+        preview=state+self.metadata['runtime_layout']['preview_offset']
+        task=scheduler.task('caller',1,22,self.symbols['preview_start_worker'],(preview,))
+        scheduler.run(lambda:task['finished'])
+        self.assertEqual(task['result'],1)
+        self.assertEqual([(r['cpu'],r['priority'],r['attribute'],r['name']) for r in scheduler.created],[(2,40,0,'PhotoLUT')])
+
     def test_off_and_identity_snapshot_do_not_allocate_full_surface_or_transform(self):
         for selected in (0,2):
             with self.subTest(selected=selected):
                 m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(selected)
                 m.mem_write(0xa03d482ba,b'\x01')
-                self.call(m,'z8_photo_lut_jpeg',stack,x0=1,x1=params)
+                scheduler,jobs,_=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(1,params))],service=False)
                 self.assertEqual(encodes,[(1,desc,(0x810000000,0x810000040))])
                 self.assertEqual(allocations,[(42,0x38,4224)])
                 self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,0,0))
@@ -395,22 +777,16 @@ class PhotoLutQueueTests(unittest.TestCase):
                 self.assertEqual(encodes,[])
 
     def test_small_jpeg_variants_use_separate_slices_and_nef_selectors_bypass(self):
-        for name,kind,offset in (('medium',1,0xc0),('small',2,0xa0)):
+        for name,kind in (('medium',1),('small',2)):
             for selector in (0,1,2):
                 with self.subTest(name=name,selector=selector):
                     m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
-                    capture=0xa03002000
-                    m.mem_write(capture+0x6a8,struct.pack('<Q',owner))
-                    m.mem_write(params+0x10,struct.pack('<Q',owner+offset))
-                    relative=8256*5504*2+(1920*1080*2 if kind==2 else 0)
-                    private=0x820001000+relative
-                    m.mem_map((private+0x400000000)&~4095,8192)
-                    self.call(m,'z8_photo_lut_'+name,stack,x0=0,x1=params,x2=capture,x3=selector)
+                    request,capture,private=self.preview_request(m,owner,kind)
+                    self.run_jpeg(m,[('STGPJPEG','z8_photo_lut_'+name,(0,request,capture,selector))],service=False)
                     self.assertEqual(encodes[0][2],(private,private+64) if selector==0 else (0x810000000,0x810000040))
                     statistics=state+self.metadata['runtime_layout']['jpeg_preview_offset']
                     self.assertEqual(struct.unpack('<3Q',m.mem_read(statistics,24)),(1,64,0) if selector==0 else (0,0,0))
-                    self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
-                    self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
+                    self.assertEqual(bytes(m.mem_read(request+0x100,0x28)),image)
                     self.assertEqual(len(allocations),1)
                     self.assertEqual(freed,[])
 
@@ -425,15 +801,13 @@ class PhotoLutQueueTests(unittest.TestCase):
         lock=footer+96+3*4
         m.mem_write(lock,struct.pack('<I',1))
         waited=[]
-        def release_other_user(uc,at,size,user):
-            if at==0x40d2d654:
-                self.assertEqual(encodes,[])
-                self.assertEqual(int.from_bytes(uc.mem_read(lock,4),'little'),1)
-                waited.append(at);uc.mem_write(lock,bytes(4))
-                uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
-        m.hook_add(UC_HOOK_CODE,release_other_user)
-        self.call(m,'z8_photo_lut_thumbnail',stack,x0=0,x1=params)
-        self.assertEqual(len(waited),1)
+        def release_other_user(task):
+            if waited:return
+            self.assertEqual(encodes,[])
+            self.assertEqual(int.from_bytes(m.mem_read(lock,4),'little'),1)
+            waited.append(task['name']);m.mem_write(lock,bytes(4))
+        self.run_jpeg(m,[('STGPJPEG','z8_photo_lut_thumbnail',(0,params))],service=False,on_sleep=release_other_user)
+        self.assertEqual(waited,['STGPJPEG'])
         self.assertEqual([row[2] for row in encodes],[(0x810000000,0x810000040),(private,private+64)])
         self.assertEqual(int.from_bytes(m.mem_read(original_output+0x10,4),'little'),129)
         self.assertEqual(int.from_bytes(m.mem_read(footer+64+0x10,4),'little'),130)
@@ -445,6 +819,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
         self.assertEqual(len(allocations),1)
         self.assertEqual(freed,[])
+
 
     def test_trim_only_frees_unowned_uncached_allocations(self):
         m,state,slot,request,stack,original,before,ids=self.fixture()

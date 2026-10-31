@@ -7,7 +7,8 @@ __attribute__((used)) const uint32_t z8_photo_lut_runtime_layout[]={
     offsetof(Z8Preview,cache_resource),offsetof(Z8Preview,paused),
     offsetof(Z8PreviewSlot,apply_sequence),offsetof(Z8PreviewSlot,flags),
     offsetof(Z8Preview,applies),offsetof(Z8Preview,display_epoch),Z8_PREVIEW_SLOTS,
-    offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy),offsetof(Z8LutState,jpeg_previews_applied)
+    offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy),offsetof(Z8LutState,jpeg_previews_applied),
+    offsetof(Z8LutState,jpeg)
 };
 
 /* Clang may lower fixed aggregate copies to memcpy in freestanding code. */
@@ -79,6 +80,9 @@ static void clean(const void *address,uint64_t bytes)
 #define POOL_MODE UINT64_C(0xa03f31a68)
 enum { SLOT_FREE,SLOT_WRITING,SLOT_PENDING,SLOT_TRANSFORM,SLOT_READY,SLOT_QUEUED,SLOT_ORPHAN };
 enum { SLOT_SUBMITTED=1,SLOT_APPLIED=2,SLOT_MAY_APPLY=4 };
+/* 40d2d498 parameters: CPU class, priority, stack bytes, one attribute byte
+ * (zero for every native task), then the NUL-terminated task name. */
+#define TASK_NAME 13
 typedef struct { uint8_t task[64];int32_t event[4]; } PreviewWorker;
 static int cache_pins(volatile const Z8PreviewSlot *slot);
 
@@ -287,7 +291,7 @@ static int preview_start_worker(volatile Z8Preview *p)
     if(!worker) { p->allocation_failed++;return 0; }
     for(unsigned i=0;i<sizeof(*worker);i++) ((uint8_t *)worker)[i]=0;
     uint32_t parameters[7]={2,40,16384,0,0,0,0};
-    copy_bytes((char *)parameters+12,"PhotoLUT",8);
+    copy_bytes((char *)parameters+TASK_NAME,"PhotoLUT",8);
     TASK_CREATE(worker->task,preview_worker,parameters);
     if(*(int32_t *)worker<=0) { FREE(worker);p->worker_error=2;return 0; }
     p->worker=(uintptr_t)worker;p->worker_id=*(uint32_t *)worker;
@@ -615,6 +619,161 @@ void z8_photo_lut_boot(void)
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
+/* Copy the native source into the lease scratch and apply the capture's
+ * look. The NEF/native source is only read; the encoder sees cleaned lines. */
+static unsigned jpeg_work(const Z8Surface *f,uint8_t *source_y,uint8_t *source_uv,const Z8Look *look)
+{
+    invalidate(source_y,f->y_bytes);invalidate(source_uv,f->uv_bytes);
+    invalidate(f->y,f->y_bytes+f->uv_bytes);
+    copy_bytes(f->y,source_y,(uint32_t)f->y_bytes);copy_bytes(f->uv,source_uv,(uint32_t)f->uv_bytes);
+    unsigned error=z8_lut_surface(f,look);
+    clean(f->y,f->y_bytes+f->uv_bytes);
+    return error;
+}
+
+/* Native encoder tasks share CPU1 with UI, MCU and service tasks of lower
+ * priority; a full-resolution transform there starves them for seconds.
+ * One dedicated task below every native C3.11 priority (2..40) performs the
+ * CPU work on CPU3 using otherwise idle time, and is never stopped.
+ *
+ * Lifetime of a queued request: its scratch lies in the capture's pool0x38
+ * output owner and its source in that capture's native buffers. The calling
+ * encoder task stays inside the native image job until the request is DONE,
+ * so output release and BSShutdown (which waits for the image job) cannot
+ * precede it. The native mode transition (41046538..41046598) destroys a pool
+ * only when 40cdafa0 reports it entirely free; a pool with this owner live is
+ * marked busy and kept. Preview pause and power quiescing never touch jobs. */
+#define JPEG_WORKER_CPU 3
+#define JPEG_WORKER_PRIORITY 48
+enum { JPEG_WORKER_ABSENT,JPEG_WORKER_CREATING,JPEG_WORKER_RUNNING };
+enum { JOB_FREE,JOB_FILLING,JOB_QUEUED,JOB_RUNNING,JOB_DONE };
+
+static void jpeg_worker(void *argument)
+{
+    PreviewWorker *worker=argument;
+    volatile Z8JpegWorker *w=&Z8_STATE->jpeg;
+    /* Sequences are contiguous from 1 per boot and each is published before
+     * the next is assigned. Serving only the exact next one is therefore
+     * strict publication order: observing any later request (acquire) makes
+     * the earlier publication visible, so the rescan never waits for it. */
+    uint64_t next=1;
+    __atomic_store_n(&w->alive,1,__ATOMIC_RELEASE);
+    for(;;) {
+        volatile Z8JpegJob *job=0;
+        unsigned later=0;
+        for(unsigned i=0;i<Z8_JPEG_JOBS && !job;i++) {
+            volatile Z8JpegJob *candidate=&w->jobs[i];
+            if(__atomic_load_n(&candidate->state,__ATOMIC_ACQUIRE)!=JOB_QUEUED) continue;
+            if(candidate->sequence==next) job=candidate;
+            else later=1;
+        }
+        if(!job) {
+            if(!later) EVENT_WAIT(worker->event,1,0,1000);
+            continue;
+        }
+        next++;
+        __atomic_store_n(&job->state,JOB_RUNNING,__ATOMIC_RELAXED);
+        Z8Surface f;Z8Look look;
+        copy_bytes(&f,(const void *)&job->surface,sizeof(f));
+        copy_bytes(&look,(const void *)&job->look,sizeof(look));
+        job->error=jpeg_work(&f,(uint8_t *)(uintptr_t)job->source_y,(uint8_t *)(uintptr_t)job->source_uv,&look);
+        __atomic_fetch_add(&w->completed,1,__ATOMIC_RELAXED);
+        __atomic_store_n(&job->state,JOB_DONE,__ATOMIC_RELEASE);
+    }
+}
+
+/* Called while reserving a capture that will need a LUT JPEG transform; a
+ * capture is admitted only with the worker running. Never sleeps: if another
+ * task is starting it, or a step fails, the reservation fails into native
+ * allocation retry. Completed steps (task block, wake event, created task)
+ * stay recorded here and are reused by the next attempt, so a failure never
+ * orphans resources. 40d2d5cc discards the OS start result; 401855e0 fails
+ * only for an ISR caller, an id below one or a non-dormant task, all excluded
+ * for this freshly created task started from task context. */
+static int jpeg_worker_start(void)
+{
+    volatile Z8JpegWorker *w=&Z8_STATE->jpeg;
+    uint32_t expected=JPEG_WORKER_ABSENT;
+    if(__atomic_load_n(&w->worker_state,__ATOMIC_ACQUIRE)==JPEG_WORKER_RUNNING) return 1;
+    if(!__atomic_compare_exchange_n(&w->worker_state,&expected,JPEG_WORKER_CREATING,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return 0;
+    PreviewWorker *worker=(PreviewWorker *)(uintptr_t)w->worker;
+    if(!worker && (worker=ALLOC(sizeof(*worker),0))) {
+        for(unsigned i=0;i<sizeof(*worker);i++) ((uint8_t *)worker)[i]=0;
+        w->worker=(uintptr_t)worker;
+    }
+    if(worker && !w->event_ready) {
+        EVENT_CREATE(worker->event,0,1,"PhotoJPG");
+        w->event_ready=worker->event[0]>0;
+    }
+    if(worker && w->event_ready && !w->worker_id) {
+        uint32_t parameters[7]={JPEG_WORKER_CPU,JPEG_WORKER_PRIORITY,16384,0,0,0,0};
+        copy_bytes((char *)parameters+TASK_NAME,"PhotoJPG",8);
+        TASK_CREATE(worker->task,jpeg_worker,parameters);
+        if(*(int32_t *)worker>0) w->worker_id=*(uint32_t *)worker;
+    }
+    if(w->worker_id) {
+        TASK_START(worker->task,worker);
+        __atomic_store_n(&w->worker_state,JPEG_WORKER_RUNNING,__ATOMIC_RELEASE);
+        return 1;
+    }
+    __atomic_fetch_add(&w->start_failures,1,__ATOMIC_RELAXED);
+    __atomic_store_n(&w->worker_state,JPEG_WORKER_ABSENT,__ATOMIC_RELEASE);
+    return 0;
+}
+
+/* The calling native task keeps its encoder lock and job ownership and
+ * sleeps until its own request completes. Sequence assignment and
+ * publication form one critical section, so the worker serves requests in
+ * exactly their publication order. The lock waits by sleeping: equal-
+ * priority encoders without time slicing would never let a spinning
+ * contender's preempted holder resume. */
+static unsigned jpeg_transform(const Z8Surface *f,uint8_t *source_y,uint8_t *source_uv,const Z8Look *look)
+{
+    volatile Z8JpegWorker *w=&Z8_STATE->jpeg;
+    /* Every lease with transform scratch was admitted with a running worker,
+     * which never stops; this guard is unreachable and never runs inline. */
+    if(__atomic_load_n(&w->worker_state,__ATOMIC_ACQUIRE)!=JPEG_WORKER_RUNNING) return Z8_LUT_NO_WORKER;
+    PreviewWorker *worker=(PreviewWorker *)(uintptr_t)w->worker;
+    volatile Z8JpegJob *job=0;
+    for(;;) {
+        for(unsigned i=0;i<Z8_JPEG_JOBS && !job;i++) {
+            uint32_t expected=JOB_FREE;
+            if(__atomic_compare_exchange_n(&w->jobs[i].state,&expected,JOB_FILLING,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) job=&w->jobs[i];
+        }
+        if(job) break;
+        __atomic_fetch_add(&w->waits,1,__ATOMIC_RELAXED);
+        TASK_SLEEP(1);
+    }
+    copy_bytes((void *)&job->surface,f,sizeof(*f));
+    copy_bytes((void *)&job->look,look,sizeof(*look));
+    job->source_y=(uintptr_t)source_y;job->source_uv=(uintptr_t)source_uv;job->error=0;
+    for(;;) {
+        uint32_t unlocked=0;
+        if(__atomic_compare_exchange_n(&w->submit_lock,&unlocked,1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
+        __atomic_fetch_add(&w->waits,1,__ATOMIC_RELAXED);
+        TASK_SLEEP(1);
+    }
+    job->sequence=++w->sequence;
+    __atomic_store_n(&job->state,JOB_QUEUED,__ATOMIC_RELEASE);
+    __atomic_store_n(&w->submit_lock,0,__ATOMIC_RELEASE);
+    __atomic_fetch_add(&w->submitted,1,__ATOMIC_RELAXED);
+    uint32_t depth=0;
+    for(unsigned i=0;i<Z8_JPEG_JOBS;i++) {
+        uint32_t state=__atomic_load_n(&w->jobs[i].state,__ATOMIC_ACQUIRE);
+        depth+=state==JOB_QUEUED || state==JOB_RUNNING;
+    }
+    uint32_t peak=__atomic_load_n(&w->queue_peak,__ATOMIC_RELAXED);
+    while(depth>peak && !__atomic_compare_exchange_n(&w->queue_peak,&peak,depth,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+    EVENT_SET(worker->event,1);
+    while(__atomic_load_n(&job->state,__ATOMIC_ACQUIRE)!=JOB_DONE) {
+        __atomic_fetch_add(&w->waits,1,__ATOMIC_RELAXED);
+        TASK_SLEEP(1);
+    }
+    unsigned error=job->error;
+    __atomic_store_n(&job->state,JOB_FREE,__ATOMIC_RELEASE);
+    return error;
+}
+
 /* The native output constructor computes compressed segment capacities from
  * capture settings, independently of its pool allocation's actual capacity.
  * Reserve the LUT surface in that same owner BEFORE native image processing.
@@ -668,6 +827,8 @@ uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,u
     if(configuration>UINT64_MAX-0x26c || pool!=0x38) return 0;
     uint32_t required=jpeg_required_bytes(bytes,configuration+0x26c,selected,&scratch);
     if(!required) return 0;
+    /* A transform reservation is admitted only with its worker running. */
+    if(scratch && !jpeg_worker_start()) return 0;
     uint64_t offset=((uint64_t)bytes+511)&~UINT64_C(511);
     uint64_t owner=POOL_ALLOC(frame,pool,required);
     if(!owner) return 0;
@@ -771,11 +932,7 @@ static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned
     if(!source_y || !source_uv || !f.y) { error=Z8_LUT_BAD_SPAN;goto rejected; }
     __atomic_fetch_add(&s->jpeg_busy,1,__ATOMIC_ACQ_REL);
     if(kind==0) s->jpeg_started=ticks();
-    invalidate(source_y,f.y_bytes);invalidate(source_uv,f.uv_bytes);
-    invalidate(f.y,bytes);
-    copy_bytes(f.y,source_y,(uint32_t)f.y_bytes);copy_bytes(f.uv,source_uv,(uint32_t)f.uv_bytes);
-    error=z8_lut_surface(&f,look);
-    clean(f.y,bytes);
+    error=jpeg_transform(&f,source_y,source_uv,look);
     if(error) {
         if(kind==0) s->jpeg_finished=ticks();
         __atomic_fetch_sub(&s->jpeg_busy,1,__ATOMIC_RELEASE);
