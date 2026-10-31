@@ -53,7 +53,7 @@ def compile_code(compiler='clang-19'):
         disasm=subprocess.check_output(['aarch64-linux-gnu-objdump','-d',str(elf)],text=True)
         instructions=[line.split('\t',2)[-1] for line in disasm.splitlines() if re.match(r'^\s*[0-9a-f]+:\s+[0-9a-f]{8}\s',line)]
         require(not any(re.search(r'\b(?:v|q|d|s|h|b)[0-9]+\b',i) or re.match(r'(?:svc|hvc|smc)\b',i) for i in instructions),'Unexpected SIMD, FP or system trap')
-        for name,old,resume in [('jpeg','fb6bbba9',0x40e82094),('boot','93f499d2',0x41184df4),
+        for name,old,resume in [('boot','93f499d2',0x41184df4),
                                 ('mode','ffc301d1',0x410463e8),('mode_exit','a0020012',0x41046708),
                                 ('reset','e00314aa',0x40cd92ac),('construct','e00315aa',0x40cd760c),
                                 ('pool_init','f75bbda9',0x41045ba4),('pool_init_exit','60020012',0x41045df8),
@@ -69,7 +69,7 @@ def compile_code(compiler='clang-19'):
     layout=dict(zip(('state_bytes','preview_offset','slots_offset','slot_bytes','request_offset','channel_offset',
                      'cache_resource_offset','paused_offset','apply_sequence_offset','flags_offset',
                      'apply_counter_offset','display_epoch_offset','slot_count','power_paused_offset',
-                     'jpeg_busy_offset'),struct.unpack_from('<15I',raw,offset)))
+                     'jpeg_busy_offset','jpeg_preview_offset'),struct.unpack_from('<16I',raw,offset)))
     return raw,symbols,dict(sha256=sha(raw),bytes=len(raw),flags=flags,
         compiler=subprocess.check_output([cc,'--version'],text=True).splitlines()[0],
         sources=sources,runtime_layout=layout)
@@ -171,7 +171,23 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     img.put(CODE-BASE,code,'photo LUT native code',expect_zero=True)
     img.put(LUT-BASE,luts,'photo LUT immutable look bundle',expect_zero=True)
     require(not any(stock[STATE_SOURCE-BASE:STATE_SOURCE-BASE+4096]),'Private runtime source is occupied')
-    img.put(0x40e82090-BASE,branch(0x40e82090,symbols['z8_photo_lut_jpeg_entry']),'main JPEG input hook',expect=bytes.fromhex('fb6bbba9'))
+    img.put(0x40eaeb8c-BASE,branch(0x40eaeb8c,symbols['z8_photo_lut_jpeg_entry'],True),
+            'main JPEG encode with an isolated input surface',expect=branch(0x40eaeb8c,0x40e82090,True))
+    img.put(0x41048e2c-BASE,branch(0x41048e2c,symbols['z8_photo_lut_output_alloc_entry'],True),
+            'reserve JPEG LUT input inside the native capture output owner',expect=branch(0x41048e2c,0x41047478,True))
+    img.put(0x40f98958-BASE,branch(0x40f98958,symbols['z8_photo_lut_output_budget'],True),
+            'include the private JPEG reservation in native capture capacity',expect=branch(0x40f98958,0x4104886c,True))
+    for at,name in [(0x40eafe58,'medium'),(0x40eb00ec,'small'),(0x40eb02dc,'thumbnail')]:
+        target='z8_photo_lut_'+name+('_entry' if name!='thumbnail' else '')
+        img.put(at-BASE,branch(at,symbols[target],True),'isolate JPEG '+name+' from NEF',expect=branch(at,0x40e82090,True))
+    for at in (0x40eb1784,0x40eb1dc0):
+        img.put(at-BASE,branch(at,symbols['z8_photo_lut_file_graph'],True),
+                'serialize the dedicated JPEG thumbnail',expect=branch(at,0x40eb17e0,True))
+    # The sizing, layout and encode calls must agree throughout a capture,
+    # including when the menu changes. Give NEF an independent compressed
+    # image even in quality modes that normally reuse the main JPEG bytes.
+    img.put(0x410590dc-BASE,branch(0x410590dc,0x410590e0),
+            'keep NEF compressed JPEG separate from the main output',expect=bytes.fromhex('60000034'))
     img.put(0x41184df0-BASE,branch(0x41184df0,symbols['z8_photo_lut_boot_entry']),'post-mapping cold/warm initialization',expect=bytes.fromhex('93f499d2'))
     img.put(0x40e991b0-BASE,branch(0x40e991b0,symbols['z8_photo_lut_frame_entry']),
             'completed photo frame copy and LUT',expect=bytes.fromhex('e0010037'))

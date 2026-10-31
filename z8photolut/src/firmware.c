@@ -7,7 +7,7 @@ __attribute__((used)) const uint32_t z8_photo_lut_runtime_layout[]={
     offsetof(Z8Preview,cache_resource),offsetof(Z8Preview,paused),
     offsetof(Z8PreviewSlot,apply_sequence),offsetof(Z8PreviewSlot,flags),
     offsetof(Z8Preview,applies),offsetof(Z8Preview,display_epoch),Z8_PREVIEW_SLOTS,
-    offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy)
+    offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy),offsetof(Z8LutState,jpeg_previews_applied)
 };
 
 /* Clang may lower fixed aggregate copies to memcpy in freestanding code. */
@@ -15,6 +15,12 @@ void *memcpy(void *destination,const void *source,size_t bytes)
 {
     volatile uint8_t *d=destination;const uint8_t *s=source;
     for(size_t i=0;i<bytes;i++) d[i]=s[i];
+    return destination;
+}
+void *memset(void *destination,int value,size_t bytes)
+{
+    volatile uint8_t *d=destination;
+    for(size_t i=0;i<bytes;i++) d[i]=(uint8_t)value;
     return destination;
 }
 
@@ -87,6 +93,13 @@ static void copy_bytes(void *destination,const void *source,uint32_t bytes)
 
 static int main_span(uint64_t p,uint64_t n)
 { return range(p,n,UINT64_C(0xa00000000),UINT64_C(0xa40000000)); }
+static int cpu_span(uint64_t p,uint64_t n)
+{
+    /* Native pool0x23 job bodies use raw image RAM; pool0x22 capture settings
+     * use its cached alias. Both also have General-heap fallback paths. */
+    return main_span(p,n) || range(p,n,UINT64_C(0x840000000),UINT64_C(0x900000000)) ||
+           range(p,n,UINT64_C(0xc40000000),UINT64_C(0xd00000000));
+}
 
 static unsigned preview_source(uint64_t descriptor,Z8Surface *f)
 {
@@ -602,56 +615,295 @@ void z8_photo_lut_boot(void)
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
-void z8_photo_lut_jpeg(const uint64_t *saved)
+/* The native output constructor computes compressed segment capacities from
+ * capture settings, independently of its pool allocation's actual capacity.
+ * Reserve the LUT surface in that same owner BEFORE native image processing.
+ * Allocation failure therefore follows 40ea9f44's native event wait/retry;
+ * no extra memory is requested after the JPEG phase has been admitted.
+ * Only the native output segments are serialized; this footer is never saved. */
+#define JPEG_ENCODE ((unsigned (*)(uint32_t,uint64_t))(uintptr_t)0x40e82090)
+#define JPEG_ENABLED ((unsigned (*)(uint64_t))(uintptr_t)0x4105903c)
+#define JPEG_LEASE_MAGIC UINT64_C(0x3154504f4c385a4a)
+#define JPEG_SURFACE_BYTES (8256u*5504u*2u)
+#define JPEG_MEDIUM_BYTES (1920u*1080u*2u)
+#define JPEG_SMALL_BYTES (640u*480u*2u)
+#define JPEG_TINY_BYTES (192u*120u*2u)
+#define JPEG_THUMB_BYTES 0x3600u
+#define JPEG_STORAGE_BYTES (JPEG_SURFACE_BYTES+JPEG_MEDIUM_BYTES+JPEG_SMALL_BYTES+JPEG_TINY_BYTES+JPEG_THUMB_BYTES)
+typedef struct {
+    uint64_t magic,owner,base,capacity,scratch;
+    uint32_t scratch_bytes,choice;
+    uint64_t compressed_bytes,reserved;
+    /* Keep mutable CPU ownership on a separate cache line. */
+    uint64_t thumbnail[4];
+    uint32_t locks[4],thumbnail_ready,mutable_reserved[3];
+} JpegLease;
+_Static_assert(sizeof(JpegLease)==128,"JPEG lease occupies two cache lines");
+
+static uint32_t jpeg_required_bytes(uint32_t bytes,uint64_t format,uint32_t selected,uint32_t *scratch)
 {
-    /* This LR is the ordinary main JPEG call; NEF previews and thumbnails
-     * use separate callers. Capture/rendering data never enters RAW TENC. */
-    if(saved[30]!=UINT64_C(0x40eaeb90)) return;
-    volatile Z8LutState *s=Z8_STATE;
-    if(s->magic!=Z8_STATE_MAGIC || !s->ready) return;
-    __atomic_fetch_add(&s->jpeg_calls,1,__ATOMIC_RELAXED);
-    uint32_t selected=choice();
-    s->jpeg_choice=selected;s->jpeg_error=0;
+    /* The capture-settings block may live in pool0x22's cached image RAM
+     * (observed C3.11 address c40000008), not only the main metadata arena. */
+    if((format&3) || !cpu_span(format,0x94)) return 0;
     Z8Look look;
-    unsigned error=z8_lut_select(Z8_BUNDLE,selected,256,&look);
-    if(error) goto rejected;
-    if(look.identity || !look.strength) return;
-    if(!range(saved[1],0x50,UINT64_C(0xa00000000),UINT64_C(0xa40000000)) || (saved[1]&7)) { error=Z8_LUT_BAD_SPAN;goto rejected; }
-    uint64_t descriptor=read64(saved[1]+8);
-    if(!range(descriptor,0x28,UINT64_C(0xa00000000),UINT64_C(0xa40000000)) || (descriptor&7)) { error=Z8_LUT_BAD_SPAN;goto rejected; }
+    if(z8_lut_select(Z8_BUNDLE,selected,256,&look)) return 0;
+    *scratch=(!look.identity && look.strength && (JPEG_ENABLED(format)&1))?JPEG_STORAGE_BYTES:0;
+    uint64_t offset=((uint64_t)bytes+511)&~UINT64_C(511);
+    uint64_t required=offset+*scratch+sizeof(JpegLease);
+    return bytes && required<=UINT32_MAX?(uint32_t)required:0;
+}
+
+uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t special)
+{
+    uint32_t bytes=((uint32_t (*)(uint64_t,uint64_t,uint32_t))(uintptr_t)0x4104886c)(settings,format,special);
+    uint32_t scratch=0,required=jpeg_required_bytes(bytes,format,choice(),&scratch);
+    /* Only the prospective pool0x38 photo count uses this wrapper. Keep
+     * the native compressed layout and its zero-size unit queries intact. */
+    return required?required:bytes;
+}
+
+uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,uint64_t configuration)
+{
+    uint32_t selected=choice(),scratch=0;
+    if(configuration>UINT64_MAX-0x26c || pool!=0x38) return 0;
+    uint32_t required=jpeg_required_bytes(bytes,configuration+0x26c,selected,&scratch);
+    if(!required) return 0;
+    uint64_t offset=((uint64_t)bytes+511)&~UINT64_C(511);
+    uint64_t owner=POOL_ALLOC(frame,pool,required);
+    if(!owner) return 0;
+    if(!main_span(owner,0x18) || (owner&7)) return 0;
+    uint64_t descriptor=read64(owner+8);
+    if(!main_span(descriptor,12) || (descriptor&7)) goto failed;
+    uint64_t raw=read64(descriptor),capacity=read32(descriptor+8);
+    /* Variable pools can clamp oversized requests or take a fallback unit.
+     * A non-NULL handle is not evidence that the requested span exists. */
+    if(capacity<required || ((raw|capacity)&511) ||
+       !range(raw,capacity,UINT64_C(0x800000000),UINT64_C(0xa00000000))) goto failed;
+    uint8_t *cpu=cpu_address(raw);
+    if(!cpu || (uintptr_t)cpu!=raw+UINT64_C(0x400000000)) goto failed;
+    JpegLease *lease=(JpegLease *)(cpu+capacity-sizeof(JpegLease));
+    invalidate(lease,sizeof(*lease));
+    *lease=(JpegLease){.magic=JPEG_LEASE_MAGIC,.owner=owner,.base=raw,.capacity=capacity,
+        .scratch=raw+offset,.scratch_bytes=scratch,.choice=selected,.compressed_bytes=bytes};
+    clean(lease,sizeof(*lease));
+    return owner;
+failed:
+    POOL_FREE(owner);
+    return 0;
+}
+
+static unsigned jpeg_lease(uint64_t owner,JpegLease *lease,volatile JpegLease **storage)
+{
+    if(!main_span(owner,0xd68) || (owner&7)) return Z8_LUT_BAD_SPAN;
+    uint64_t descriptor=read64(owner+8);
+    if(!main_span(descriptor,12) || (descriptor&7)) return Z8_LUT_BAD_SPAN;
+    uint64_t raw=read64(descriptor),capacity=read32(descriptor+8);
+    if(capacity<sizeof(*lease) || ((raw|capacity)&511) ||
+       !range(raw,capacity,UINT64_C(0x800000000),UINT64_C(0xa00000000))) return Z8_LUT_BAD_SPAN;
+    uint8_t *cpu=cpu_address(raw);
+    if(!cpu || (uintptr_t)cpu!=raw+UINT64_C(0x400000000)) return Z8_LUT_BAD_SPAN;
+    const JpegLease *source=(const JpegLease *)(cpu+capacity-sizeof(*lease));
+    /* The second line contains live CPU locks, never DMA data. */
+    invalidate(source,64);
+    *lease=*source;
+    if(lease->magic!=JPEG_LEASE_MAGIC || lease->owner!=owner || lease->base!=raw ||
+       lease->capacity!=capacity || lease->reserved || !lease->compressed_bytes ||
+       lease->compressed_bytes>capacity-sizeof(*lease) ||
+       lease->scratch!=raw+((lease->compressed_bytes+511)&~UINT64_C(511)) ||
+       (lease->scratch_bytes && lease->scratch_bytes!=JPEG_STORAGE_BYTES) ||
+       !range(lease->scratch,(uint64_t)lease->scratch_bytes+sizeof(*lease),raw,raw+capacity))
+        return Z8_LUT_BAD_SPAN;
+    *storage=(volatile JpegLease *)source;
+    return Z8_LUT_OK;
+}
+
+static void jpeg_lock(volatile uint32_t *lock)
+{
+    for(;;) {
+        uint32_t expected=0;
+        if(__atomic_compare_exchange_n(lock,&expected,1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+        TASK_SLEEP(1);
+    }
+}
+
+static void jpeg_error(unsigned kind,unsigned error)
+{
+    if(kind==0) {
+        Z8_STATE->jpeg_error=error;
+        __atomic_fetch_add(&Z8_STATE->jpeg_rejected,1,__ATOMIC_RELAXED);
+    } else {
+        Z8_STATE->jpeg_preview_error=error;
+        __atomic_fetch_add(&Z8_STATE->jpeg_preview_rejected,1,__ATOMIC_RELAXED);
+    }
+}
+
+static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned kind,
+                                   const JpegLease *lease,const Z8Look *look,unsigned *applied)
+{
+    static const uint32_t offsets[]={0,JPEG_SURFACE_BYTES,JPEG_SURFACE_BYTES+JPEG_MEDIUM_BYTES,
+        JPEG_SURFACE_BYTES+JPEG_MEDIUM_BYTES+JPEG_SMALL_BYTES};
+    static const uint32_t capacities[]={JPEG_SURFACE_BYTES,JPEG_MEDIUM_BYTES,JPEG_SMALL_BYTES,JPEG_TINY_BYTES};
+    volatile Z8LutState *s=Z8_STATE;
+    unsigned error=Z8_LUT_BAD_SPAN;
+    *applied=0;
+    if(kind>3 || lease->scratch_bytes!=JPEG_STORAGE_BYTES || !main_span(parameters,0x50) || (parameters&7)) goto rejected;
+    uint64_t descriptor=read64(parameters+8);
+    if(!main_span(descriptor,0x28) || (descriptor&7)) goto rejected;
     uint32_t format=read32(descriptor);
     if(format!=1 && format!=2) { error=Z8_LUT_BAD_GEOMETRY;goto rejected; }
     Z8Surface f={.y=(uint8_t *)(uintptr_t)read64(descriptor+24),.uv=(uint8_t *)(uintptr_t)read64(descriptor+32),
         .width=read16(descriptor+16),.height=read16(descriptor+18),
         .y_stride=read16(descriptor+8),.uv_stride=read16(descriptor+10),.uv_divisor=format==1?1u:2u};
     f.y_bytes=(uint64_t)f.y_stride*f.height;f.uv_bytes=(uint64_t)f.uv_stride*(f.height/f.uv_divisor);
-    s->width=f.width;s->height=f.height;s->y=(uintptr_t)f.y;s->uv=(uintptr_t)f.uv;
-    if(!range((uintptr_t)f.y,f.y_bytes,UINT64_C(0x800000000),UINT64_C(0x900000000)) ||
-       !range((uintptr_t)f.uv,f.uv_bytes,UINT64_C(0x800000000),UINT64_C(0x900000000)) ||
-       (((uintptr_t)f.y|(uintptr_t)f.uv|f.y_bytes|f.uv_bytes)&63)) { error=Z8_LUT_BAD_SPAN;goto rejected; }
-    /* Validate all geometry before any cache or pixel operation. */
+    if(kind==0) { s->width=f.width;s->height=f.height;s->y=(uintptr_t)f.y;s->uv=(uintptr_t)f.uv; }
+    uint64_t scratch=lease->scratch+offsets[kind],bytes=f.y_bytes+f.uv_bytes;
+    uint64_t original_y=(uintptr_t)f.y,original_uv=(uintptr_t)f.uv;
+    if(!range(original_y,f.y_bytes,UINT64_C(0x800000000),UINT64_C(0x900000000)) ||
+       !range(original_uv,f.uv_bytes,UINT64_C(0x800000000),UINT64_C(0x900000000)) ||
+       ((original_y|original_uv|f.y_bytes|f.uv_bytes)&63) || bytes>capacities[kind] ||
+       (scratch<original_y+f.y_bytes && original_y<scratch+bytes) ||
+       (scratch<original_uv+f.uv_bytes && original_uv<scratch+bytes)) goto rejected;
     Z8Look off={0,17,1,0};
     error=z8_lut_surface(&f,&off);
     if(error) goto rejected;
-    f.y=cpu_address((uintptr_t)f.y);f.uv=cpu_address((uintptr_t)f.uv);
-    if(!f.y || !f.uv) { error=Z8_LUT_BAD_SPAN;goto rejected; }
-    /* Every native main-JPEG admission retains its complete image-job owner.
-     * Its completion cannot release capture bit0x400 until we return, even
-     * when preview is paused for shutdown. Never emit an unfiltered photo. */
+    uint8_t *source_y=cpu_address(original_y),*source_uv=cpu_address(original_uv);
+    f.y=cpu_address(scratch);f.uv=f.y?f.y+f.y_bytes:0;
+    if(!source_y || !source_uv || !f.y) { error=Z8_LUT_BAD_SPAN;goto rejected; }
     __atomic_fetch_add(&s->jpeg_busy,1,__ATOMIC_ACQ_REL);
-    s->jpeg_started=ticks();
-    invalidate(f.y,f.y_bytes);invalidate(f.uv,f.uv_bytes);
-    error=z8_lut_surface(&f,&look);
-    clean(f.y,f.y_bytes);clean(f.uv,f.uv_bytes);
-    s->jpeg_finished=ticks();
+    if(kind==0) s->jpeg_started=ticks();
+    invalidate(source_y,f.y_bytes);invalidate(source_uv,f.uv_bytes);
+    invalidate(f.y,bytes);
+    copy_bytes(f.y,source_y,(uint32_t)f.y_bytes);copy_bytes(f.uv,source_uv,(uint32_t)f.uv_bytes);
+    error=z8_lut_surface(&f,look);
+    clean(f.y,bytes);
+    if(error) {
+        if(kind==0) s->jpeg_finished=ticks();
+        __atomic_fetch_sub(&s->jpeg_busy,1,__ATOMIC_RELEASE);
+        goto rejected;
+    }
+    uint64_t private_descriptor[5];
+    copy_bytes(private_descriptor,(const void *)(uintptr_t)descriptor,sizeof(private_descriptor));
+    private_descriptor[3]=scratch;private_descriptor[4]=scratch+f.y_bytes;
+    /* Native encoding retains params+0x20 for control updates until return.
+     * Substitute only its source pointer, preserving native caller outputs. */
+    *(uint64_t *)(uintptr_t)(parameters+8)=(uintptr_t)private_descriptor;
+    unsigned result=JPEG_ENCODE(channel,parameters);
+    *(uint64_t *)(uintptr_t)(parameters+8)=descriptor;
+    if(kind==0) {
+        s->jpeg_finished=ticks();
+        __atomic_fetch_add(&s->jpeg_applied,1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&s->jpeg_pixels,(uint64_t)f.width*f.height,__ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&s->jpeg_previews_applied,1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&s->jpeg_preview_pixels,(uint64_t)f.width*f.height,__ATOMIC_RELAXED);
+    }
     __atomic_fetch_sub(&s->jpeg_busy,1,__ATOMIC_RELEASE);
-    if(error) goto rejected;
-    __atomic_fetch_add(&s->jpeg_applied,1,__ATOMIC_RELAXED);
-    __atomic_fetch_add(&s->jpeg_pixels,(uint64_t)f.width*f.height,__ATOMIC_RELAXED);
-    return;
+    *applied=1;
+    return result;
 rejected:
-    s->jpeg_error=error;
-    __atomic_fetch_add(&s->jpeg_rejected,1,__ATOMIC_RELAXED);
+    jpeg_error(kind,error);
+    return JPEG_ENCODE(channel,parameters);
+}
+
+static unsigned jpeg_output(uint32_t channel,uint64_t parameters,uint64_t owner,unsigned kind)
+{
+    if(Z8_STATE->magic!=Z8_STATE_MAGIC || !Z8_STATE->ready) return JPEG_ENCODE(channel,parameters);
+    JpegLease lease;volatile JpegLease *storage=0;
+    unsigned error=jpeg_lease(owner,&lease,&storage);
+    if(error) { jpeg_error(kind,error);return JPEG_ENCODE(channel,parameters); }
+    if(kind==0) {
+        __atomic_fetch_add(&Z8_STATE->jpeg_calls,1,__ATOMIC_RELAXED);
+        Z8_STATE->jpeg_choice=lease.choice;Z8_STATE->jpeg_error=0;
+    }
+    Z8Look look;
+    error=z8_lut_select(Z8_BUNDLE,lease.choice,256,&look);
+    if(error) { jpeg_error(kind,error);return JPEG_ENCODE(channel,parameters); }
+    if(look.identity || !look.strength) return JPEG_ENCODE(channel,parameters);
+    jpeg_lock(&storage->locks[kind]);
+    unsigned applied,result=jpeg_encode_locked(channel,parameters,kind,&lease,&look,&applied);
+    __atomic_store_n(&storage->locks[kind],0,__ATOMIC_RELEASE);
+    return result;
+}
+
+unsigned z8_photo_lut_jpeg(uint32_t channel,uint64_t parameters)
+{
+    if(!main_span(parameters,0x50) || (parameters&7)) {
+        jpeg_error(0,Z8_LUT_BAD_SPAN);return JPEG_ENCODE(channel,parameters);
+    }
+    /* 40eaeb24..34 builds this exact owner-relative output descriptor. */
+    return jpeg_output(channel,parameters,read64(parameters+0x10)-0x38,0);
+}
+
+static unsigned jpeg_preview(uint32_t channel,uint64_t parameters,uint64_t capture,uint64_t selector,unsigned kind)
+{
+    if(selector!=0) return JPEG_ENCODE(channel,parameters);
+    if(!main_span(capture,0x6b0) || !main_span(parameters,0x50) || (parameters&7)) {
+        jpeg_error(kind,Z8_LUT_BAD_SPAN);return JPEG_ENCODE(channel,parameters);
+    }
+    uint64_t owner=read64(capture+0x6a8),offset=kind==1?0xc0:0xa0;
+    if(read64(parameters+0x10)!=owner+offset) {
+        jpeg_error(kind,Z8_LUT_BAD_SPAN);return JPEG_ENCODE(channel,parameters);
+    }
+    return jpeg_output(channel,parameters,owner,kind);
+}
+
+unsigned z8_photo_lut_medium(uint32_t channel,uint64_t parameters,uint64_t capture,uint64_t selector)
+{ return jpeg_preview(channel,parameters,capture,selector,1); }
+unsigned z8_photo_lut_small(uint32_t channel,uint64_t parameters,uint64_t capture,uint64_t selector)
+{ return jpeg_preview(channel,parameters,capture,selector,2); }
+
+unsigned z8_photo_lut_thumbnail(uint32_t channel,uint64_t parameters)
+{
+    if(!main_span(parameters,0x50) || (parameters&7)) {
+        jpeg_error(3,Z8_LUT_BAD_SPAN);return JPEG_ENCODE(channel,parameters);
+    }
+    JpegLease lease;volatile JpegLease *storage=0;
+    unsigned error=jpeg_lease(read64(parameters+0x10)-0xe0,&lease,&storage);
+    if(error) { jpeg_error(3,error);return JPEG_ENCODE(channel,parameters); }
+    Z8Look look;
+    error=z8_lut_select(Z8_BUNDLE,lease.choice,256,&look);
+    if(error) { jpeg_error(3,error);return JPEG_ENCODE(channel,parameters); }
+    if(look.identity || !look.strength || !lease.scratch_bytes) return JPEG_ENCODE(channel,parameters);
+    jpeg_lock(&storage->locks[3]);
+    __atomic_store_n(&storage->thumbnail_ready,0,__ATOMIC_RELEASE);
+    uint64_t private_parameters[10],private_result[12]={0};
+    copy_bytes(private_parameters,(const void *)(uintptr_t)parameters,sizeof(private_parameters));
+    copy_bytes((void *)storage->thumbnail,(const void *)(uintptr_t)read64(parameters+0x10),sizeof(storage->thumbnail));
+    storage->thumbnail[1]=lease.scratch+JPEG_STORAGE_BYTES-JPEG_THUMB_BYTES;
+    storage->thumbnail[2]=0;
+    private_parameters[2]=(uintptr_t)storage->thumbnail;
+    private_parameters[3]=(private_parameters[3]&UINT64_C(0xffffffff00000000))|JPEG_THUMB_BYTES;
+    private_parameters[9]=(uintptr_t)private_result;
+    /* Preserve the common native thumbnail for NEF. The JPEG duplicate gets
+     * its own result block and never overwrites the original control output. */
+    unsigned result=JPEG_ENCODE(channel,parameters),applied=0;
+    unsigned private_ok=jpeg_encode_locked(channel,(uintptr_t)private_parameters,3,&lease,&look,&applied);
+    uint32_t bytes=(uint32_t)storage->thumbnail[2];
+    if(private_ok && applied && bytes && bytes<=JPEG_THUMB_BYTES)
+        __atomic_store_n(&storage->thumbnail_ready,1,__ATOMIC_RELEASE);
+    else jpeg_error(3,Z8_LUT_BAD_SPAN);
+    clean((const void *)storage->thumbnail,64);
+    __atomic_store_n(&storage->locks[3],0,__ATOMIC_RELEASE);
+    return result;
+}
+
+unsigned z8_photo_lut_file_graph(uint32_t file,uint64_t capture,uint64_t owner,uint64_t header,uint64_t graph)
+{
+    unsigned kind=((unsigned (*)(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t))(uintptr_t)0x40eb17e0)
+        (file,capture,owner,header,graph);
+    if(kind!=0 || ((file&15)!=0 && (file&15)!=4)) return kind;
+    JpegLease lease;volatile JpegLease *storage=0;
+    unsigned error=jpeg_lease(owner,&lease,&storage);
+    if(error) { jpeg_error(3,error);return kind; }
+    if(!lease.scratch_bytes) return kind;
+    if(!cpu_span(graph,0x2d8) || (graph&7) || !__atomic_load_n(&storage->thumbnail_ready,__ATOMIC_ACQUIRE)) {
+        jpeg_error(3,Z8_LUT_BAD_SPAN);return kind;
+    }
+    /* JPEG header generation, EXIF length, catalog and async preview writer
+     * all follow this per-file pointer. NEF's graph and shared owner stay
+     * original; the descriptor and bytes live until native output release. */
+    *(uint64_t *)(uintptr_t)(graph+0x18)=(uintptr_t)storage->thumbnail;
+    return kind;
 }
 
 #define ENTRY_GUARD ((int (*)(void *))(uintptr_t)0x403ae0f8)

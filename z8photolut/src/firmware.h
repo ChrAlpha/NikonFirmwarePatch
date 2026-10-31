@@ -52,12 +52,20 @@ typedef struct {
     Z8Preview preview;
     /* Diagnostic count; native image-job ownership controls JPEG lifetime. */
     uint32_t jpeg_busy,cache_cleanup_lock;
+    uint64_t jpeg_previews_applied,jpeg_preview_pixels,jpeg_preview_rejected;
+    uint32_t jpeg_preview_error,reserved;
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)
 #define Z8_BUNDLE ((const Z8LookBundle *)(uintptr_t)Z8_LOOKS_VA)
 void z8_photo_lut_boot(void);
-void z8_photo_lut_jpeg(const uint64_t *saved);
+uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,uint64_t configuration);
+uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t special);
+unsigned z8_photo_lut_jpeg(uint32_t channel,uint64_t parameters);
+unsigned z8_photo_lut_medium(uint32_t,uint64_t,uint64_t,uint64_t);
+unsigned z8_photo_lut_small(uint32_t,uint64_t,uint64_t,uint64_t);
+unsigned z8_photo_lut_thumbnail(uint32_t,uint64_t);
+unsigned z8_photo_lut_file_graph(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t);
 void z8_photo_lut_frame(const uint64_t *saved);
 unsigned z8_photo_lut_queue(uint64_t *saved);
 void z8_photo_lut_mode_enter(void);

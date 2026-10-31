@@ -54,10 +54,26 @@
 .global z8_photo_lut_jpeg_entry
 .type z8_photo_lut_jpeg_entry,%function
 z8_photo_lut_jpeg_entry:
-    invoke z8_photo_lut_jpeg, 1
-    .inst 0xa9bb6bfb
-    b z8_photo_lut_jpeg_resume
+    b z8_photo_lut_jpeg
 .size z8_photo_lut_jpeg_entry, .-z8_photo_lut_jpeg_entry
+.global z8_photo_lut_output_alloc_entry
+.type z8_photo_lut_output_alloc_entry,%function
+z8_photo_lut_output_alloc_entry:
+    /* The native output constructor retains this capture's settings in x19. */
+    mov x3, x19
+    b z8_photo_lut_output_alloc
+.size z8_photo_lut_output_alloc_entry, .-z8_photo_lut_output_alloc_entry
+.macro jpeg_preview_entry name
+.global z8_photo_lut_\name\()_entry
+.type z8_photo_lut_\name\()_entry,%function
+z8_photo_lut_\name\()_entry:
+    mov x2, x21
+    mov x3, x22
+    b z8_photo_lut_\name
+.size z8_photo_lut_\name\()_entry, .-z8_photo_lut_\name\()_entry
+.endm
+jpeg_preview_entry medium
+jpeg_preview_entry small
 .global z8_photo_lut_boot_entry
 .type z8_photo_lut_boot_entry,%function
 z8_photo_lut_boot_entry:

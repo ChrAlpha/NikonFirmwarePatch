@@ -290,29 +290,161 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(len(waited),1)
         self.assertEqual(int.from_bytes(m.mem_read(cleanup,4),'little'),0)
 
-    def test_main_jpeg_is_fully_transformed_while_preview_is_power_paused(self):
+    def jpeg_fixture(self,selected=1,capacity=None,available=True,jpeg_enabled=True):
         from z8photolut.cube import parse,bundle
         m,state,slot,request,stack,original,before,ids=self.fixture()
-        rows=['LUT_3D_SIZE 2']+['%d %d %d'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1)]
-        data,_=bundle([parse(('\n'.join(rows)+'\n').encode())],grid=17)
-        m.mem_map(0x409a1000,0xf000);m.mem_write(0x409a0000,data)
+        rows=['TITLE "Cycle"','LUT_3D_SIZE 2']+['%d %d %d'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1)]
+        identity=['TITLE "Identity"','LUT_3D_SIZE 2']+['%d %d %d'%(r,g,b) for b in (0,1) for g in (0,1) for r in (0,1)]
+        data,_=bundle([parse(('\n'.join(rows)+'\n').encode()),parse(('\n'.join(identity)+'\n').encode())],grid=17)
+        m.mem_map(0x409a1000,0x1f000);m.mem_write(0x409a0000,data)
         m.mem_map(0x41186000,4096);m.mem_map(0xc10000000,4096)
+        m.mem_map(0x41059000,4096);m.mem_map(0x40e82000,4096)
         m.mem_write(0x41186718,struct.pack('<3I',0xd2c00088,0x8b080000,0xd65f03c0))
-        parameters=0xa03008000;descriptor=parameters+0x100;saved=parameters+0x200
-        m.mem_write(parameters+8,struct.pack('<Q',descriptor))
+        m.mem_write(0x4105903c,struct.pack('<2I',0x52800000|(int(jpeg_enabled)<<5),0xd65f03c0))
+        owner=0xa03009000;allocation_descriptor=owner+0x1000;raw=0x820000000
+        scratch=8256*5504*2+1920*1080*2+640*480*2+192*120*2+0x3600
+        required=4096+(scratch if selected==1 and jpeg_enabled else 0)+128
+        if capacity is None:capacity=(required+511)&~511
+        m.mem_write(owner+8,struct.pack('<Q',allocation_descriptor))
+        m.mem_write(allocation_descriptor,struct.pack('<QI',raw,capacity))
+        m.mem_map(raw+0x400000000,8192)
+        footer=raw+0x400000000+capacity-128
+        if footer>=raw+0x400000000+8192:m.mem_map(footer&~4095,4096)
+        m.mem_write(0xa03d482ba,bytes([selected]))
+        allocations=[];freed=[];encodes=[]
+        def native(uc,at,size,user):
+            if at==0x41047478:
+                allocations.append(tuple(uc.reg_read(getattr(regs,f'UC_ARM64_REG_X{i}')) for i in range(3)))
+                uc.reg_write(regs.UC_ARM64_REG_X0,owner if available else 0)
+                uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
+            elif at==0x410477c8:
+                freed.append(uc.reg_read(regs.UC_ARM64_REG_X0));uc.reg_write(regs.UC_ARM64_REG_X0,1)
+                uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
+            elif at==0x40e82090:
+                params=uc.reg_read(regs.UC_ARM64_REG_X1)
+                desc=int.from_bytes(uc.mem_read(params+8,8),'little')
+                planes=struct.unpack('<2Q',uc.mem_read(desc+24,16))
+                encodes.append((uc.reg_read(regs.UC_ARM64_REG_X0),desc,planes))
+                self.assertEqual(bytes(uc.mem_read(0xc10000000,128)),bytes([100])*64+bytes([100,180])*32)
+                if planes[0]!=0x810000000:
+                    self.assertEqual(bytes(uc.mem_read(planes[0]+0x400000000,128)),bytes([71])*64+bytes([186,129])*32)
+                    self.assertEqual(int.from_bytes(uc.mem_read(state+self.metadata['runtime_layout']['jpeg_busy_offset'],4),'little'),1)
+                # Native inline control changes must reach the original caller.
+                uc.mem_write(params+0x24,struct.pack('<I',0x12345678))
+                output=int.from_bytes(uc.mem_read(params+0x10,8),'little')
+                uc.mem_write(output+0x10,struct.pack('<I',128+len(encodes)))
+                result=int.from_bytes(uc.mem_read(params+0x48,8),'little')
+                if result:uc.mem_write(result,struct.pack('<I',len(encodes)))
+                uc.reg_write(regs.UC_ARM64_REG_X0,1)
+                uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
+        m.hook_add(UC_HOOK_CODE,native)
+        self.call(m,'z8_photo_lut_output_alloc',stack,x0=42,x1=0x38,x2=4096,x3=0xa03000000)
+        allocation=m.reg_read(regs.UC_ARM64_REG_X0)
+        parameters=0xa03008000;descriptor=parameters+0x100
+        m.mem_write(parameters+8,struct.pack('<2Q',descriptor,owner+0x38))
         image=bytearray(0x28);struct.pack_into('<I',image,0,1)
         struct.pack_into('<2H',image,8,8,8);struct.pack_into('<2H',image,16,8,8)
         struct.pack_into('<2Q',image,24,0x810000000,0x810000040);m.mem_write(descriptor,bytes(image))
-        registers=[0]*32;registers[1]=parameters;registers[30]=0x40eaeb90
-        m.mem_write(saved,struct.pack('<32Q',*registers))
         m.mem_write(0xc10000000,bytes([100])*64+bytes([100,180])*32)
+        return m,state,stack,parameters,descriptor,bytes(image),allocations,freed,encodes,allocation,footer
+
+    def test_main_jpeg_uses_owned_copy_and_preserves_nef_source_while_power_paused(self):
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+        self.assertNotEqual(owner,0)
         layout=self.metadata['runtime_layout'];preview=state+layout['preview_offset']
         m.mem_write(preview+layout['paused_offset'],struct.pack('<I',1))
         m.mem_write(preview+layout['power_paused_offset'],struct.pack('<I',1))
-        self.call(m,'z8_photo_lut_jpeg',stack,x0=saved)
-        self.assertEqual(bytes(m.mem_read(0xc10000000,128)),bytes([71])*64+bytes([186,129])*32)
+        # A menu change after reservation does not alter this capture's look.
+        m.mem_write(0xa03d482ba,b'\0')
+        self.call(m,'z8_photo_lut_jpeg',stack,x0=0,x1=params)
+        self.assertEqual(m.reg_read(regs.UC_ARM64_REG_X0),1)
         self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,1,64))
         self.assertEqual(int.from_bytes(m.mem_read(state+layout['jpeg_busy_offset'],4),'little'),0)
+        self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
+        self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
+        self.assertEqual(int.from_bytes(m.mem_read(params+0x24,4),'little'),0x12345678)
+        self.assertEqual(encodes[0][2],(0x820001000,0x820001040))
+        self.assertEqual(allocations,[(42,0x38,4096+8256*5504*2+1920*1080*2+640*480*2+192*120*2+0x3600+128)])
+        self.assertEqual(freed,[]) # The native output owner retains the tail.
+        self.assertEqual(int.from_bytes(m.mem_read(footer,8),'little'),0x3154504f4c385a4a)
+
+    def test_off_and_identity_snapshot_do_not_allocate_full_surface_or_transform(self):
+        for selected in (0,2):
+            with self.subTest(selected=selected):
+                m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(selected)
+                m.mem_write(0xa03d482ba,b'\x01')
+                self.call(m,'z8_photo_lut_jpeg',stack,x0=1,x1=params)
+                self.assertEqual(encodes,[(1,desc,(0x810000000,0x810000040))])
+                self.assertEqual(allocations,[(42,0x38,4224)])
+                self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,0,0))
+                self.assertEqual(freed,[])
+
+    def test_nef_only_reservation_has_no_unused_full_jpeg_surface(self):
+        *_,allocations,freed,encodes,owner,footer=self.jpeg_fixture(jpeg_enabled=False)
+        self.assertNotEqual(owner,0)
+        self.assertEqual(allocations,[(42,0x38,4224)])
+        self.assertEqual(encodes,[])
+        self.assertEqual(freed,[])
+
+    def test_reservation_oom_and_clamped_capacity_return_to_native_admission(self):
+        for capacity,available in ((5120,True),(None,False)):
+            with self.subTest(capacity=capacity,available=available):
+                *_,allocations,freed,encodes,owner,footer=self.jpeg_fixture(capacity=capacity,available=available)
+                self.assertEqual(owner,0)
+                self.assertEqual(freed,[0xa03009000] if available else [])
+                self.assertEqual(encodes,[])
+
+    def test_small_jpeg_variants_use_separate_slices_and_nef_selectors_bypass(self):
+        for name,kind,offset in (('medium',1,0xc0),('small',2,0xa0)):
+            for selector in (0,1,2):
+                with self.subTest(name=name,selector=selector):
+                    m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+                    capture=0xa03002000
+                    m.mem_write(capture+0x6a8,struct.pack('<Q',owner))
+                    m.mem_write(params+0x10,struct.pack('<Q',owner+offset))
+                    relative=8256*5504*2+(1920*1080*2 if kind==2 else 0)
+                    private=0x820001000+relative
+                    m.mem_map((private+0x400000000)&~4095,8192)
+                    self.call(m,'z8_photo_lut_'+name,stack,x0=0,x1=params,x2=capture,x3=selector)
+                    self.assertEqual(encodes[0][2],(private,private+64) if selector==0 else (0x810000000,0x810000040))
+                    statistics=state+self.metadata['runtime_layout']['jpeg_preview_offset']
+                    self.assertEqual(struct.unpack('<3Q',m.mem_read(statistics,24)),(1,64,0) if selector==0 else (0,0,0))
+                    self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
+                    self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
+                    self.assertEqual(len(allocations),1)
+                    self.assertEqual(freed,[])
+
+    def test_tiny_jpeg_duplicate_preserves_native_thumbnail_result_and_waits_for_owner(self):
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+        original_output=owner+0xe0;original_result=params+0x400
+        m.mem_write(original_output+8,struct.pack('<Q',0x820000200))
+        m.mem_write(params+0x10,struct.pack('<Q',original_output))
+        m.mem_write(params+0x48,struct.pack('<Q',original_result))
+        private=0x820001000+8256*5504*2+1920*1080*2+640*480*2
+        m.mem_map((private+0x400000000)&~4095,8192)
+        lock=footer+96+3*4
+        m.mem_write(lock,struct.pack('<I',1))
+        waited=[]
+        def release_other_user(uc,at,size,user):
+            if at==0x40d2d654:
+                self.assertEqual(encodes,[])
+                self.assertEqual(int.from_bytes(uc.mem_read(lock,4),'little'),1)
+                waited.append(at);uc.mem_write(lock,bytes(4))
+                uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
+        m.hook_add(UC_HOOK_CODE,release_other_user)
+        self.call(m,'z8_photo_lut_thumbnail',stack,x0=0,x1=params)
+        self.assertEqual(len(waited),1)
+        self.assertEqual([row[2] for row in encodes],[(0x810000000,0x810000040),(private,private+64)])
+        self.assertEqual(int.from_bytes(m.mem_read(original_output+0x10,4),'little'),129)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+64+0x10,4),'little'),130)
+        self.assertEqual(int.from_bytes(m.mem_read(original_result,4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(params+0x48,8),'little'),original_result)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+112,4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(lock,4),'little'),0)
+        self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
+        self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
+        self.assertEqual(len(allocations),1)
+        self.assertEqual(freed,[])
 
     def test_trim_only_frees_unowned_uncached_allocations(self):
         m,state,slot,request,stack,original,before,ids=self.fixture()

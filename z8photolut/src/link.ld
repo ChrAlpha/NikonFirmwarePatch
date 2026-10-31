@@ -1,5 +1,4 @@
 ENTRY(z8_photo_lut_jpeg_entry)
-z8_photo_lut_jpeg_resume = 0x40e82094;
 z8_photo_lut_boot_resume = 0x41184df4;
 z8_photo_lut_frame_resume = 0x40e991b4;
 z8_photo_lut_frame_success = 0x40e991ec;
