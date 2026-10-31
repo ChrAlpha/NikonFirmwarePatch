@@ -39,6 +39,28 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -B tests/test_compiled_paths.py
 
+  photo-lut:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Install native test toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-19 binutils-aarch64-linux-gnu
+          python -m pip install -r requirements.txt unicorn==2.1.4
+      - name: Validate cube import, image kernels and actual AArch64 hooks
+        run: python -B -m unittest discover -s tests -p 'test_photo_lut*.py' -v
+      - name: Check full-resolution NV12 and NV16 with sanitizers
+        run: |
+          cc -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror tests/photo_lut_native.c z8photolut/src/lut.c -o "$RUNNER_TEMP/photo-lut-core"
+          "$RUNNER_TEMP/photo-lut-core" --full
+
   windows-toolkit:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.firmware_smoke
     needs: paths
