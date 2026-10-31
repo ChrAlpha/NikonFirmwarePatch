@@ -557,18 +557,17 @@ void z8_photo_lut_shutdown(const uint64_t *saved)
     if(Z8_STATE->magic!=Z8_STATE_MAGIC || !Z8_STATE->ready || (uint32_t)saved[0]!=0x05020102) return;
     uint32_t expected=0;
     if(!__atomic_compare_exchange_n(&Z8_STATE->preview.power_paused,&expected,1,0,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) return;
-    __atomic_fetch_or(&Z8_STATE->jpeg_busy,Z8_JPEG_CLOSED,__ATOMIC_ACQ_REL);
     z8_photo_lut_mode_enter();
-    /* Finish an admitted in-place JPEG transform before native shutdown can
-     * cancel its encoder task. This never emits a partly transformed JPEG. */
-    while(__atomic_load_n(&Z8_STATE->jpeg_busy,__ATOMIC_ACQUIRE)&~Z8_JPEG_CLOSED) TASK_SLEEP(1);
+    /* Do not reject or drain JPEG here: this notification precedes capture
+     * completion. Native BSShutdown waits bit0x400, owned by the entire image
+     * job (40f6fa64..40f6fbc4), including our synchronous JPEG operation.
+     * Returning an invented encoder error would not cancel its caller. */
 }
 
 void z8_photo_lut_power_cancel(void)
 {
     if(Z8_STATE->magic!=Z8_STATE_MAGIC || !Z8_STATE->ready) return;
     if(__atomic_exchange_n(&Z8_STATE->preview.power_paused,0,__ATOMIC_ACQ_REL)) {
-        __atomic_fetch_and(&Z8_STATE->jpeg_busy,~Z8_JPEG_CLOSED,__ATOMIC_RELEASE);
         z8_photo_lut_mode_exit();
     }
 }
@@ -626,13 +625,10 @@ void z8_photo_lut_jpeg(const uint64_t *saved)
     if(error) goto rejected;
     f.y=cpu_address((uintptr_t)f.y);f.uv=cpu_address((uintptr_t)f.uv);
     if(!f.y || !f.uv) { error=Z8_LUT_BAD_SPAN;goto rejected; }
-    /* Admission and shutdown share one atomic word. A two-variable check
-     * could let shutdown pass its drain immediately before our first write. */
-    uint32_t owners=__atomic_load_n(&s->jpeg_busy,__ATOMIC_ACQUIRE);
-    for(;;) {
-        if(owners&Z8_JPEG_CLOSED || owners==Z8_JPEG_CLOSED-1) { error=Z8_LUT_CANCELLED;goto rejected; }
-        if(__atomic_compare_exchange_n(&s->jpeg_busy,&owners,owners+1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
-    }
+    /* Every native main-JPEG admission retains its complete image-job owner.
+     * Its completion cannot release capture bit0x400 until we return, even
+     * when preview is paused for shutdown. Never emit an unfiltered photo. */
+    __atomic_fetch_add(&s->jpeg_busy,1,__ATOMIC_ACQ_REL);
     s->jpeg_started=ticks();
     invalidate(f.y,f.y_bytes);invalidate(f.uv,f.uv_bytes);
     error=z8_lut_surface(&f,&look);
@@ -696,4 +692,23 @@ int z8_photo_lut_photo_refresh(void *page)
         CONTENT(child,Z8_STRING_FIRST+2+selected);
     }
     return result;
+}
+
+void z8_photo_lut_bank_reset_result(const uint64_t *saved)
+{
+    if(Z8_STATE->magic!=Z8_STATE_MAGIC || !Z8_STATE->ready || !(saved[0]&1)) return;
+    uint32_t kind=(uint32_t)saved[19],bank=kind==9?0:kind-10;
+    if(bank>=4) return;
+    /* Individual-bank reset deliberately excludes the folder-name item from
+     * its531-ID list. Reset our independent setting only after native success.
+     * Whole-camera resets already copy the patched group6 defaults. */
+    uint8_t initial=(uint8_t)Z8_BUNDLE->initial;
+    __atomic_store_n(Z8_SAVED_CHOICE+(bank+1)*0x2e0,initial,__ATOMIC_RELEASE);
+    if(read32(UINT64_C(0xa03d48164))==bank) {
+        __atomic_store_n(Z8_SAVED_CHOICE,initial,__ATOMIC_RELEASE);
+        Z8_STATE->choice=initial;
+        if(Z8_STATE->preview.worker && Z8_STATE->preview.worker_started)
+            EVENT_SET(((PreviewWorker *)(uintptr_t)Z8_STATE->preview.worker)->event,1);
+    }
+    REQUEST_SAVE();
 }

@@ -170,6 +170,14 @@ z8_photo_lut_power_cancel_entry:
     ret
 .size z8_photo_lut_power_cancel_entry, .-z8_photo_lut_power_cancel_entry
 
+.global z8_photo_lut_bank_reset_result_entry
+.type z8_photo_lut_bank_reset_result_entry,%function
+z8_photo_lut_bank_reset_result_entry:
+    invoke z8_photo_lut_bank_reset_result, 1
+    .inst 0x5283ac95 /* native mov w21,#0x1d64 */
+    b z8_photo_lut_bank_reset_result_resume
+.size z8_photo_lut_bank_reset_result_entry, .-z8_photo_lut_bank_reset_result_entry
+
 /* Keep the folder-name descriptor at six bytes. Only native bank copying
  * and resetting also transfer its two persisted alignment bytes. The same
  * type10 branch handles other blobs; retain every unrelated size and flag. */

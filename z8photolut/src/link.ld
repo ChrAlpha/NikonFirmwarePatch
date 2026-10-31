@@ -18,6 +18,7 @@ z8_photo_lut_shutdown_resume = 0x40d67264;
 z8_photo_lut_bank_resume = 0x41016354;
 z8_photo_lut_bank_default_resume = 0x410169cc;
 z8_photo_lut_current_default_resume = 0x41016878;
+z8_photo_lut_bank_reset_result_resume = 0x40d68208;
 SECTIONS {
     . = 0x40990000;
     .text : { KEEP(*(.text.hooks)) *(.text .text.*) }

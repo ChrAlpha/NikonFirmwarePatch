@@ -242,7 +242,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.call(m,'z8_photo_lut_mode_exit',stack)
         self.assertEqual(int.from_bytes(m.mem_read(paused,4),'little'),0)
 
-    def test_power_closes_jpeg_admission_drains_once_and_cancel_reopens(self):
+    def test_power_quiesces_preview_without_rejecting_native_capture_ownership(self):
         m,state,slot,request,stack,original,before,ids=self.fixture()
         layout=self.metadata['runtime_layout'];preview=state+layout['preview_offset']
         paused=preview+layout['paused_offset'];power=preview+layout['power_paused_offset']
@@ -253,26 +253,46 @@ class PhotoLutQueueTests(unittest.TestCase):
         sleeps=[]
         def observe(uc,address,size,user):
             if address==0x40d2d654:
-                gate=int.from_bytes(uc.mem_read(jpeg,4),'little')
-                self.assertEqual(gate,0x80000001)
-                self.assertEqual(int.from_bytes(uc.mem_read(power,4),'little'),1)
-                sleeps.append(gate)
-                # An already admitted encoder completes while shutdown waits.
-                uc.mem_write(jpeg,struct.pack('<I',gate-1))
+                sleeps.append(address)
+                self.fail('An early JPEG wait delays native capture shutdown admission')
         m.hook_add(UC_HOOK_CODE,observe)
         self.call(m,'z8_photo_lut_shutdown',stack,x0=saved)
         self.call(m,'z8_photo_lut_shutdown',stack,x0=saved)
-        self.assertEqual(sleeps,[0x80000001])
+        self.assertEqual(sleeps,[])
         self.assertEqual(int.from_bytes(m.mem_read(paused,4),'little'),1)
         self.call(m,'z8_photo_lut_mode_enter',stack)
         self.call(m,'z8_photo_lut_mode_exit',stack)
         self.assertEqual(int.from_bytes(m.mem_read(paused,4),'little'),1)
-        self.assertEqual(int.from_bytes(m.mem_read(jpeg,4),'little'),0x80000000)
+        self.assertEqual(int.from_bytes(m.mem_read(jpeg,4),'little'),1)
         self.call(m,'z8_photo_lut_power_cancel',stack)
         self.call(m,'z8_photo_lut_power_cancel',stack)
         self.assertEqual(int.from_bytes(m.mem_read(paused,4),'little'),0)
         self.assertEqual(int.from_bytes(m.mem_read(power,4),'little'),0)
-        self.assertEqual(int.from_bytes(m.mem_read(jpeg,4),'little'),0)
+        self.assertEqual(int.from_bytes(m.mem_read(jpeg,4),'little'),1)
+
+    def test_main_jpeg_is_fully_transformed_while_preview_is_power_paused(self):
+        from z8photolut.cube import parse,bundle
+        m,state,slot,request,stack,original,before,ids=self.fixture()
+        rows=['LUT_3D_SIZE 2']+['%d %d %d'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1)]
+        data,_=bundle([parse(('\n'.join(rows)+'\n').encode())],grid=17)
+        m.mem_map(0x409a1000,0xf000);m.mem_write(0x409a0000,data)
+        m.mem_map(0x41186000,4096);m.mem_map(0xc10000000,4096)
+        m.mem_write(0x41186718,struct.pack('<3I',0xd2c00088,0x8b080000,0xd65f03c0))
+        parameters=0xa03008000;descriptor=parameters+0x100;saved=parameters+0x200
+        m.mem_write(parameters+8,struct.pack('<Q',descriptor))
+        image=bytearray(0x28);struct.pack_into('<I',image,0,1)
+        struct.pack_into('<2H',image,8,8,8);struct.pack_into('<2H',image,16,8,8)
+        struct.pack_into('<2Q',image,24,0x810000000,0x810000040);m.mem_write(descriptor,bytes(image))
+        registers=[0]*32;registers[1]=parameters;registers[30]=0x40eaeb90
+        m.mem_write(saved,struct.pack('<32Q',*registers))
+        m.mem_write(0xc10000000,bytes([100])*64+bytes([100,180])*32)
+        layout=self.metadata['runtime_layout'];preview=state+layout['preview_offset']
+        m.mem_write(preview+layout['paused_offset'],struct.pack('<I',1))
+        m.mem_write(preview+layout['power_paused_offset'],struct.pack('<I',1))
+        self.call(m,'z8_photo_lut_jpeg',stack,x0=saved)
+        self.assertEqual(bytes(m.mem_read(0xc10000000,128)),bytes([71])*64+bytes([186,129])*32)
+        self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,1,64))
+        self.assertEqual(int.from_bytes(m.mem_read(state+layout['jpeg_busy_offset'],4),'little'),0)
 
     def test_trim_only_frees_unowned_uncached_allocations(self):
         m,state,slot,request,stack,original,before,ids=self.fixture()
@@ -292,6 +312,29 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(int.from_bytes(m.mem_read(preview+120,4),'little'),128)
         self.assertEqual(int.from_bytes(m.mem_read(slot+8,8),'little'),0)
         self.assertEqual(int.from_bytes(m.mem_read(slot+layout['slot_bytes'],4),'little'),5)
+
+    def test_successful_bank_reset_changes_only_target_lut_and_current_if_selected(self):
+        for kind in (0,1,5,9,10,11,12,13,14):
+            for selected in range(4):
+                for success in (0,1):
+                    with self.subTest(kind=kind,selected=selected,success=success):
+                        m,state,slot,request,stack,original,before,ids=self.fixture()
+                        m.mem_map(0x41012000,4096)
+                        m.mem_write(0x41012bf4,bytes.fromhex('c0035fd6'))
+                        m.mem_write(0x409a0014,struct.pack('<I',1))
+                        m.mem_write(0xa03d48164,struct.pack('<I',selected))
+                        for bank in range(5):m.mem_write(0xa03d482b4+bank*0x2e0,b'FOLDER\x02\x5a')
+                        saved=request+0x400;registers=[0]*32;registers[0]=success;registers[19]=kind
+                        m.mem_write(saved,struct.pack('<32Q',*registers))
+                        saves=[]
+                        m.hook_add(UC_HOOK_CODE,lambda uc,at,size,user:saves.append(at) if at==0x41012bf4 else None)
+                        self.call(m,'z8_photo_lut_bank_reset_result',stack,x0=saved)
+                        target=0 if kind==9 else kind-10
+                        valid=success and 0<=target<4
+                        for bank in range(5):
+                            changed=valid and (bank==target+1 or bank==0 and selected==target)
+                            self.assertEqual(bytes(m.mem_read(0xa03d482b4+bank*0x2e0,8)),b'FOLDER'+bytes([1 if changed else 2,0x5a]))
+                        self.assertEqual(len(saves),1 if valid else 0)
 
 
 if __name__=='__main__':unittest.main()

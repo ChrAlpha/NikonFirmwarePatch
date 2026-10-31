@@ -14,6 +14,7 @@ from z8photolut.patcher import build
 def main():
     p=argparse.ArgumentParser(description=__doc__,epilog='Camera menu: Photo shooting menu > Photo LUT > Off or a look. '
         'Selection belongs to the photo shooting bank. LUTs are compiled into this build. '
+        'LUTs act on Nikon-rendered SDR image values; .cube does not identify scene-linear or log colorimetry. '
         'This development build requires physical-camera acceptance; QEMU timing is not camera performance.')
     p.add_argument('firmware',type=Path)
     p.add_argument('--lut',type=Path,action='append',required=True,help='3D .cube file; repeat for up to eight looks')

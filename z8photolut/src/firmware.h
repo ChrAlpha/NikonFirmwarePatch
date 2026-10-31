@@ -12,7 +12,6 @@
  * alignment bytes are descriptor-unowned and persisted with all five banks. */
 #define Z8_SAVED_CHOICE ((uint8_t *)(uintptr_t)UINT64_C(0xa03d482ba))
 #define Z8_PREVIEW_SLOTS 8u
-#define Z8_JPEG_CLOSED (UINT32_C(1)<<31)
 
 typedef struct {
     uint32_t state,choice;
@@ -51,7 +50,7 @@ typedef struct {
     uint32_t jpeg_choice, jpeg_error, width, height;
     uint64_t y, uv;
     Z8Preview preview;
-    /* Atomic admission gate: high bit closes new work; low bits count owners. */
+    /* Diagnostic count; native image-job ownership controls JPEG lifetime. */
     uint32_t jpeg_busy,reserved;
 } Z8LutState;
 
@@ -69,6 +68,7 @@ void z8_photo_lut_will_apply(const uint64_t *);
 void z8_photo_lut_applied(const uint64_t *);
 void z8_photo_lut_shutdown(const uint64_t *);
 void z8_photo_lut_power_cancel(void);
+void z8_photo_lut_bank_reset_result(const uint64_t *);
 int z8_photo_lut_menu_entry(void *page);
 void z8_photo_lut_menu_ok(void *context);
 int z8_photo_lut_photo_refresh(void *page);

@@ -57,7 +57,7 @@ def compile_code(compiler='clang-19'):
                                 ('mode','ffc301d1',0x410463e8),('mode_exit','a0020012',0x41046708),
                                 ('reset','e00314aa',0x40cd92ac),('construct','e00315aa',0x40cd760c),
                                 ('pool_init','f75bbda9',0x41045ba4),('pool_init_exit','60020012',0x41045df8),
-                                ('shutdown','f40f1ef8',0x40d67264)]:
+                                ('shutdown','f40f1ef8',0x40d67264),('bank_reset_result','95ac8352',0x40d68208)]:
             start=symbols[f'z8_photo_lut_{name}_entry']-CODE
             expected=bytes.fromhex(old)
             at=raw.find(expected,start,start+256)
@@ -192,7 +192,7 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
         img.put(at-BASE,branch(at,symbols[f'z8_photo_lut_{name}_entry']),
                 'photo LUT resource lifecycle '+name,expect=bytes.fromhex(old))
     for at,old,name in [(0x41016350,'020540b9','bank'),(0x410169c8,'020540b9','bank_default'),
-                        (0x41016874,'220540b9','current_default')]:
+                        (0x41016874,'220540b9','current_default'),(0x40d68204,'95ac8352','bank_reset_result')]:
         img.put(at-BASE,branch(at,symbols[f'z8_photo_lut_{name}_entry']),
                 'photo LUT setting '+name.replace('_',' '),expect=bytes.fromhex(old))
     # Group6 has five 0x2e0-byte photo banks. Original item0x600 occupies
@@ -223,5 +223,9 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
         edits=edits,all_bytes_outside_edits_preserved=True,lut_sha256=sha(luts),
         runtime=dict(address='0xa101f0000',source='0x40bf0000',bytes=4096,layout=native['runtime_layout']),
         settings=dict(group=6,current='0xa03d482ba',banks=5,stride=0x2e0,
-                      copy_hooks=['0x41016350','0x410169c8','0x41016874'],save_request='0x41012bf4'),
+                      copy_hooks=['0x41016350','0x410169c8','0x41016874'],reset_success_hook='0x40d68204',save_request='0x41012bf4'),
+        color_contract=dict(stage='native rendered 8-bit photo YUV before display or JPEG',
+                            model_conversion='integer BT.601 full-range YCbCr',camera_colorimetry_verified=False,
+                            preview='65x65 chroma cache with all256 luma samples; bilinear approximation',
+                            jpeg='RGB tetrahedral interpolation per pixel'),
         acceptance=dict(full_jpeg=False,continuous_preview=False,physical_camera=False))
