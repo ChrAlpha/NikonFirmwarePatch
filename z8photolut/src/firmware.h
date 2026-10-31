@@ -51,7 +51,7 @@ typedef struct {
     uint64_t y, uv;
     Z8Preview preview;
     /* Diagnostic count; native image-job ownership controls JPEG lifetime. */
-    uint32_t jpeg_busy,reserved;
+    uint32_t jpeg_busy,cache_cleanup_lock;
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)

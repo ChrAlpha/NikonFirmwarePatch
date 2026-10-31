@@ -104,17 +104,27 @@ static unsigned preview_source(uint64_t descriptor,Z8Surface *f)
 
 static void release_cache(volatile Z8Preview *p)
 {
+    /* The native pool mutex is acquired after our mode-entry hook. Serialize
+     * concurrent cleanup here so a second transition cannot reconfigure the
+     * pool while the first still cleans or frees its detached resource. */
+    for(;;) {
+        uint32_t expected=0;
+        if(__atomic_compare_exchange_n(&Z8_STATE->cache_cleanup_lock,&expected,1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
+        TASK_SLEEP(1);
+    }
     uint64_t resource=__atomic_exchange_n(&p->cache_resource,0,__ATOMIC_ACQ_REL);
     uint64_t cached=__atomic_exchange_n(&p->cache,0,__ATOMIC_ACQ_REL);
     __atomic_store_n(&p->cache_choice,0,__ATOMIC_RELEASE);
-    if(!resource) return;
-    if(cached) {
+    if(resource && cached) {
         /* Prevent dirty CPU lines from reaching a later owner's DMA buffer. */
         clean((const void *)(uintptr_t)cached,Z8_PREVIEW_TABLE_BYTES);
         invalidate((const void *)(uintptr_t)cached,Z8_PREVIEW_TABLE_BYTES);
     }
-    if(!POOL_FREE(resource)) p->worker_error=4;
-    __atomic_fetch_add(&p->cache_releases,1,__ATOMIC_RELAXED);
+    if(resource) {
+        if(!POOL_FREE(resource)) p->worker_error=4;
+        __atomic_fetch_add(&p->cache_releases,1,__ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&Z8_STATE->cache_cleanup_lock,0,__ATOMIC_RELEASE);
 }
 
 static int acquire_cache(volatile Z8Preview *p)

@@ -270,6 +270,26 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(int.from_bytes(m.mem_read(power,4),'little'),0)
         self.assertEqual(int.from_bytes(m.mem_read(jpeg,4),'little'),1)
 
+    def test_mode_transition_waits_for_already_detached_cache_cleanup(self):
+        m,state,slot,request,stack,original,before,ids=self.fixture()
+        layout=self.metadata['runtime_layout'];preview=state+layout['preview_offset']
+        cleanup=state+layout['jpeg_busy_offset']+4
+        # Another task detached resource0 but has not finished its CPU clean.
+        m.mem_write(cleanup,struct.pack('<I',1))
+        m.mem_write(preview+152,struct.pack('<Q',0xca83fb000))
+        m.mem_write(0x40d2d654,bytes.fromhex('c0035fd6'))
+        waited=[]
+        def finish_other_owner(uc,address,size,user):
+            if address==0x40d2d654:
+                self.assertEqual(int.from_bytes(uc.mem_read(cleanup,4),'little'),1)
+                self.assertEqual(int.from_bytes(uc.mem_read(preview+152,8),'little'),0xca83fb000)
+                waited.append(address)
+                uc.mem_write(preview+152,bytes(8));uc.mem_write(cleanup,bytes(4))
+        m.hook_add(UC_HOOK_CODE,finish_other_owner)
+        self.call(m,'z8_photo_lut_mode_enter',stack)
+        self.assertEqual(len(waited),1)
+        self.assertEqual(int.from_bytes(m.mem_read(cleanup,4),'little'),0)
+
     def test_main_jpeg_is_fully_transformed_while_preview_is_power_paused(self):
         from z8photolut.cube import parse,bundle
         m,state,slot,request,stack,original,before,ids=self.fixture()
