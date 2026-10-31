@@ -7,6 +7,9 @@
 #define Z8_LUT_MAX_LOOKS 8u
 #define Z8_LUT_BUNDLE_LIMIT 0x200000u
 #define Z8_LUT_MAGIC UINT64_C(0x32303054554c385a)
+#define Z8_PREVIEW_GRID 65u
+#define Z8_PREVIEW_TABLE_NODES (256u*Z8_PREVIEW_GRID*Z8_PREVIEW_GRID)
+#define Z8_PREVIEW_TABLE_BYTES (Z8_PREVIEW_TABLE_NODES*8u)
 
 typedef struct {
     uint32_t offset, bytes, grid, identity, crc32, reserved;
@@ -42,6 +45,8 @@ unsigned z8_lut_validate(const Z8LookBundle *, uint32_t available);
 unsigned z8_lut_select(const Z8LookBundle *, uint32_t choice, uint32_t strength, Z8Look *);
 void z8_lut_rgb(const Z8Look *, const uint8_t rgb[3], uint8_t output[3]);
 unsigned z8_lut_surface(const Z8Surface *, const Z8Look *);
+unsigned z8_lut_preview_build(const Z8Look *,uint64_t *table,uint32_t bytes);
+unsigned z8_lut_preview_surface(const Z8Surface *,const uint64_t *table,uint32_t bytes);
 
 _Static_assert(sizeof(Z8LookEntry)==96, "look entry ABI");
 _Static_assert(sizeof(Z8LookBundle)==832, "bundle ABI");

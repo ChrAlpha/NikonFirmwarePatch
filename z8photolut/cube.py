@@ -137,6 +137,9 @@ def bundle(cubes, *, grid=33, default=0):
         payload[HEADER_BYTES+i*ENTRY_BYTES:HEADER_BYTES+(i+1)*ENTRY_BYTES] = entry
         details.append(dict(title=cube.title, input_size=cube.size, native_size=grid,
                             identity=identity, source_sha256=cube.source_sha256,
+                            domain_min=cube.minimum,domain_max=cube.maximum,
+                            resampling='trilinear',runtime_interpolation='tetrahedral',
+                            output_range='clipped SDR RGB 0..1',
                             samples_sha256=hashlib.sha256(samples).hexdigest()))
     struct.pack_into('<8s6I', payload, 0, MAGIC, 2, len(payload), len(cubes), default,
                      zlib.crc32(payload[HEADER_BYTES:]), 0)

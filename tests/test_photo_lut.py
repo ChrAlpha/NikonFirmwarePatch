@@ -40,6 +40,8 @@ class PhotoLutTests(unittest.TestCase):
         cls.lib.z8_lut_rgb.argtypes=[C.POINTER(Look),C.POINTER(C.c_uint8),C.POINTER(C.c_uint8)]
         cls.lib.z8_lut_surface.argtypes=[C.POINTER(Surface),C.POINTER(Look)]
         cls.lib.z8_lut_surface.restype=C.c_uint
+        cls.lib.z8_lut_preview_build.argtypes=[C.POINTER(Look),C.POINTER(C.c_uint64),C.c_uint32]
+        cls.lib.z8_lut_preview_surface.argtypes=[C.POINTER(Surface),C.POINTER(C.c_uint64),C.c_uint32]
         cls.identity,_=bundle([parse(cube_text())],grid=17)
         cls.cycle,_=bundle([parse(cube_text(cycle=True))],grid=17)
 
@@ -122,6 +124,31 @@ class PhotoLutTests(unittest.TestCase):
             self.assertNotEqual(bytes(y),y_before)
             for row in range(height):self.assertEqual(bytes(y)[row*stride+width:(row+1)*stride],y_before[row*stride+width:(row+1)*stride])
             for row in range(height//divisor):self.assertEqual(bytes(uv)[row*stride+width:(row+1)*stride],uv_before[row*stride+width:(row+1)*stride])
+
+    def test_preview_cache_matches_rgb_reference_with_bounded_quantization(self):
+        storage,look=self.native_look(self.cycle)
+        nodes=256*65*65
+        cache=(C.c_uint64*nodes)()
+        self.assertEqual(self.lib.z8_lut_preview_build(C.byref(look),cache,C.sizeof(cache)),0)
+        self.assertNotEqual(self.lib.z8_lut_preview_build(C.byref(look),cache,C.sizeof(cache)-8),0)
+        rng=random.Random(661)
+        for divisor in [1,2]:
+            width,height,stride=256,128,272
+            raw_y=bytes(rng.randrange(256) for _ in range(stride*height))
+            raw_uv=bytes(rng.randrange(256) for _ in range(stride*height//divisor))
+            exact_y=(C.c_uint8*len(raw_y)).from_buffer_copy(raw_y)
+            exact_uv=(C.c_uint8*len(raw_uv)).from_buffer_copy(raw_uv)
+            fast_y=(C.c_uint8*len(raw_y)).from_buffer_copy(raw_y)
+            fast_uv=(C.c_uint8*len(raw_uv)).from_buffer_copy(raw_uv)
+            exact=Surface(exact_y,exact_uv,len(raw_y),len(raw_uv),width,height,stride,stride,divisor)
+            fast=Surface(fast_y,fast_uv,len(raw_y),len(raw_uv),width,height,stride,stride,divisor)
+            self.assertEqual(self.lib.z8_lut_surface(C.byref(exact),C.byref(look)),0)
+            self.assertEqual(self.lib.z8_lut_preview_surface(C.byref(fast),cache,C.sizeof(cache)),0)
+            delta=sorted(abs(a-b) for plane_a,plane_b in [(exact_y,fast_y),(exact_uv,fast_uv)] for a,b in zip(plane_a,plane_b))
+            self.assertLessEqual(max(delta),4)
+            self.assertLessEqual(delta[len(delta)*99//100],2)
+            for y in range(height):self.assertEqual(bytes(fast_y)[y*stride+width:(y+1)*stride],raw_y[y*stride+width:(y+1)*stride])
+            for y in range(height//divisor):self.assertEqual(bytes(fast_uv)[y*stride+width:(y+1)*stride],raw_uv[y*stride+width:(y+1)*stride])
 
 
 if __name__=='__main__':unittest.main()

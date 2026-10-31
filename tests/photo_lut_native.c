@@ -19,6 +19,8 @@ int main(int argc,char **argv)
         table[at++]=(uint16_t)((r*65535u+16)/32);
     }
     Z8Look look={table,33,0,256};
+    uint64_t *cache=malloc(Z8_PREVIEW_TABLE_BYTES);assert(cache);
+    assert(z8_lut_preview_build(&look,cache,Z8_PREVIEW_TABLE_BYTES)==0);
     for(unsigned divisor=1;divisor<=2;divisor++) {
         size_t yn=(size_t)stride*height,un=yn/divisor;
         uint8_t *y=malloc(yn+128),*uv=malloc(un+128);assert(y&&uv);
@@ -49,8 +51,27 @@ int main(int argc,char **argv)
             assert(uv[x]==0xa5&&uv[64+un+x]==0xa5);
         }
         printf("{\"width\":%u,\"height\":%u,\"uv_divisor\":%u,\"seconds\":%.6f,\"yuv\":[%u,%u,%u],\"physical_camera_timing\":false}\n",width,height,divisor,elapsed,first_y,first_u,first_v);
+        for(unsigned row=0;row<height;row++) memset(y+64+(size_t)row*stride,100,width);
+        for(unsigned row=0;row<height/divisor;row++) for(unsigned x=0;x<width;x+=2) {
+            uv[64+(size_t)row*stride+x]=100;uv[65+(size_t)row*stride+x]=180;
+        }
+        assert(z8_lut_preview_surface(&f,cache,Z8_PREVIEW_TABLE_BYTES)==0);
+        for(unsigned row=0;row<height;row++) {
+            for(unsigned x=0;x<width;x++) assert(y[64+(size_t)row*stride+x]==first_y);
+            for(unsigned x=width;x<stride;x++) assert(y[64+(size_t)row*stride+x]==0x5a);
+        }
+        for(unsigned row=0;row<height/divisor;row++) {
+            for(unsigned x=0;x<width;x+=2) {
+                assert(uv[64+(size_t)row*stride+x]==first_u);
+                assert(uv[65+(size_t)row*stride+x]==first_v);
+            }
+            for(unsigned x=width;x<stride;x++) assert(uv[64+(size_t)row*stride+x]==0xa5);
+        }
+        /* Exercise all endpoint reads, especially the last U/V/Y cell. */
+        memset(y,255,yn+128);memset(uv,255,un+128);
+        assert(z8_lut_preview_surface(&f,cache,Z8_PREVIEW_TABLE_BYTES)==0);
         free(y);free(uv);
     }
-    free(table);
+    free(cache);free(table);
     return 0;
 }
