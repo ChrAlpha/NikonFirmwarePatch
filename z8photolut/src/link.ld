@@ -14,9 +14,6 @@ z8_photo_lut_applied_failure = 0x402d14d0;
 z8_photo_lut_pool_init_resume = 0x41045ba4;
 z8_photo_lut_pool_init_exit_resume = 0x41045df8;
 z8_photo_lut_shutdown_resume = 0x40d67264;
-z8_photo_lut_bank_resume = 0x41016354;
-z8_photo_lut_bank_default_resume = 0x410169cc;
-z8_photo_lut_current_default_resume = 0x41016878;
 z8_photo_lut_bank_reset_result_resume = 0x40d68208;
 SECTIONS {
     . = 0x40990000;

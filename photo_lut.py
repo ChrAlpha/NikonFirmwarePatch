@@ -4,7 +4,7 @@
 A library file (Z8LUTLIB.BIN) holds up to eight looks. Its camera part is the
 runtime bundle the firmware applies; its host part keeps each look's exact
 original .cube. The same file is built into firmware, or copied to a card root
-and loaded in the camera for the current power-on session.
+and imported once in the camera, then restored automatically after power cycles.
 """
 import argparse
 import json
@@ -20,14 +20,16 @@ from z8photolut.patcher import build
 
 NOTES = ('Looks act on the photo the camera has already rendered: 8-bit full-range Y\'CbCr of the JPEG after the '
          'active Picture Control, in its selected colour space. RAW (NEF) data is never changed. '
-         'Camera menu: Photo shooting menu > Photo LUT > Off, Load LUTs from card, or a look. A card load lasts until '
-         'the camera is switched off; afterwards only built-in looks (none by default) remain and card selections '
-         'read as Off.')
+         'Camera menu: Photo shooting menu > Photo LUT > Off, Load LUTs from card, or a look. Import once: the library '
+         'source and full transform identities for banks A-D are saved internally. Card libraries restore '
+         'automatically after power cycles; keep Z8LUTLIB.BIN on the card. Off retains the imported library. '
+         'An unavailable selected look blocks capture until it is restored or Off is selected.')
 
 
 BUILTIN_FILE = 'builtin-library.bin'
-BUILTIN_NOTICE = ('Saved Photo LUT selections are look positions. After installing firmware whose built-in looks '
-                  'differ from the installed firmware, set Photo LUT again in every shooting bank.')
+BUILTIN_NOTICE = ('Saved Photo LUT selections use full transform identities, so renaming or reordering looks '
+                  'preserves selections. A removed or changed transform remains unavailable until restored '
+                  'or another look or Off is selected.')
 
 
 def load_cubes(paths, grid, accept):

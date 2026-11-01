@@ -63,7 +63,7 @@ Windows 使用 `py -3 -m venv .venv` 创建环境，用 `.\.venv\Scripts\Activat
 ### 使用与文档
 
 - 功能指南：[ProRes](docs/prores.md#简体中文)、[RAW／预拍摄](docs/raw-precapture.md#简体中文)、[像素位移](docs/pixelshift.md#简体中文)、[开放门／N-RAW](docs/opengate-nraw.md#简体中文)。
-- [照片 LUT](docs/photo-lut.md#简体中文)：独立的开发版工具 `photo_lut.py`，不属于上述 v0.3.0-r1 工具包的四项功能和 15 种组合，尚未实机验收。
+- [照片 LUT](docs/photo-lut.md#简体中文)：独立的开发版工具 `photo_lut.py`，不属于上述 v0.3.0-r1 工具包的四项功能和 15 种组合，支持导入库和 A–D 选择在正常关机后自动恢复；关闭效果仍保留导入库。尚未实机验收。
 - [已知问题与功能限制](docs/known-issues.md)、[当前验证](docs/validation.md)、[上一公开版记录](docs/validation-v0.2.0.md)。
 - [发布包与独立验证](docs/releases.md)、[更新日志](CHANGELOG.md)。
 

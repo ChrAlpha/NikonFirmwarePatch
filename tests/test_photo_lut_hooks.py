@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from z8photolut.patcher import compile_code,CODE
 from z8photolut import patcher
-from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,bundle_ids,desire,record_bytes,runtime_bundle,snapshot_bytes
 
 
 class PhotoLutPrebuiltTests(unittest.TestCase):
@@ -168,54 +168,6 @@ def service_code():
             patcher.branch(SERVICE+20,NativeScheduler.SLEEP,True)+patcher.branch(SERVICE+24,SERVICE+4))
 
 
-@unittest.skipIf(Uc is None,'Unicorn is required for AArch64 hook ABI checks')
-class PhotoLutHookTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.code,cls.symbols,cls.metadata=compile_code()
-
-    def execute(self,name,identifier,length,flags,descriptor=0x4400bb98):
-        machine=Uc(UC_ARCH_ARM64,UC_MODE_ARM)
-        machine.mem_map(CODE,65536)
-        machine.mem_write(CODE,self.code)
-        machine.mem_map(0x4400b000,4096)
-        machine.mem_map(0x60000000,8192)
-        machine.mem_write(descriptor+4,struct.pack('<I',length))
-        resume=self.symbols[f'z8_photo_lut_{name}_resume']
-        machine.mem_map(resume&~4095,4096)
-        rng=random.Random(892)
-        before=[rng.randrange(1<<64) for _ in range(31)]
-        before[8 if name!='current_default' else 9]=descriptor
-        before[20]=identifier
-        ids=[getattr(regs,f'UC_ARM64_REG_X{i}') for i in range(31)]
-        for register,value in zip(ids,before):machine.reg_write(register,value)
-        sp=0x60001800
-        machine.reg_write(regs.UC_ARM64_REG_SP,sp)
-        machine.reg_write(regs.UC_ARM64_REG_NZCV,flags)
-        machine.emu_start(self.symbols[f'z8_photo_lut_{name}_entry'],resume,count=80)
-        qualified=descriptor==0x4400bb98 if name=='current_default' else identifier&65535==0x600
-        before[2]=8 if qualified and length==6 else length
-        self.assertEqual(machine.reg_read(regs.UC_ARM64_REG_PC),resume)
-        self.assertEqual(machine.reg_read(regs.UC_ARM64_REG_SP),sp)
-        self.assertEqual(machine.reg_read(regs.UC_ARM64_REG_NZCV),flags)
-        self.assertEqual([machine.reg_read(i) for i in ids],before)
-
-    def test_copy_and_bank_reset_preserve_registers_and_flags(self):
-        for name in ['bank','bank_default']:
-            for identifier in [0x02000600,0x06000600,0x00000601,0x0200120b]:
-                for length in [0,1,6,7,1024]:
-                    for flags in [0,0x50000000,0xa0000000,0xf0000000]:
-                        with self.subTest(name=name,identifier=identifier,length=length,flags=flags):
-                            self.execute(name,identifier,length,flags)
-
-    def test_current_default_uses_descriptor_identity(self):
-        for descriptor in [0x4400bb98,0x4400bbb0]:
-            for length in [0,6,7]:
-                for flags in [0,0x50000000,0xa0000000,0xf0000000]:
-                    with self.subTest(descriptor=descriptor,length=length,flags=flags):
-                        self.execute('current_default',0x12345678,length,flags,descriptor)
-
-
 @unittest.skipIf(Uc is None,'Unicorn is required for AArch64 queue ABI checks')
 class PhotoLutQueueTests(unittest.TestCase):
     @classmethod
@@ -233,7 +185,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         layout=self.metadata['runtime_layout']
         m.mem_write(state,struct.pack('<Q6I',0x32545354554c385a,2,layout['state_bytes'],1,256,1,0))
         m.mem_write(0x409a0010,struct.pack('<I',2))
-        m.mem_write(0xa03d482ba,b'\x01')
+        desire(m,layout,1)
         m.mem_write(0xa02810470,struct.pack('<I',1 if channel==3 else 0))
         m.mem_write(context+0x10,struct.pack('<I',6))
         original=bytearray((i*29)&255 for i in range(0x98));original[0]=1
@@ -455,7 +407,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         if footer>=raw+0x400000000+8192:
             try:m.mem_map(footer&~4095,4096)
             except Exception:pass # Shares the snapshot's last page.
-        m.mem_write(0xa03d482ba,bytes([selected]))
+        desire(m,self.metadata['runtime_layout'],selected)
         allocations=[];freed=[];encodes=[];self.encode_log=[];self.encode_failures={}
         pixels=width*height
         self.source=bytes([100])*pixels+bytes([100,180])*(pixels//2)
@@ -574,7 +526,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         m.mem_write(preview+layout['paused_offset'],struct.pack('<I',1))
         m.mem_write(preview+layout['power_paused_offset'],struct.pack('<I',1))
         # A menu change after reservation does not alter this capture's look.
-        m.mem_write(0xa03d482ba,b'\0')
+        desire(m,layout,0)
         _,jobs,_=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
         self.assertEqual(jobs[0]['result'],1)
         self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,1,64))
@@ -783,7 +735,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         for selected in (0,2):
             with self.subTest(selected=selected):
                 m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(selected)
-                m.mem_write(0xa03d482ba,b'\x01')
+                desire(m,self.metadata['runtime_layout'],1)
                 scheduler,jobs,_=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(1,params))],service=False)
                 self.assertEqual(encodes,[(1,desc,(0x810000000,0x810000040))])
                 self.assertEqual(allocations,[(42,0x38,4096+LEASE_BYTES)])
@@ -869,17 +821,23 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(int.from_bytes(m.mem_read(slot+8,8),'little'),0)
         self.assertEqual(int.from_bytes(m.mem_read(slot+layout['slot_bytes'],4),'little'),5)
 
-    def test_successful_bank_reset_changes_only_target_lut_and_current_if_selected(self):
+    def test_successful_bank_reset_resets_only_the_target_bank_record(self):
+        layout=self.metadata['runtime_layout']
         for kind in (0,1,5,9,10,11,12,13,14):
-            for selected in range(4):
-                for success in (0,1):
-                    with self.subTest(kind=kind,selected=selected,success=success):
+            for success in (0,1):
+                for ready in (0,1):
+                    with self.subTest(kind=kind,success=success,ready=ready):
                         m,state,slot,request,stack,original,before,ids=self.fixture()
                         m.mem_map(0x41012000,4096)
                         m.mem_write(0x41012bf4,bytes.fromhex('c0035fd6'))
-                        m.mem_write(0x409a0014,struct.pack('<I',1))
-                        m.mem_write(0xa03d48164,struct.pack('<I',selected))
-                        for bank in range(5):m.mem_write(0xa03d482b4+bank*0x2e0,b'FOLDER\x02\x5a')
+                        m.mem_write(0x409a0014,struct.pack('<I',1))       # built-in default: look 1
+                        looks=bundle_ids(m)
+                        persist=state+layout['persist_offset']
+                        banks=[looks[1],None,looks[1],'unresolved']
+                        m.mem_write(persist,record_bytes(banks))
+                        m.mem_write(persist+layout['persist_ready_offset'],struct.pack('<I',ready))
+                        m.mem_write(persist+layout['persist_authoritative_offset'],struct.pack('<I',ready))
+                        m.mem_write(persist+layout['persist_blob_offset'],struct.pack('<I',1))   # stored record read
                         saved=request+0x400;registers=[0]*32;registers[0]=success;registers[19]=kind
                         m.mem_write(saved,struct.pack('<32Q',*registers))
                         saves=[]
@@ -887,11 +845,13 @@ class PhotoLutQueueTests(unittest.TestCase):
                         self.call(m,'z8_photo_lut_bank_reset_result',stack,x0=saved)
                         target=0 if kind==9 else kind-10
                         valid=success and 0<=target<4
-                        for bank in range(5):
-                            changed=valid and (bank==target+1 or bank==0 and selected==target)
-                            # A reset selects the active library's default and its tag (built-in: 0).
-                            self.assertEqual(bytes(m.mem_read(0xa03d482b4+bank*0x2e0,8)),b'FOLDER'+(bytes([1,0]) if changed else bytes([2,0x5a])))
-                        self.assertEqual(len(saves),1 if valid else 0)
+                        expected=list(banks)
+                        if valid and ready:expected[target]=looks[0]
+                        self.assertEqual(bytes(m.mem_read(persist,0xc0)),record_bytes(expected))
+                        # A reset before the record is decided is kept and merged when it is.
+                        pending=struct.unpack('<I',m.mem_read(persist+layout['persist_pending_offset'],4))[0]
+                        self.assertEqual(pending,1<<target if valid and not ready else 0)
+                        self.assertEqual(saves,[0x41012bf4] if valid and ready else [])
 
 
 if __name__=='__main__':unittest.main()

@@ -70,8 +70,14 @@ def compile_code(compiler='clang-19'):
                      'cache_resource_offset','paused_offset','apply_sequence_offset','flags_offset',
                      'apply_counter_offset','display_epoch_offset','slot_count','power_paused_offset',
                      'jpeg_busy_offset','jpeg_preview_offset','jpeg_worker_offset','card_offset','xmp_offset',
-                     'xmp_skipped_offset'),
-                    struct.unpack_from('<20I',raw,offset)))
+                     'xmp_skipped_offset','persist_offset','persist_sequence_offset','persist_ready_offset',
+                     'persist_restore_offset','persist_source_offset','persist_blob_offset','persist_pending_offset',
+                     'persist_authoritative_offset','boots_offset','persist_reason_offset','persist_detail_offset',
+                     'persist_retries_offset','persist_library_generation_offset','persist_effective_offset',
+                     'persist_refused_forecasts_offset','persist_refused_allocations_offset','persist_commits_offset',
+                     'persist_blob_writes_offset','persist_refused_writes_offset','persist_blob_reads_offset',
+                     'persist_late_reads_offset','xmp_last_choice_offset','xmp_last_applied_offset'),
+                    struct.unpack_from('<43I',raw,offset)))
     return raw,symbols,dict(sha256=sha(raw),bytes=len(raw),flags=flags,
         compiler=subprocess.check_output([cc,'--version'],text=True).splitlines()[0],
         sources=sources,runtime_layout=layout)
@@ -98,10 +104,10 @@ def load_code(code_source='source',compiler='clang-19'):
 TEXT_BLOCKS,BLOCK_BYTES,LOOK_SLOTS,FIRST_STRING=0x408d0000,0x800,8,3137
 # Every language except Simplified (8) and Traditional (9) Chinese uses group 0.
 MENU_TEXT=(
-    ('Photo LUT','Apply a look to photo preview and JPEG; RAW is unchanged. Card looks last until power off.',
+    ('Photo LUT','LUT for preview/JPEG; RAW unchanged. Import once; keep the card file for automatic restore.',
      'Off','Load LUTs from card'),
-    ('照片 LUT','对照片预览和 JPEG 应用风格；RAW 不变。存储卡风格在关机前有效。','关闭','从存储卡载入 LUT'),
-    ('照片 LUT','對照片預覽和 JPEG 套用風格，RAW 不變。記憶卡風格在關機前有效。','關閉','從記憶卡載入 LUT'))
+    ('照片 LUT','预览与 JPEG 使用风格，RAW 不变。导入后开机自动恢复。请保留卡上库文件。','关闭','从存储卡载入 LUT'),
+    ('照片 LUT','預覽與 JPEG 使用風格，RAW 不變。匯入後開機自動恢復。請保留卡上庫檔。','關閉','從記憶卡載入 LUT'))
 
 
 def text_block(group,names):
@@ -190,6 +196,70 @@ def add_menu(img,names,symbols):
     return dict(state=29,item=0x2caa,options=count,page=hex(page_va))
 
 
+# Enum values of firmware.h, in declaration order (test_photo_lut_persistence checks them).
+DESIRED=('off','look','unresolved')
+SOURCES=('none','stored','fresh','migrated','lost','defaults','retained','unread')
+BLOBS=('pending','valid','absent','corrupt','lost','unread','skipped')
+RESTORES=('waiting','reading','done')
+EFFECTIVE=('off','applied','restoring','unavailable','unresolved')
+CARD_STATUS=('idle','loaded','no-file','invalid','conflict','read-error','memory','busy','restoring',
+             'not-in-library','unresolved')
+STATE_VA=0xa101f0000
+
+
+def persistence(layout):
+    """Where the bank record lives and how to observe its lifecycle (read-only probes)."""
+    persist=STATE_VA+layout['persist_offset']
+    def probe(name,address,size,meaning,type='u32',values=None):
+        entry=dict(name=name,address=hex(address),size=size,type=type,meaning=meaning)
+        if values:entry['values']={str(i):v for i,v in enumerate(values)}
+        return entry
+    def field(name,size,meaning,values=None,type='u32'):
+        return probe(name,persist+layout[f'persist_{name}_offset'],size,meaning,type,values)
+    probes=[probe('state_magic',STATE_VA,8,'Z8LUTST2 once the boot hook ran this boot','u64'),
+            probe('state_version',STATE_VA+8,4,'private state layout version (4)'),
+            probe('boots',STATE_VA+layout['boots_offset'],8,'boot hook runs since cold power-on (state reset each boot)','u64'),
+            probe('bank_index',0xa03d48164,4,'native selected photo bank 0..3 (A..D)'),
+            *(probe(f'owned_bytes_{copy}',0xa03d482ba+copy*0x2e0,2,
+                    'photo-bank blob owned bytes: 0xffff record authoritative, 0 never written, other: pre-record selection',
+                    'u16') for copy in range(5)),
+            probe('record',persist,0xc0,'Z8BankRecord: u32 magic Z8BK, u16 version 1, u16 bytes 0xc0, u32 library '
+                  '(0 built-in, 1 card), u32 reserved, banks A..D {u8 kind (0 off, 1 look, 2 unresolved), 3 reserved, '
+                  '32-byte transform id}, sha256','bytes'),
+            field('sequence',4,'record seqlock: odd while written; equal before/after a read = consistent snapshot'),
+            field('ready',4,'record decided this boot (1) or still restoring (0)'),
+            field('authoritative',4,'record decided from an actual read or native reset; only then stored'),
+            field('source',4,'origin of the record this boot',SOURCES),
+            field('blob',4,'outcome of reading the stored blob-16 region',BLOBS),
+            field('pending',4,'changes kept until an actual read decides the record (bit per bank, 0x10 library)'),
+            field('restore',4,'card library restore attempt',RESTORES),
+            field('reason',4,'last card read result',CARD_STATUS),
+            field('detail',4,'card slots of that result (1 slot 1, 2 slot 2, 3 both)'),
+            field('retries',4,'card restore attempts this boot'),
+            field('library_generation',4,'card library publications this boot'),
+            field('effective',4,'selected bank, last evaluated',EFFECTIVE),
+            field('refused_forecasts',4,'capacity forecasts withheld (selected look not applied)'),
+            field('refused_allocations',4,'capture allocations withheld (selected look not applied)'),
+            field('commits',4,'record store requests'),
+            field('blob_writes',4,'blob-16 region writes with the record'),
+            field('refused_writes',4,'blob-16 stores refused (stored record unreadable or no memory)'),
+            field('blob_reads',4,'blob-16 region reads'),
+            field('late_reads',4,'blob-16 reads after the record was decided (ignored)'),
+            probe('xmp_last_choice',STATE_VA+layout['xmp_last_choice_offset'],4,'look position latched by the last JPEG'),
+            probe('xmp_last_applied',STATE_VA+layout['xmp_last_applied_offset'],4,'applied bits latched by the last JPEG')]
+    region='stock blob 16 (0xcdb0 B) then Z8BankRecord (0xc0 B); generation u32 at 0x1fff8, ENDM at 0x1fffc'
+    return dict(schema=1,
+        block=dict(address=hex(STATE_VA),bytes=layout['state_bytes'],magic='0x32545354554c385a',version=4,
+                   record=hex(persist),record_bytes=0xc0,sequence=hex(persist+layout['persist_sequence_offset'])),
+        record=dict(section=16,group=0x31,blob='0xa03dabdc0',stock_bytes=0xcdb0,bytes=0xc0,kinds=list(DESIRED),
+                    libraries=['built-in','card']),
+        hooks=dict(settings_restored='0x4101248c',defaults=['0x41016a60','0x41016a7c'],blob_read='0x40d6b548',
+                   settings_wait='0x41012924',bank_copy='0x410ddb8c',blob_loaded='0x41012a48',blob_write='0x41012558',bank_reset_result='0x40d68204',save_request='0x41012bf4'),
+        probes=probes,
+        nor=[dict(name='photo-lut-record-primary',base='0x45e60000',size='0x20000',volume=16,section=16,format=region),
+             dict(name='photo-lut-record-mirror',base='0x46240000',size='0x20000',volume=16,section=16,format=region)])
+
+
 def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     require(len(stock)==81807711 and sha(stock)==STOCK_SHA,'Exact original C3.11 EG is required')
     validate_runtime(luts)
@@ -198,7 +268,7 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     code,symbols,native=load_code(code_source,compiler)
     img=Image(stock)
     img.put(CODE-BASE,code,'photo LUT native code',expect_zero=True)
-    img.put(LUT-BASE,luts,'photo LUT immutable built-in look bundle (selection marker 0)',expect_zero=True)
+    img.put(LUT-BASE,luts,'photo LUT immutable built-in look bundle',expect_zero=True)
     require(not any(stock[STATE_SOURCE-BASE:STATE_SOURCE-BASE+4096]),'Private runtime source is occupied')
     img.put(0x40eaeb8c-BASE,branch(0x40eaeb8c,symbols['z8_photo_lut_jpeg_entry'],True),
             'main JPEG encode with an isolated input surface',expect=branch(0x40eaeb8c,0x40e82090,True))
@@ -243,16 +313,23 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
                         (0x40d67260,'f40f1ef8','shutdown'),(0x40d619b8,'c0035fd6','power_cancel')]:
         img.put(at-BASE,branch(at,symbols[f'z8_photo_lut_{name}_entry']),
                 'photo LUT resource lifecycle '+name,expect=bytes.fromhex(old))
-    for at,old,name in [(0x41016350,'020540b9','bank'),(0x410169c8,'020540b9','bank_default'),
-                        (0x41016874,'220540b9','current_default'),(0x40d68204,'95ac8352','bank_reset_result')]:
-        img.put(at-BASE,branch(at,symbols[f'z8_photo_lut_{name}_entry']),
-                'photo LUT setting '+name.replace('_',' '),expect=bytes.fromhex(old))
-    # Group6 has five 0x2e0-byte photo banks. Original item0x600 occupies
-    # bytes0..5, item0x601 starts at+8. Getter/setter length stays6.
-    require(stock[0x3ece4dc:0x3ece4e4]==b'NCZ_8\0\0\0','Photo folder defaults/alignment differ')
-    require(struct.unpack_from('<6I',stock,0x3eabb98)[:2]==(10,6),'Photo folder descriptor differs')
+    img.put(0x40d68204-BASE,branch(0x40d68204,symbols['z8_photo_lut_bank_reset_result_entry']),
+            'photo LUT bank reset result',expect=bytes.fromhex('95ac8352'))
+    # Bank record lifecycle: section-15 restore finished, native
+    # defaults copied, and blob 16 (group 0x31) read, loaded-skip and store,
+    # whose mirrored region also holds the record after the stock bytes.
+    for at,target,name,why in [(0x4101248c,0x410130e0,'settings_restored','after native section-15 restore'),
+                               (0x41012924,0x40d2bd04,'settings_wait','native settings wait with startup recovery'),
+                               (0x410ddb8c,0x41013a14,'bank_copy','explicit shooting-bank item copy'),
+                               (0x41016a60,0x41016480,'defaults','after defaults for a failed restore'),
+                               (0x41016a7c,0x41016480,'defaults','after defaults for a whole reset'),
+                               (0x41012a48,0x41016aac,'blob_loaded','blob-16 read skipped while loaded'),
+                               (0x41012558,0x40d6c628,'blob_write','blob-16 store with the bank record')]:
+        img.put(at-BASE,branch(at,symbols[f'z8_photo_lut_{name}'],True),'photo LUT bank record: '+why,
+                expect=branch(at,target,True))
+    img.put(0x40d6b548-BASE,branch(0x40d6b548,symbols['z8_photo_lut_blob_read']),
+            'photo LUT bank record: blob-16 read',expect=branch(0x40d6b548,0x40d6c7d8))
     initial=struct.unpack_from('<I',luts,20)[0]
-    img.put(0x3ece4e2,bytes([initial,0]),'photo LUT default selection and built-in library marker',expect=bytes(2))
     names=[luts[HEADER+i*ENTRY+24:HEADER+i*ENTRY+88].split(b'\0',1)[0].decode() for i in range(struct.unpack_from('<I',luts,16)[0])]
     menu=add_menu(img,names,symbols)
     menu['default']='Off' if initial==0 else names[initial-1]
@@ -274,8 +351,7 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     return raw,dict(native=native,menu=menu,symbols={k:hex(v) for k,v in symbols.items()},
         edits=edits,all_bytes_outside_edits_preserved=True,lut_sha256=sha(luts),
         runtime=dict(address='0xa101f0000',source='0x40bf0000',bytes=4096,layout=native['runtime_layout']),
-        settings=dict(group=6,current='0xa03d482ba',banks=5,stride=0x2e0,
-                      copy_hooks=['0x41016350','0x410169c8','0x41016874'],reset_success_hook='0x40d68204',save_request='0x41012bf4'),
+        persistence=persistence(native['runtime_layout']),
         color_contract=dict(stage='native rendered 8-bit photo YUV before display or JPEG',
                             model_conversion='integer BT.601 full-range YCbCr',camera_colorimetry_verified=False,
                             preview='65x65 chroma cache with all256 luma samples; bilinear approximation',

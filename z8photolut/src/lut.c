@@ -66,6 +66,13 @@ static void sha_finish(Sha256 *s,uint8_t digest[32])
     for(unsigned i=0;i<32;i++) digest[i]=(uint8_t)(s->h[i/4]>>(24-8*(i%4)));
 }
 
+void z8_lut_sha256(const void *data,uint32_t bytes,uint8_t digest[32])
+{
+    Sha256 s;sha_start(&s);
+    sha_add(&s,data,bytes);
+    sha_finish(&s,digest);
+}
+
 void z8_lut_look_id(uint32_t grid,const uint16_t *samples,uint8_t digest[32])
 {
     static const char domain[]="z8photolut/look/1\0" Z8_LUT_SEMANTICS;
@@ -119,7 +126,7 @@ static unsigned validate(const Z8LookBundle *b,uint32_t available,unsigned diges
        b->magic!=Z8_LUT_MAGIC || b->version!=3 || b->bytes<sizeof(*b) ||
        b->bytes>available || b->bytes>Z8_LUT_BUNDLE_LIMIT ||
        b->count>Z8_LUT_MAX_LOOKS || b->initial>b->count ||
-       b->tag>255) return Z8_LUT_BAD_BUNDLE;
+       b->reserved) return Z8_LUT_BAD_BUNDLE;
     const uint8_t *raw=(const uint8_t *)b;
     if(z8_lut_crc32(raw+64,b->bytes-64)!=b->crc32) return Z8_LUT_BAD_BUNDLE;
     uint32_t end=sizeof(*b);
@@ -169,7 +176,7 @@ static unsigned validate(const Z8LookBundle *b,uint32_t available,unsigned diges
     if(end!=b->bytes) return Z8_LUT_BAD_BUNDLE;
     if(!digests) return Z8_LUT_OK;
     /* Library identity (host library.py Library.runtime): domain, default,
-     * then every byte after the header. The session tag is header-only. */
+     * then every byte after the header. */
     static const char domain[]="z8photolut/library/1";
     uint8_t initial[4]={(uint8_t)b->initial,(uint8_t)(b->initial>>8),(uint8_t)(b->initial>>16),(uint8_t)(b->initial>>24)};
     uint8_t digest[32];

@@ -10,7 +10,14 @@ __attribute__((used)) const uint32_t z8_photo_lut_runtime_layout[]={
     offsetof(Z8Preview,applies),offsetof(Z8Preview,display_epoch),Z8_PREVIEW_SLOTS,
     offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy),offsetof(Z8LutState,jpeg_previews_applied),
     offsetof(Z8LutState,jpeg),offsetof(Z8LutState,card),offsetof(Z8LutState,xmp_appended),
-    offsetof(Z8LutState,xmp_skipped)
+    offsetof(Z8LutState,xmp_skipped),offsetof(Z8LutState,persist),offsetof(Z8Persist,sequence),
+    offsetof(Z8Persist,ready),offsetof(Z8Persist,restore),offsetof(Z8Persist,source),offsetof(Z8Persist,blob),
+    offsetof(Z8Persist,pending_mask),offsetof(Z8Persist,authoritative),
+    offsetof(Z8LutState,boots),offsetof(Z8Persist,reason),offsetof(Z8Persist,detail),offsetof(Z8Persist,retries),
+    offsetof(Z8Persist,library_generation),offsetof(Z8Persist,effective),offsetof(Z8Persist,refused_forecasts),
+    offsetof(Z8Persist,refused_allocations),offsetof(Z8Persist,commits),offsetof(Z8Persist,blob_writes),offsetof(Z8Persist,refused_writes),
+    offsetof(Z8Persist,blob_reads),offsetof(Z8Persist,late_reads),offsetof(Z8LutState,xmp_last_choice),
+    offsetof(Z8LutState,xmp_last_applied)
 };
 
 /* Clang may lower fixed aggregate copies to memcpy in freestanding code. */
@@ -41,10 +48,10 @@ static uint8_t *cpu_address(uint64_t raw)
     if(cached!=raw && cached!=raw+UINT64_C(0x400000000)) return 0;
     return (uint8_t *)(uintptr_t)cached;
 }
-/* The active library is the built-in image bundle or this session's card
- * bundle. Publication (GUI task) first quiesces preview work, then raises
- * `publishing` and waits until every counted reader has left. A reader that
- * observes publication in progress treats the look as unavailable. */
+/* The active library is the built-in image bundle or the published card
+ * bundle. Publication (card worker only) first quiesces preview work, then
+ * raises `publishing` and waits until every counted reader has left. A reader
+ * that observes publication in progress treats the look as unavailable. */
 static const Z8LookBundle *library_active(void)
 {
     uint64_t active=__atomic_load_n(&Z8_STATE->card.active,__ATOMIC_ACQUIRE);
@@ -60,27 +67,19 @@ static const Z8LookBundle *library_enter(void)
 }
 static void library_exit(void) { __atomic_fetch_sub(&Z8_STATE->card.readers,1,__ATOMIC_RELEASE); }
 
-/* A bank stores its look index and a one-byte library marker: 0 for the
- * built-in library, nonzero for this power-on's card session library. A
- * marker that differs from the active library's reads as Off. Within a
- * session every publication remaps all banks by full transform identity.
- * The marker is not a persistent identity: every built-in library is 0, so
- * firmware with different built-in looks needs reselection (docs). */
-static uint32_t selection(const Z8LookBundle *b)
+/* Native C3.11 forecast task: 40f964e8 posts mask 1 to the object at
+ * a03bc6970 through 40c002a0. Its registered 40f95258 callback dispatches
+ * bit 0 to 40f98758, whose 40f98958 call recomputes our prospective budget.
+ * Notify after stable desired/library transitions, never from a frame path.
+ * The object and event must have completed native initialization. */
+void z8_photo_lut_capture_refresh(void)
 {
-    /* One 16-bit load: index and tag always come from the same store. */
-    uint32_t pair=__atomic_load_n((volatile uint16_t *)Z8_SAVED_CHOICE,__ATOMIC_ACQUIRE);
-    uint32_t value=pair&255,tag=pair>>8;
-    if(!Z8_STATE->ready || !b || tag!=b->tag || value>b->count) value=0;
-    Z8_STATE->choice=value;
-    return value;
-}
-static uint32_t choice(void)
-{
-    const Z8LookBundle *b=library_enter();
-    uint32_t value=selection(b);
-    if(b) library_exit();
-    return value;
+    volatile Z8LutState *s=Z8_STATE;
+    if(s->magic!=Z8_STATE_MAGIC || !s->persist.settings_restored || s->preview.power_paused) return;
+    const uint64_t object=UINT64_C(0xa03bc6970);
+    if(!*(volatile const uint8_t *)(uintptr_t)UINT64_C(0xa03bc6bd0) ||
+       read64(object+0x48)!=UINT64_C(0x40f95258) || (int32_t)read32(object+0x38)<=0) return;
+    ((void (*)(void))(uintptr_t)0x40f964e8)();
 }
 
 /* Native C3.11 cache helpers operate on 64-byte lines. All admitted image
@@ -133,6 +132,97 @@ static void copy_bytes(void *destination,const void *source,uint32_t bytes)
 
 static int main_span(uint64_t p,uint64_t n)
 { return range(p,n,UINT64_C(0xa00000000),UINT64_C(0xa40000000)); }
+
+static int same_bytes(const uint8_t *a,const uint8_t *b,uint32_t n)
+{
+    for(uint32_t i=0;i<n;i++) if(a[i]!=b[i]) return 0;
+    return 1;
+}
+
+/* Task context only: wait out a publication in progress. */
+static const Z8LookBundle *library_wait(void)
+{
+    const Z8LookBundle *b;
+    while(!(b=library_enter())) TASK_SLEEP(1);
+    return b;
+}
+
+/* ---- desired and effective looks --------------------------------------- */
+/* The bank record holds the desired look of photo banks A..D. Native bank
+ * switching saves the current settings into the old bank and loads the new
+ * one, so the current settings always belong to the selected bank and its
+ * desired look is banks[selected]. Readers take a consistent copy through
+ * the sequence; the GUI task and native settings producers write it. */
+/* 1: *out is the bank's desired look; 0: not known yet (or a writer kept
+ * the record busy). Before the stored record is read, only a change made
+ * meanwhile is known. */
+static int desired_slot(uint32_t bank,Z8BankSlot *out)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    for(unsigned attempt=0;attempt<64;attempt++) {
+        uint32_t before=__atomic_load_n(&p->sequence,__ATOMIC_ACQUIRE);
+        if(before&1) continue;
+        unsigned ready=__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE);
+        unsigned known=ready || (p->pending_mask&(1u<<bank));
+        if(known) copy_bytes(out,ready?(const void *)(uintptr_t)&p->record.banks[bank]:
+                                       (const void *)(uintptr_t)&p->pending[bank],sizeof(*out));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if(__atomic_load_n(&p->sequence,__ATOMIC_RELAXED)==before) return known;
+    }
+    return 0;
+}
+
+/* The selected bank's look against library b. *index is its 1-based
+ * position in b when applied, else 0. Restoring and unavailable looks are
+ * never replaced by Off or by another look. */
+static uint32_t evaluate(const Z8LookBundle *b,uint32_t *index)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8Persist *p=&s->persist;
+    *index=0;
+    uint32_t bank=read32(Z8_BANK_INDEX);
+    Z8BankSlot slot;
+    if(!desired_slot(bank<Z8_BANKS?bank:0,&slot)) return Z8_EFFECTIVE_RESTORING;
+    if(bank>=Z8_BANKS) return Z8_EFFECTIVE_UNRESOLVED;
+    if(slot.kind==Z8_DESIRED_OFF) return Z8_EFFECTIVE_OFF;
+    if(slot.kind!=Z8_DESIRED_LOOK) return Z8_EFFECTIVE_UNRESOLVED;
+    if(s->ready && b)
+        for(uint32_t i=0;i<b->count;i++)
+            if(same_bytes(b->looks[i].id,slot.id,32)) { *index=i+1;return Z8_EFFECTIVE_APPLIED; }
+    /* Restoring only while the card library this configuration uses has not
+     * been read yet; a built-in configuration never reads the card. */
+    return p->record.library==Z8_LIBRARY_CARD && __atomic_load_n(&p->restore,__ATOMIC_ACQUIRE)!=Z8_RESTORE_DONE?
+           Z8_EFFECTIVE_RESTORING:Z8_EFFECTIVE_UNAVAILABLE;
+}
+
+static uint32_t effective(const Z8LookBundle *b,uint32_t *index)
+{
+    uint32_t state=evaluate(b,index);
+    Z8_STATE->persist.effective=state;
+    return state;
+}
+
+/* The applied look's position in b, or 0 (Off or not applied). */
+static uint32_t selection(const Z8LookBundle *b)
+{
+    uint32_t index;
+    effective(b,&index);
+    Z8_STATE->choice=index;
+    return index;
+}
+static uint32_t choice(void)
+{
+    const Z8LookBundle *b=library_enter();
+    uint32_t value=b?selection(b):0;
+    if(b) library_exit();
+    return value;
+}
+/* A capture is admitted with the selected bank's look applied, or Off. */
+static int admitted(const Z8LookBundle *b,uint32_t *index)
+{
+    uint32_t state=effective(b,index);
+    return state==Z8_EFFECTIVE_OFF || state==Z8_EFFECTIVE_APPLIED;
+}
 static int cpu_span(uint64_t p,uint64_t n)
 {
     /* Native pool0x23 job bodies use raw image RAM; pool0x22 capture settings
@@ -635,27 +725,529 @@ void z8_photo_lut_power_cancel(void)
     }
 }
 
+/* Status shown on the card row: load results, and why the selected bank's
+ * look is not applied. */
+enum { CARD_IDLE,CARD_LOADED,CARD_NO_FILE,CARD_INVALID,CARD_CONFLICT,CARD_READ,CARD_MEMORY,CARD_BUSY,
+       CARD_RESTORING,CARD_NOT_IN_LIBRARY,CARD_UNRESOLVED,CARD_STATES };
+/* English, Simplified and Traditional Chinese; \1 = look count, \2 = slot(s). */
+static const char *const card_text[CARD_STATES][3]={
+    {"Load LUTs from card","从存储卡载入 LUT","從記憶卡載入 LUT"},
+    {"Card LUTs: \1 loaded (slot \2)","存储卡 LUT：已载入 \1 个（卡槽 \2）","記憶卡 LUT：已載入 \1 個（卡槽 \2）"},
+    {"No Z8LUTLIB.BIN on either card","两张卡上都没有 Z8LUTLIB.BIN","兩張卡上都沒有 Z8LUTLIB.BIN"},
+    {"Slot \2 Z8LUTLIB.BIN invalid; unchanged","卡槽 \2 的 Z8LUTLIB.BIN 无效，未更改","卡槽 \2 的 Z8LUTLIB.BIN 無效，未變更"},
+    {"Slots 1 and 2 differ; unchanged","两张卡的 Z8LUTLIB.BIN 不同，未更改","兩張卡的 Z8LUTLIB.BIN 不同，未變更"},
+    {"Slot \2 read error; unchanged","卡槽 \2 读取失败，未更改","卡槽 \2 讀取失敗，未變更"},
+    {"Not enough memory; unchanged","内存不足，未更改","記憶體不足，未變更"},
+    {"Card busy; try again","存储卡正在使用，请重试","記憶卡正在使用，請重試"},
+    {"Restoring LUT settings...","正在恢复 LUT 设置...","正在恢復 LUT 設定..."},
+    {"Selected LUT not on card; choose again","存储卡上没有所选 LUT，请重新选择","記憶卡上沒有所選 LUT，請重新選擇"},
+    {"LUT setting not recognized; choose again","LUT 设置无法识别，请重新选择","LUT 設定無法識別，請重新選擇"},
+};
+
 static void menu_text(const Z8LookBundle *,uint32_t status,uint32_t count,uint32_t slots);
+static int card_worker_start(void);
+static void card_wake(void);
+static void record_lock(void);
+static void record_unlock(void);
+static void preview_wake(void);
+
+/* ---- bank record persistence ------------------------------------------- */
+/* Native settings interfaces. Section-15 restore and the
+ * blob-16 read are separate native steps; the record is decided once both
+ * have reported, in either order. Only an actual read of the stored region,
+ * or a native reset, decides what may be stored: a failed or skipped read
+ * leaves every bank unresolved and stores nothing. Group 0x31's loaded byte
+ * (0x41016aac/0x41016550) is native-owned: mode 4 sets it after loading
+ * blob 16, and the save producer stores blob 16 only while it is set. */
+#define REQUEST_SAVE ((void (*)(void))(uintptr_t)0x41012bf4)
+#define SETTINGS_REPLY ((uint32_t (*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))(uintptr_t)0x410130e0)
+#define SETTINGS_DEFAULTS ((void (*)(void))(uintptr_t)0x41016480)
+#define SECTION_READ ((uint32_t (*)(uint32_t,uint64_t,uint32_t))(uintptr_t)0x40d6c7d8)
+#define SECTION_WRITE ((uint32_t (*)(uint32_t,uint64_t,uint32_t))(uintptr_t)0x40d6c628)
+#define SECTION ((uint64_t (*)(uint32_t))(uintptr_t)0x40d712c8)
+#define GROUP_LOADED ((uint32_t (*)(uint32_t))(uintptr_t)0x41016aac)
+#define BLOB_TOTAL (Z8_BLOB_BYTES+(uint32_t)sizeof(Z8BankRecord))
+#define BLOB_ALLOC_TRIES 50u
+
+/* Every record starts all-zero, so no byte it carries (or hashes) is left
+ * over from a stack or an earlier record. */
+static void record_init(Z8BankRecord *r) { for(unsigned i=0;i<sizeof(*r);i++) ((uint8_t *)r)[i]=0; }
+static void record_seal(Z8BankRecord *r)
+{
+    r->magic=Z8_RECORD_MAGIC;r->version=1;r->bytes=sizeof(*r);r->reserved=0;
+    z8_lut_sha256(r,offsetof(Z8BankRecord,sha256),r->sha256);
+}
+
+static int record_valid(const Z8BankRecord *r)
+{
+    if(r->magic!=Z8_RECORD_MAGIC || r->version!=1 || r->bytes!=sizeof(*r) || r->library>Z8_LIBRARY_CARD ||
+       r->reserved) return 0;
+    for(unsigned bank=0;bank<Z8_BANKS;bank++) {
+        const Z8BankSlot *slot=&r->banks[bank];
+        if(slot->kind>Z8_DESIRED_UNRESOLVED || slot->reserved[0] || slot->reserved[1] || slot->reserved[2]) return 0;
+        if(slot->kind!=Z8_DESIRED_LOOK)
+            for(unsigned i=0;i<sizeof(slot->id);i++) if(slot->id[i]) return 0;
+    }
+    uint8_t digest[32];
+    z8_lut_sha256(r,offsetof(Z8BankRecord,sha256),digest);
+    return same_bytes(digest,r->sha256,32);
+}
+
+/* Record writers hold record_lock; readers use the sequence. */
+static void record_read(Z8BankRecord *out)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    for(;;) {
+        uint32_t before=__atomic_load_n(&p->sequence,__ATOMIC_ACQUIRE);
+        copy_bytes(out,(const void *)(uintptr_t)&p->record,sizeof(*out));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if(!(before&1) && __atomic_load_n(&p->sequence,__ATOMIC_RELAXED)==before) return;
+        TASK_SLEEP(1);
+    }
+}
+static void sequence_open(void) { __atomic_fetch_add(&Z8_STATE->persist.sequence,1,__ATOMIC_ACQ_REL); }
+static void sequence_close(void) { __atomic_fetch_add(&Z8_STATE->persist.sequence,1,__ATOMIC_RELEASE); }
+static void record_publish(Z8BankRecord *next)
+{
+    record_seal(next);
+    sequence_open();
+    copy_bytes((void *)(uintptr_t)&Z8_STATE->persist.record,next,sizeof(*next));
+    sequence_close();
+}
+
+static void slot_clear(Z8BankSlot *slot) { for(unsigned i=0;i<sizeof(*slot);i++) ((uint8_t *)slot)[i]=0; }
+/* The firmware default: the built-in library's default look, or Off. */
+static void default_slot(Z8BankSlot *slot)
+{
+    slot_clear(slot);
+    const Z8LookBundle *b=Z8_BUILTIN;
+    if(Z8_STATE->ready && b->initial) {
+        slot->kind=Z8_DESIRED_LOOK;
+        copy_bytes(slot->id,b->looks[b->initial-1].id,sizeof(slot->id));
+    }
+}
+
+static uint32_t owned(unsigned copy)
+{ return __atomic_load_n((volatile uint16_t *)(uintptr_t)(Z8_OWNED_BYTES+copy*Z8_BANK_STRIDE),__ATOMIC_ACQUIRE); }
+/* Returns whether any owned bytes changed (a section-15 save is needed). */
+static int own_all(void)
+{
+    int changed=0;
+    for(unsigned copy=0;copy<Z8_BANK_COPIES;copy++) {
+        changed|=owned(copy)!=Z8_OWNED_RECORDED;
+        __atomic_store_n((volatile uint16_t *)(uintptr_t)(Z8_OWNED_BYTES+copy*Z8_BANK_STRIDE),
+                         (uint16_t)Z8_OWNED_RECORDED,__ATOMIC_RELEASE);
+    }
+    return changed;
+}
+
+/* Store the record with blob 16 and the owned bytes with section 15 through
+ * the native asynchronous settings save (its region writer skips an
+ * unchanged region). Only for a record decided from an actual read. */
+static void commit(void)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    if(!__atomic_load_n(&p->authoritative,__ATOMIC_ACQUIRE) || p->blob==Z8_BLOB_PENDING) return;
+    p->commits++;
+    REQUEST_SAVE();
+}
+
+static uint8_t *blob_scratch(void)
+{
+    for(unsigned tries=0;tries<BLOB_ALLOC_TRIES;tries++) {
+        uint8_t *scratch=ALLOC(BLOB_TOTAL,0);
+        if(scratch && !((uintptr_t)scratch&7)) return scratch;
+        if(scratch) FREE(scratch);
+        Z8_STATE->persist.alloc_retries++;
+        TASK_SLEEP(10);
+    }
+    return 0;
+}
+
+static int erased(const uint8_t *p,uint32_t n)
+{
+    for(uint32_t i=0;i<n;i++) if(p[i]!=0xff) return 0;
+    return 1;
+}
+/* The stored region as read by the native reader into scratch: stock bytes
+ * then the record. A failed read means the region is unreadable. */
+static uint32_t region_state(uint32_t result,const uint8_t *scratch,Z8BankRecord *tail)
+{
+    if(!(result&1)) return Z8_BLOB_LOST;
+    copy_bytes(tail,scratch+Z8_BLOB_BYTES,sizeof(*tail));
+    if(erased((const uint8_t *)tail,sizeof(*tail))) return Z8_BLOB_ABSENT;
+    return record_valid(tail)?Z8_BLOB_VALID:Z8_BLOB_CORRUPT;
+}
+
+/* Decide once section 15 is restored and the stored region was read (or the
+ * read was skipped / failed), in either order. `stored`, a record just read,
+ * is staged in RAM (not yet visible) until then.
+ *  VALID   -> the stored record.
+ *  ABSENT or LOST (no record in the region, or no readable region: the
+ *           native caller defaults the stock blob too) -> by the owned bytes:
+ *           a record existed (lost: unresolved), only a pre-record selection
+ *           existed (migrated: Off stays Off, else unresolved), or nothing
+ *           (the firmware default).
+ *  CORRUPT -> every bank unresolved.
+ *  native defaults (S2) -> the firmware default.
+ *  SKIPPED with a retained warm-start record -> that record.
+ *  UNREAD, or SKIPPED without one -> unresolved, not stored; the card
+ *  worker asks for a native save, whose store reads the region first.
+ * Changes made meanwhile (menu, bank reset) are kept on top. */
+static void persist_decide(const Z8BankRecord *stored)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    record_lock();
+    if(__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE) && p->authoritative) { record_unlock();return; }
+    if(stored) {
+        Z8BankRecord staged;
+        copy_bytes(&staged,stored,sizeof(staged));
+        record_publish(&staged);
+    }
+    if(!p->settings_restored || p->blob==Z8_BLOB_PENDING) { record_unlock();return; }
+    Z8BankRecord r;
+    record_init(&r);
+    uint32_t source,authoritative=1,store=1;
+    if(p->defaults) {
+        for(unsigned bank=0;bank<Z8_BANKS;bank++) default_slot(&r.banks[bank]);
+        source=Z8_SOURCE_DEFAULTS;
+    } else if(p->blob==Z8_BLOB_VALID) {
+        record_read(&r);
+        source=Z8_SOURCE_STORED;store=0;
+    } else if(p->blob==Z8_BLOB_SKIPPED && p->retained) {
+        record_read(&r);
+        source=Z8_SOURCE_RETAINED;store=0;
+    } else if(p->blob==Z8_BLOB_ABSENT || p->blob==Z8_BLOB_LOST || p->blob==Z8_BLOB_CORRUPT) {
+        unsigned recorded=p->blob==Z8_BLOB_CORRUPT,legacy=0;
+        for(unsigned copy=0;copy<Z8_BANK_COPIES;copy++) {
+            uint32_t value=owned(copy);
+            recorded|=value==Z8_OWNED_RECORDED;legacy|=value && value!=Z8_OWNED_RECORDED;
+        }
+        uint32_t selected=read32(Z8_BANK_INDEX);
+        for(unsigned bank=0;bank<Z8_BANKS;bank++) {
+            Z8BankSlot *slot=&r.banks[bank];
+            slot_clear(slot);
+            /* The current copy holds the selected bank's latest value. */
+            uint32_t value=owned(bank==selected?0:bank+1);
+            if(recorded) slot->kind=Z8_DESIRED_UNRESOLVED;
+            else if(legacy) slot->kind=value?Z8_DESIRED_UNRESOLVED:Z8_DESIRED_OFF;
+            else default_slot(slot);
+        }
+        source=recorded?Z8_SOURCE_LOST:legacy?Z8_SOURCE_MIGRATED:Z8_SOURCE_FRESH;
+        store=!recorded;
+    } else {
+        for(unsigned bank=0;bank<Z8_BANKS;bank++) { slot_clear(&r.banks[bank]);r.banks[bank].kind=Z8_DESIRED_UNRESOLVED; }
+        source=Z8_SOURCE_UNREAD;authoritative=0;store=0;
+    }
+    /* Deferred copies refer to the original unread slots, independently of
+     * later edits to their source. Resolve all origins before explicit edits. */
+    Z8BankSlot original[Z8_BANKS];
+    copy_bytes(original,r.banks,sizeof(original));
+    for(unsigned bank=0;bank<Z8_BANKS;bank++) {
+        uint32_t origin=(p->pending_sources>>(4*bank))&15;
+        if(origin && origin<=Z8_BANKS) { copy_bytes(&r.banks[bank],&original[origin-1],sizeof(Z8BankSlot));store=authoritative; }
+    }
+    for(unsigned bank=0;bank<Z8_BANKS;bank++)
+        if(p->pending_mask&(1u<<bank)) { copy_bytes(&r.banks[bank],(const void *)(uintptr_t)&p->pending[bank],sizeof(Z8BankSlot));store=authoritative; }
+    if(p->pending_mask&Z8_PENDING_LIBRARY) { r.library=p->pending_library;store=authoritative; }
+    record_publish(&r);
+    unsigned owned_changed=0;
+    if(authoritative) { owned_changed=own_all();p->pending_mask=0;p->pending_sources=0; }
+    p->source=source;
+    __atomic_store_n(&p->authoritative,authoritative,__ATOMIC_RELEASE);
+    __atomic_store_n(&p->ready,1,__ATOMIC_RELEASE);
+    record_unlock();
+    if(store) commit();
+    else if(owned_changed) REQUEST_SAVE();
+    card_wake();
+    preview_wake();
+    z8_photo_lut_capture_refresh();
+}
+
+/* A bank's desired look chosen in the menu or reset by the native producer.
+ * Before an actual read decided the record, the change is kept and merged on
+ * top of whatever that read finds. */
+static void desire_bank(uint32_t bank,const Z8BankSlot *slot)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    record_lock();
+    unsigned ready=__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE),authoritative=ready && p->authoritative;
+    if(ready) {
+        Z8BankRecord r;
+        record_read(&r);
+        copy_bytes(&r.banks[bank],slot,sizeof(*slot));
+        record_publish(&r);
+    }
+    if(!authoritative) {
+        sequence_open();
+        copy_bytes((void *)(uintptr_t)&p->pending[bank],slot,sizeof(*slot));
+        p->pending_mask|=1u<<bank;
+        p->pending_sources&=~(15u<<(4*bank));
+        sequence_close();
+    }
+    record_unlock();
+    if(authoritative) commit();
+    preview_wake();
+    z8_photo_lut_capture_refresh();
+}
+
+/* Explicit shooting-bank Copy at 410ddb8c. Native status zero means the
+ * main item list was copied; this seam precedes name-save enqueue and any
+ * selected-destination refresh. Copies 1..4 are A..D, independent of selection.
+ * GUI actions serialize source edits. Observe the source on native success,
+ * allowing a concurrent stored-record read to resolve its identity first;
+ * no private lock is held across the original native transaction. */
+int z8_photo_lut_bank_copy(uint32_t source,uint32_t destination,const uint32_t *items,uint32_t count)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    if(Z8_STATE->magic!=Z8_STATE_MAGIC)
+        return ((int (*)(uint32_t,uint32_t,const uint32_t *,uint32_t))(uintptr_t)0x41013a14)(source,destination,items,count);
+    int result=((int (*)(uint32_t,uint32_t,const uint32_t *,uint32_t))(uintptr_t)0x41013a14)(source,destination,items,count);
+    unsigned changed=result==0 && count && source && source<=Z8_BANKS && destination && destination<=Z8_BANKS && source!=destination;
+    record_lock();
+    unsigned authoritative=__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE) && p->authoritative;
+    if(changed) {
+        unsigned from=source-1,to=destination-1;
+        unsigned known=authoritative || (p->pending_mask&(1u<<from));
+        Z8BankSlot slot;
+        slot_clear(&slot);slot.kind=Z8_DESIRED_UNRESOLVED;
+        if(known) copy_bytes(&slot,authoritative?(const void *)(uintptr_t)&p->record.banks[from]:
+                              (const void *)(uintptr_t)&p->pending[from],sizeof(slot));
+        if(p->ready) {
+            Z8BankRecord r;record_read(&r);
+            copy_bytes(&r.banks[to],&slot,sizeof(slot));record_publish(&r);
+        }
+        if(!authoritative) {
+            unsigned origin=(p->pending_sources>>(4*from))&15;
+            sequence_open();
+            p->pending_sources&=~(15u<<(4*to));
+            if(known) { copy_bytes((void *)(uintptr_t)&p->pending[to],&slot,sizeof(slot));p->pending_mask|=1u<<to; }
+            else { p->pending_mask&=~(1u<<to);p->pending_sources|=(origin?origin:source)<<(4*to); }
+            sequence_close();
+        }
+    }
+    record_unlock();
+    if(changed) {
+        if(authoritative) commit();
+        preview_wake();z8_photo_lut_capture_refresh();
+    }
+    return result;
+}
+
+/* The configuration's library after an explicit Load (card worker task). */
+static int request_cancelled(uint32_t serial)
+{
+    uint32_t cutoff=__atomic_load_n(&Z8_STATE->persist.cancelled_request,__ATOMIC_ACQUIRE);
+    return cutoff && (int32_t)(serial-cutoff)<=0;
+}
+
+static void desire_library(uint32_t library,uint32_t serial)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    record_lock();
+    if(request_cancelled(serial)) { record_unlock();return; }
+    /* The single worker has completed canceled older requests before it
+     * can accept this newer one. Do not let an ancient cutoff age across
+     * the modular serial comparison window; zero is never a request. */
+    __atomic_store_n(&p->cancelled_request,0,__ATOMIC_RELEASE);
+    unsigned ready=__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE),authoritative=ready && p->authoritative,changed=1;
+    if(ready) {
+        Z8BankRecord r;
+        record_read(&r);
+        changed=r.library!=library;
+        r.library=library;
+        if(changed) record_publish(&r);
+    }
+    if(!authoritative) { p->pending_library=library;p->pending_mask|=Z8_PENDING_LIBRARY; }
+    record_unlock();
+    if(authoritative && changed) commit();
+    if(changed) z8_photo_lut_capture_refresh();
+}
+
+/* A failed initial task creation has no worker to retry itself. The native
+ * settings task is the owner of its restore, so retry from that task's wait
+ * loop only while an automatic import or unread-record recovery needs it. */
+static int card_start_needed(void)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8Persist *p=&s->persist;
+    if(s->magic!=Z8_STATE_MAGIC || !p->settings_restored || s->preview.power_paused ||
+       __atomic_load_n(&s->card.worker_state,__ATOMIC_ACQUIRE)==1) return 0;
+    if(!p->ready || !p->authoritative) return 1;
+    Z8BankRecord r;record_read(&r);
+    return r.library==Z8_LIBRARY_CARD;
+}
+
+/* 41012924 originally waits indefinitely at 40d2bd04 (kernel mode 1), then
+ * dispatches the returned bits. 40d2bd64 is its timed mode-1 counterpart;
+ * 40d2bdac uses mode 0x21 and would change native event consumption. A zero
+ * timeout result must leave zero bits so the native loop performs no save.
+ * Stock events still return immediately; once started, use the stock wait. */
+uint32_t z8_photo_lut_settings_wait(void *event,uint32_t mask,uint32_t *bits)
+{
+    if(card_start_needed() && !card_worker_start()) {
+        if(bits) *bits=0;
+        return ((uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t))(uintptr_t)0x40d2bd64)(event,mask,bits,500);
+    }
+    return ((uint32_t (*)(void *,uint32_t,uint32_t *))(uintptr_t)0x40d2bd04)(event,mask,bits);
+}
+
+/* S1: native section-15 restore finished (0x4101248c, settings task). */
+uint32_t z8_photo_lut_settings_restored(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    if(s->magic==Z8_STATE_MAGIC && !s->persist.settings_restored) {
+        s->persist.settings_restored=1;
+        persist_decide(0);
+        if(card_start_needed() && card_worker_start()) card_wake();
+    }
+    return SETTINGS_REPLY(a,b,c,d,e);
+}
+
+/* S2: native defaults were copied into every settings group (whole reset,
+ * or a failed section-15 restore): every bank gets the firmware default. */
+void z8_photo_lut_defaults(void)
+{
+    SETTINGS_DEFAULTS();
+    volatile Z8LutState *s=Z8_STATE;
+    if(s->magic!=Z8_STATE_MAGIC) return;
+    volatile Z8Persist *p=&s->persist;
+    record_lock();
+    p->defaults=1;
+    __atomic_store_n(&p->cancelled_request,__atomic_load_n(&s->card.request,__ATOMIC_ACQUIRE),__ATOMIC_RELEASE);
+    __atomic_store_n(&s->card.unload,1,__ATOMIC_RELEASE);
+    sequence_open();p->pending_mask=0;p->pending_sources=0;sequence_close();
+    unsigned ready=__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE);
+    if(ready) {
+        Z8BankRecord r;
+        record_init(&r);
+        for(unsigned bank=0;bank<Z8_BANKS;bank++) default_slot(&r.banks[bank]);
+        record_publish(&r);
+        own_all();
+        p->source=Z8_SOURCE_DEFAULTS;
+        __atomic_store_n(&p->authoritative,1,__ATOMIC_RELEASE);
+    }
+    record_unlock();
+    /* The configuration is back on the built-in library: so is the menu. */
+    card_wake();
+    if(ready) { commit();preview_wake();z8_photo_lut_capture_refresh(); }
+    else persist_decide(0);
+}
+
+static void section_runtime(uint64_t buffer,uint32_t bytes)
+{
+    /* Leave the section's last-transfer fields as the stock call set them. */
+    uint64_t section=SECTION(Z8_BLOB_SECTION);
+    if(!section) return;
+    *(volatile uint64_t *)(uintptr_t)(section+0x10)=buffer;
+    *(volatile uint32_t *)(uintptr_t)(section+0x18)=bytes;
+}
+
+/* Read the stored region of blob 16 into scratch: stock bytes, then the
+ * record. Returns the native result. */
+static uint32_t blob_read_region(uint8_t *scratch,uint64_t buffer,uint32_t bytes)
+{
+    uint32_t result=SECTION_READ(Z8_BLOB_SECTION,(uintptr_t)scratch,BLOB_TOTAL);
+    section_runtime(buffer,bytes);
+    return result;
+}
+
+/* Blob-16 reads (0x40d6b548 tail branch). The stock bytes are read as before;
+ * the record that follows them in the same committed region is decided on. */
+uint32_t z8_photo_lut_blob_read(uint32_t section,uint64_t buffer,uint32_t bytes)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    if(section!=Z8_BLOB_SECTION || buffer!=Z8_BLOB || bytes!=Z8_BLOB_BYTES || s->magic!=Z8_STATE_MAGIC)
+        return SECTION_READ(section,buffer,bytes);
+    volatile Z8Persist *p=&s->persist;
+    p->blob_reads++;
+    uint8_t *scratch=blob_scratch();
+    uint32_t result,blob;
+    Z8BankRecord tail;
+    if(scratch) {
+        result=blob_read_region(scratch,buffer,bytes);
+        blob=region_state(result,scratch,&tail);
+        if(result&1) copy_bytes((void *)(uintptr_t)buffer,scratch,Z8_BLOB_BYTES);
+        FREE(scratch);
+    } else {
+        /* The stock bytes still load; only the record is not read. */
+        result=SECTION_READ(section,buffer,bytes);
+        blob=result&1?Z8_BLOB_UNREAD:Z8_BLOB_LOST;
+    }
+    if(__atomic_load_n(&p->authoritative,__ATOMIC_ACQUIRE) || p->defaults) p->late_reads++;
+    else if(p->blob==Z8_BLOB_PENDING || (blob!=Z8_BLOB_UNREAD && p->blob!=blob)) {
+        p->blob=blob;
+        persist_decide(blob==Z8_BLOB_VALID?&tail:0);
+    }
+    return result;
+}
+
+/* Mode 4 skips the blob-16 read while the group is already loaded in RAM
+ * (0x41012a48), as after a warm start that kept native settings RAM. */
+uint32_t z8_photo_lut_blob_loaded(uint32_t group)
+{
+    uint32_t loaded=GROUP_LOADED(group);
+    volatile Z8LutState *s=Z8_STATE;
+    if(group==Z8_BLOB_GROUP && (loaded&1) && s->magic==Z8_STATE_MAGIC && s->persist.blob==Z8_BLOB_PENDING) {
+        s->persist.blob=Z8_BLOB_SKIPPED;
+        persist_decide(0);
+    }
+    return loaded;
+}
+
+/* Blob-16 store in the native save producer (0x41012558): one region write
+ * of the unchanged stock bytes followed by the record. A record not decided
+ * from an actual read is never written over: the stored region is read first
+ * and decided on (an unreadable region is lost, as for the native caller).
+ * Without memory for that, nothing is written and the store reports failure. */
+uint32_t z8_photo_lut_blob_write(uint32_t section,uint64_t buffer,uint32_t bytes)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    if(section!=Z8_BLOB_SECTION || buffer!=Z8_BLOB || bytes!=Z8_BLOB_BYTES || s->magic!=Z8_STATE_MAGIC)
+        return SECTION_WRITE(section,buffer,bytes);
+    volatile Z8Persist *p=&s->persist;
+    uint8_t *scratch=blob_scratch();
+    if(!scratch) { p->refused_writes++;return 0; }
+    if(!__atomic_load_n(&p->authoritative,__ATOMIC_ACQUIRE)) {
+        Z8BankRecord tail;
+        p->blob=region_state(blob_read_region(scratch,buffer,bytes),scratch,&tail);
+        persist_decide(p->blob==Z8_BLOB_VALID?&tail:0);
+        if(!__atomic_load_n(&p->authoritative,__ATOMIC_ACQUIRE)) { FREE(scratch);p->refused_writes++;return 0; }
+    }
+    copy_bytes(scratch,(const void *)(uintptr_t)buffer,Z8_BLOB_BYTES);
+    Z8BankRecord r;
+    record_read(&r);
+    copy_bytes(scratch+Z8_BLOB_BYTES,&r,sizeof(r));
+    uint32_t result=SECTION_WRITE(section,(uintptr_t)scratch,BLOB_TOTAL);
+    section_runtime(buffer,bytes);
+    FREE(scratch);
+    p->blob_writes++;
+    return result;
+}
 
 void z8_photo_lut_boot(void)
 {
     volatile Z8LutState *s=Z8_STATE;
     uint64_t boots=0;
-    if(s->magic==Z8_STATE_MAGIC && s->version==3 && s->bytes==sizeof(*s)) {
+    Z8BankRecord retained;
+    unsigned keep=0;
+    if(s->magic==Z8_STATE_MAGIC && s->version==4 && s->bytes==sizeof(*s)) {
         boots=s->boots;
+        /* A warm start keeps native settings RAM; the decided record goes
+         * with it, used only if mode 4 skips the blob read as already loaded. */
+        copy_bytes(&retained,(const void *)(uintptr_t)&s->persist.record,sizeof(retained));
+        keep=s->persist.ready && s->persist.authoritative && record_valid(&retained);
     }
     volatile uint8_t *p=(volatile uint8_t *)s;
     for(unsigned i=0;i<sizeof(*s);i++) p[i]=0;
-    s->version=3;s->bytes=sizeof(*s);s->boots=boots+1;s->strength=256;
+    s->version=4;s->bytes=sizeof(*s);s->boots=boots+1;s->strength=256;
     s->error=z8_lut_validate_image(Z8_BUILTIN,Z8_LUT_BUNDLE_LIMIT);
-    /* Native DS initializes later. The authoritative selection is read from
-     * the current photo bank at each menu/capture boundary, never from a
-     * previous task's private RAM. */
     s->choice=0;
     s->ready=s->error==Z8_LUT_OK;
-    /* The heap is rebuilt at every boot, so any card library is gone: menu
-     * text always restarts from the built-in library. */
-    if(s->ready) menu_text(Z8_BUILTIN,0,0,0);   /* status 0: "Load LUTs from card" */
+    if(keep) { copy_bytes((void *)(uintptr_t)&s->persist.record,&retained,sizeof(retained));s->persist.retained=1; }
+    /* The heap is rebuilt at every boot: the card library is restored by the
+     * card worker once native settings are back. */
+    if(s->ready) menu_text(Z8_BUILTIN,CARD_RESTORING,0,0);
     s->magic=Z8_STATE_MAGIC;
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
@@ -838,7 +1430,7 @@ typedef struct {
     uint64_t magic,owner,base,capacity,scratch;
     uint32_t scratch_bytes,choice;
     uint64_t compressed_bytes,samples;      /* raw address of the sample copy, or 0 */
-    uint32_t grid,identity,tag,sample_bytes;
+    uint32_t grid,identity,reserved,sample_bytes;
     uint8_t id[32];
     char name[64];
     uint8_t immutable_reserved[16];
@@ -868,27 +1460,37 @@ static uint32_t jpeg_required_bytes(uint32_t bytes,uint64_t format,const Z8LookB
     return bytes && required<=UINT32_MAX?(uint32_t)required:0;
 }
 
+/* Larger than any photo output pool: the native forecast counts no photo,
+ * which is how release is withheld while the selected look is not applied. */
+#define OUTPUT_NO_ROOM 0x80000000u
+
 uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t special)
 {
     uint32_t bytes=((uint32_t (*)(uint64_t,uint64_t,uint32_t))(uintptr_t)0x4104886c)(settings,format,special);
     const Z8LookBundle *b=library_enter();
     if(!b) return bytes;
-    uint32_t scratch=0,required=jpeg_required_bytes(bytes,format,b,selection(b),&scratch);
+    uint32_t selected=0,scratch=0,required=0;
+    unsigned admit=admitted(b,&selected);
+    if(admit) required=jpeg_required_bytes(bytes,format,b,selected,&scratch);
     library_exit();
     /* Only the prospective pool0x38 photo count uses this wrapper. Keep
      * the native compressed layout and its zero-size unit queries intact. */
+    if(!admit && bytes) { Z8_STATE->persist.refused_forecasts++;return OUTPUT_NO_ROOM; }
     return required?required:bytes;
 }
 
 uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,uint64_t configuration)
 {
     if(configuration>UINT64_MAX-0x26c || pool!=0x38) return 0;
-    /* During a library publication the native allocation retry runs again. */
+    /* During a library publication, and while the selected bank's look is
+     * not applied, the native allocation wait/retry (40ea9f3c) runs again;
+     * its cancel bit ends the capture without an image. */
     const Z8LookBundle *b=library_enter();
     if(!b) return 0;
-    uint32_t selected=selection(b),scratch=0;
+    uint32_t selected=0,scratch=0,required=0;
     uint64_t owner=0;
-    uint32_t required=jpeg_required_bytes(bytes,configuration+0x26c,b,selected,&scratch);
+    if(!admitted(b,&selected)) { Z8_STATE->persist.refused_allocations++;goto done; }
+    required=jpeg_required_bytes(bytes,configuration+0x26c,b,selected,&scratch);
     if(!required) goto done;
     /* A transform reservation is admitted only with its worker running. */
     if(scratch && !jpeg_worker_start()) goto done;
@@ -908,7 +1510,7 @@ uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,u
     JpegLease *lease=(JpegLease *)(cpu+capacity-sizeof(JpegLease));
     invalidate(lease,sizeof(*lease));
     *lease=(JpegLease){.magic=JPEG_LEASE_MAGIC,.owner=owner,.base=raw,.capacity=capacity,
-        .scratch=raw+offset,.scratch_bytes=scratch,.choice=selected,.compressed_bytes=bytes,.tag=b->tag};
+        .scratch=raw+offset,.scratch_bytes=scratch,.choice=selected,.compressed_bytes=bytes};
     if(selected) {
         const Z8LookEntry *e=&b->looks[selected-1];
         lease->grid=e->grid;lease->identity=e->identity;
@@ -1257,32 +1859,7 @@ uint32_t z8_photo_lut_xmp(uint32_t kind,uint32_t file,uint64_t settings,uint32_t
 #define CHILD ((void *(*)(void *,uint32_t,uint32_t))(uintptr_t)0x4050a6f0)
 #define CONTENT ((void (*)(void *,uint32_t))(uintptr_t)0x403f645c)
 #define BIND ((int (*)(void *,uint32_t,uint32_t))(uintptr_t)0x4031e178)
-#define REQUEST_SAVE ((void (*)(void))(uintptr_t)0x41012bf4)
-
-/* Selections are two bytes per photo bank (index, library tag), read and
- * written as one 16-bit unit so no reader pairs an index with another tag.
- * Copy 0 is the current settings; 1..4 are banks A..D. */
-#define BANK_COPIES 5u
-#define BANK_STRIDE 0x2e0u
-static uint32_t saved_selection(unsigned copy)
-{ return __atomic_load_n((volatile uint16_t *)(Z8_SAVED_CHOICE+copy*BANK_STRIDE),__ATOMIC_ACQUIRE); }
-static void save_selection(unsigned copy,uint32_t index,uint32_t tag)
-{ __atomic_store_n((volatile uint16_t *)(Z8_SAVED_CHOICE+copy*BANK_STRIDE),(uint16_t)(index|tag<<8),__ATOMIC_RELEASE); }
-
 /* ---- menu text ------------------------------------------------------- */
-enum { CARD_IDLE,CARD_LOADED,CARD_NO_FILE,CARD_INVALID,CARD_CONFLICT,CARD_READ,CARD_MEMORY,CARD_BUSY,CARD_STATES };
-/* English, Simplified and Traditional Chinese; \1 = look count, \2 = slot(s). */
-static const char *const card_text[CARD_STATES][3]={
-    {"Load LUTs from card","从存储卡载入 LUT","從記憶卡載入 LUT"},
-    {"Card LUTs: \1 loaded (slot \2)","存储卡 LUT：已载入 \1 个（卡槽 \2）","記憶卡 LUT：已載入 \1 個（卡槽 \2）"},
-    {"No Z8LUTLIB.BIN on either card","两张卡上都没有 Z8LUTLIB.BIN","兩張卡上都沒有 Z8LUTLIB.BIN"},
-    {"Slot \2 Z8LUTLIB.BIN invalid; unchanged","卡槽 \2 的 Z8LUTLIB.BIN 无效，未更改","卡槽 \2 的 Z8LUTLIB.BIN 無效，未變更"},
-    {"Slots 1 and 2 differ; unchanged","两张卡的 Z8LUTLIB.BIN 不同，未更改","兩張卡的 Z8LUTLIB.BIN 不同，未變更"},
-    {"Slot \2 read error; unchanged","卡槽 \2 读取失败，未更改","卡槽 \2 讀取失敗，未變更"},
-    {"Not enough memory; unchanged","内存不足，未更改","記憶體不足，未變更"},
-    {"Card busy; try again","存储卡正在使用，请重试","記憶卡正在使用，請重試"},
-};
-
 /* Append UTF-8 (validated names or the fixed texts above) as UTF-16 at a
  * unit position of a block, through the writable alias of the image text. */
 static unsigned text_append(uint64_t block,unsigned n,unsigned limit,const char *utf8,uint32_t count,uint32_t slots)
@@ -1344,7 +1921,7 @@ static void menu_text(const Z8LookBundle *b,uint32_t status,uint32_t count,uint3
     }
 }
 
-/* ---- card session library -------------------------------------------- */
+/* ---- card library -------------------------------------------------- */
 /* Pinned C3.11 file interface, as used by the pixel-shift and pre-capture
  * card workers: paths are "A:\..." (slot 1, CFexpress) and "B:\..." (slot 2,
  * SD); open(path,0,0x20); seek(fd,offset,whence,&position). */
@@ -1358,7 +1935,11 @@ static void menu_text(const Z8LookBundle *b,uint32_t status,uint32_t count,uint3
 #define CARD_WORKER_PRIORITY 47
 #define CARD_WAIT_POLLS 300u
 #define CARD_WAIT_MS 10u
+#define CARD_CHUNK 0x40000u
+#define CARD_IDLE_MS 500u
 enum { FILE_MISSING,FILE_VALID,FILE_INVALID,FILE_READ,FILE_MEMORY };
+
+static int powering_down(void) { return __atomic_load_n(&Z8_STATE->preview.power_paused,__ATOMIC_ACQUIRE)!=0; }
 
 static unsigned card_read(char drive,uint8_t **found)
 {
@@ -1387,11 +1968,15 @@ static unsigned card_read(char drive,uint8_t **found)
     uint32_t bytes=b->bytes;
     /* A declared bundle beyond the file is truncated; beyond 2 MiB, oversized. */
     if(b->magic!=Z8_LUT_MAGIC || bytes<sizeof(*b) || bytes>limit) goto done;
-    error=FS_READ(fd,memory+64,bytes-64,&count);
-    CACHE_FLUSH(memory+64,bytes-64);
-    if(error || count!=bytes-64) { result=FILE_READ;goto done; }
-    /* A card file comes from the host tool: tag 0, every look re-hashed. */
-    if(z8_lut_validate(b,bytes)!=Z8_LUT_OK || b->tag) goto done;
+    /* Bounded transfers: power-down stops the read between chunks. */
+    for(uint32_t at=64;at<bytes;at+=count) {
+        uint32_t chunk=bytes-at<CARD_CHUNK?bytes-at:CARD_CHUNK;
+        if(powering_down()) { result=FILE_READ;goto done; }
+        error=FS_READ(fd,memory+at,chunk,&count);
+        CACHE_FLUSH(memory+at,chunk);
+        if(error || count!=chunk) { result=FILE_READ;goto done; }
+    }
+    if(z8_lut_validate(b,bytes)!=Z8_LUT_OK) goto done;
     if(bytes<limit) {
         uint8_t *exact=ALLOC(bytes,0);
         if(exact && !((uintptr_t)exact&7)) { copy_bytes(exact,memory,bytes);FREE(memory);memory=exact; }
@@ -1402,12 +1987,6 @@ done:
     if(memory) FREE(memory);
     FS_CLOSE(fd);
     return result;
-}
-
-static int same_bytes(const uint8_t *a,const uint8_t *b,uint32_t n)
-{
-    for(uint32_t i=0;i<n;i++) if(a[i]!=b[i]) return 0;
-    return 1;
 }
 
 /* Both cards are read. A present file that is invalid or unreadable blocks
@@ -1437,30 +2016,147 @@ static uint8_t *card_load(uint32_t *status,uint32_t *slots)
     return chosen;
 }
 
+/* Card worker only, so publications never overlap. Order: preview quiesce
+ * (pause, cancel, wait, release cache, discard pending) -> publishing -> no
+ * counted reader -> swap -> release -> resume. Banks name their looks by full
+ * transform identity, so nothing is remapped and nothing is saved. An
+ * identical bundle is not published again; 0 publishes the built-in library. */
+static int card_publish(uint8_t *next)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8CardLibrary *c=&s->card;
+    const Z8LookBundle *previous=library_active(),*bundle=next?(const Z8LookBundle *)next:Z8_BUILTIN;
+    if(powering_down() || previous==bundle || (previous!=Z8_BUILTIN && next && previous->bytes==bundle->bytes &&
+                                               same_bytes((const uint8_t *)previous,next,bundle->bytes))) {
+        if(next) FREE(next);
+        return !powering_down();
+    }
+    z8_photo_lut_mode_enter();
+    __atomic_store_n(&c->publishing,1,__ATOMIC_SEQ_CST);
+    while(__atomic_load_n(&c->readers,__ATOMIC_SEQ_CST)) TASK_SLEEP(1);
+    __atomic_store_n(&c->active,(uintptr_t)next,__ATOMIC_RELEASE);
+    __atomic_store_n(&c->publishing,0,__ATOMIC_SEQ_CST);
+    if(previous!=Z8_BUILTIN) FREE((void *)(uintptr_t)previous);
+    __atomic_fetch_add(&s->persist.library_generation,1,__ATOMIC_RELEASE);
+    c->publications++;
+    z8_photo_lut_mode_exit();
+    z8_photo_lut_capture_refresh();
+    return 1;
+}
+
+/* The configuration names the card library, and either no card library is
+ * published yet or the selected bank's look is missing from it. Another
+ * bank's missing look is looked for when that bank is selected (the worker
+ * re-checks at every wake), so an unused bank causes no card I/O. A
+ * built-in configuration never reads the card by itself. */
+static int restore_needed(void)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    if(!__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE) || p->record.library!=Z8_LIBRARY_CARD) return 0;
+    if(!__atomic_load_n(&Z8_STATE->card.active,__ATOMIC_ACQUIRE)) return 1;
+    uint32_t index;
+    const Z8LookBundle *b=library_wait();
+    uint32_t state=evaluate(b,&index);
+    library_exit();
+    return state==Z8_EFFECTIVE_RESTORING || state==Z8_EFFECTIVE_UNAVAILABLE;
+}
+
+/* One automatic restore attempt: read both cards and publish a valid
+ * library. Desired looks are never touched; failures only explain why a
+ * look is unavailable. */
+static void restore_attempt(void)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    __atomic_store_n(&p->restore,Z8_RESTORE_READING,__ATOMIC_RELEASE);
+    uint32_t status=CARD_BUSY,slots=0;
+    uint8_t *chosen=powering_down()?0:card_load(&status,&slots);
+    uint32_t count=chosen?((const Z8LookBundle *)chosen)->count:0;
+    if(chosen && __atomic_load_n(&Z8_STATE->card.unload,__ATOMIC_ACQUIRE)) { FREE(chosen);chosen=0;status=CARD_BUSY; }
+    if(chosen && !card_publish(chosen)) status=CARD_BUSY;
+    if(status==CARD_LOADED) {
+        volatile Z8CardLibrary *c=&Z8_STATE->card;
+        c->status=status;c->detail=slots;c->loaded=count;
+    }
+    p->reason=status;p->detail=slots;p->retries++;
+    __atomic_store_n(&p->restore,Z8_RESTORE_DONE,__ATOMIC_RELEASE);
+}
+
 static void card_worker(void *argument)
 {
     PreviewWorker *worker=argument;
-    volatile Z8CardLibrary *c=&Z8_STATE->card;
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8CardLibrary *c=&s->card;
+    volatile Z8Persist *p=&s->persist;
+    /* Automatic retries while a wanted look is missing: 0.5, 1, 2, 4, 8 s,
+     * then every 10 s; a menu visit retries at once. */
+    static const uint32_t backoff[]={500,1000,2000,4000,8000,10000};
+    unsigned attempts=0,unread=0;
+    /* Time is counted in idle waits at their bound: an early wake only
+     * brings a retry forward. */
+    uint32_t clock=0,last=0,saved=0;
     for(;;) {
+        /* A reset preceding a newer explicit Load is applied first. A reset
+         * during a read cancels its staged result below, before publication. */
+        if(__atomic_exchange_n(&c->unload,0,__ATOMIC_ACQ_REL)) {
+            card_publish(0);
+            attempts=0;
+            continue;
+        }
         uint32_t serial=__atomic_load_n(&c->request,__ATOMIC_ACQUIRE);
-        if(serial==__atomic_load_n(&c->result,__ATOMIC_ACQUIRE)) { EVENT_WAIT(worker->event,1,0,1000);continue; }
-        uint32_t status=CARD_BUSY,slots=0;
-        /* Power-down has begun: touch no card (its FS may be unmounting). */
-        uint8_t *chosen=__atomic_load_n(&Z8_STATE->preview.power_paused,__ATOMIC_ACQUIRE)?0:card_load(&status,&slots);
-        /* The GUI stopped waiting: never hand it a result it cannot publish. */
-        if(chosen && __atomic_load_n(&c->wanted,__ATOMIC_ACQUIRE)!=serial) { FREE(chosen);chosen=0;status=CARD_BUSY; }
-        c->status=status;c->detail=slots;c->loaded=chosen?((const Z8LookBundle *)chosen)->count:0;
-        uint64_t previous=__atomic_exchange_n(&c->staged,(uintptr_t)chosen,__ATOMIC_ACQ_REL);
-        if(previous) FREE((void *)(uintptr_t)previous);
-        __atomic_store_n(&c->result,serial,__ATOMIC_RELEASE);
+        if(serial!=__atomic_load_n(&c->result,__ATOMIC_ACQUIRE)) {
+            /* An explicit Load: published whatever the menu does meanwhile. */
+            uint32_t status=CARD_BUSY,slots=0,count=0;
+            uint8_t *chosen=powering_down() || request_cancelled(serial)?0:card_load(&status,&slots);
+            if(chosen && request_cancelled(serial)) { FREE(chosen);chosen=0;status=CARD_BUSY; }
+            if(chosen) {
+                count=((const Z8LookBundle *)chosen)->count;
+                if(!card_publish(chosen)) status=CARD_BUSY;
+                else desire_library(Z8_LIBRARY_CARD,serial);
+            }
+            c->status=status;c->detail=slots;c->loaded=status==CARD_LOADED?count:0;
+            if(status!=CARD_LOADED) c->refusals++;
+            /* A card read happened: a look still missing is now unavailable. */
+            p->reason=status;p->detail=slots;
+            __atomic_store_n(&p->restore,Z8_RESTORE_DONE,__ATOMIC_RELEASE);
+            __atomic_store_n(&c->result,serial,__ATOMIC_RELEASE);
+            continue;
+        }
+        /* The record could not be read (no memory): ask the native settings
+         * task to save, whose blob-16 store reads the region first. */
+        if(!powering_down() && __atomic_load_n(&p->ready,__ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&p->authoritative,__ATOMIC_ACQUIRE) && (GROUP_LOADED(Z8_BLOB_GROUP)&1) &&
+           (p->blob==Z8_BLOB_UNREAD || p->blob==Z8_BLOB_SKIPPED) && (!unread || clock-saved>=backoff[unread-1])) {
+            REQUEST_SAVE();
+            saved=clock;
+            if(unread<6) unread++;
+        }
+        unsigned due=0;
+        if(__atomic_load_n(&p->ready,__ATOMIC_ACQUIRE) && !powering_down()) {
+            if(__atomic_exchange_n(&c->retry_now,0,__ATOMIC_ACQ_REL)) due=restore_needed();
+            else if(p->restore==Z8_RESTORE_WAITING) due=restore_needed();
+            else if(restore_needed()) {
+                uint32_t delay=backoff[attempts<5?attempts:5];
+                due=clock-last>=delay;
+            } else attempts=0;
+        }
+        if(due) {
+            restore_attempt();
+            last=clock;
+            if(attempts<5) attempts++;
+            continue;
+        }
+        EVENT_WAIT(worker->event,1,0,CARD_IDLE_MS);
+        clock+=CARD_IDLE_MS;
     }
 }
 
-/* Started from the GUI task only; completed steps are kept and reused. */
+/* Started from the settings task (S1) or the GUI task; one start wins. */
 static int card_worker_start(void)
 {
     volatile Z8CardLibrary *c=&Z8_STATE->card;
-    if(c->worker_state) return 1;
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&c->worker_state,&expected,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+        return expected==1;
     PreviewWorker *worker=(PreviewWorker *)(uintptr_t)c->worker;
     if(!worker && (worker=ALLOC(sizeof(*worker),0))) {
         for(unsigned i=0;i<sizeof(*worker);i++) ((uint8_t *)worker)[i]=0;
@@ -1476,75 +2172,35 @@ static int card_worker_start(void)
         TASK_CREATE(worker->task,card_worker,parameters);
         if(*(int32_t *)worker>0) c->worker_id=*(uint32_t *)worker;
     }
-    if(!c->worker_id) return 0;
+    if(!c->worker_id) { __atomic_store_n(&c->worker_state,0,__ATOMIC_RELEASE);return 0; }
     TASK_START(worker->task,worker);
-    c->worker_state=1;
+    __atomic_store_n(&c->worker_state,1,__ATOMIC_RELEASE);
     return 1;
 }
 
-static int same_id(const uint8_t *a,const uint8_t *b) { return same_bytes(a,b,32); }
-
-/* GUI task: the same context as a menu selection and its save request.
- * Order: preview quiesce (pause, cancel, wait, release cache, discard
- * pending) -> publishing -> no counted reader -> remap every bank by full
- * transform identity -> swap -> names -> release -> resume -> save. */
-static int card_publish(Z8LookBundle *next)
+static void card_wake(void)
 {
-    volatile Z8LutState *s=Z8_STATE;
-    volatile Z8CardLibrary *c=&s->card;
-    if(__atomic_load_n(&s->preview.power_paused,__ATOMIC_ACQUIRE)) { FREE(next);return 0; }
-    z8_photo_lut_mode_enter();
-    __atomic_store_n(&c->publishing,1,__ATOMIC_SEQ_CST);
-    while(__atomic_load_n(&c->readers,__ATOMIC_SEQ_CST)) TASK_SLEEP(1);
-    const Z8LookBundle *previous=library_active();
-    /* A one-byte marker, not a persistent identity: 0 is the built-in
-     * library, a session library gets a nonzero value unlike the previous
-     * one. Every publication remaps every bank by full transform identity
-     * and rewrites every marker, so a stale marker becomes Off here. */
-    uint32_t tag=previous->tag%255+1;
-    next->tag=tag;
-    for(unsigned copy=0;copy<BANK_COPIES;copy++) {
-        uint32_t saved=saved_selection(copy),index=saved&255,mapped=0;
-        if((saved>>8)==previous->tag && index && index<=previous->count)
-            for(unsigned i=0;i<next->count && !mapped;i++)
-                if(same_id(next->looks[i].id,previous->looks[index-1].id)) mapped=i+1;
-        save_selection(copy,mapped,tag);
-    }
-    __atomic_store_n(&c->active,(uintptr_t)next,__ATOMIC_RELEASE);
-    s->choice=saved_selection(0)&255;
-    __atomic_store_n(&c->publishing,0,__ATOMIC_SEQ_CST);
-    if(previous!=Z8_BUILTIN) FREE((void *)(uintptr_t)previous);
-    c->publications++;
-    z8_photo_lut_mode_exit();
-    if(!__atomic_load_n(&s->preview.power_paused,__ATOMIC_ACQUIRE)) REQUEST_SAVE();
-    return 1;
+    volatile Z8CardLibrary *c=&Z8_STATE->card;
+    if(__atomic_load_n(&c->worker_state,__ATOMIC_ACQUIRE)==1)
+        EVENT_SET(((PreviewWorker *)(uintptr_t)c->worker)->event,1);
 }
 
+static void menu_show(void);
+
+/* GUI task: an explicit Load. The worker reads and publishes; the menu
+ * waits a bounded time for the result to show it. */
 static void card_request(void)
 {
     volatile Z8CardLibrary *c=&Z8_STATE->card;
     c->attempts++;
-    uint64_t stale=__atomic_exchange_n(&c->staged,0,__ATOMIC_ACQ_REL);
-    if(stale) FREE((void *)(uintptr_t)stale);
-    uint32_t status=CARD_MEMORY,slots=0,count=0;
-    if(card_worker_start()) {
-        uint32_t serial=c->request+1;
-        if(!serial) serial=1;
-        __atomic_store_n(&c->wanted,serial,__ATOMIC_RELEASE);
-        __atomic_store_n(&c->request,serial,__ATOMIC_RELEASE);
-        EVENT_SET(((PreviewWorker *)(uintptr_t)c->worker)->event,1);
-        for(unsigned i=0;i<CARD_WAIT_POLLS && __atomic_load_n(&c->result,__ATOMIC_ACQUIRE)!=serial;i++) TASK_SLEEP(CARD_WAIT_MS);
-        __atomic_store_n(&c->wanted,0,__ATOMIC_RELEASE);
-        status=CARD_BUSY;
-        if(__atomic_load_n(&c->result,__ATOMIC_ACQUIRE)==serial) {
-            status=c->status;slots=c->detail;count=c->loaded;
-            uint64_t staged=__atomic_exchange_n(&c->staged,0,__ATOMIC_ACQ_REL);
-            if(status==CARD_LOADED && (!staged || !card_publish((Z8LookBundle *)(uintptr_t)staged))) status=CARD_BUSY;
-            else if(status!=CARD_LOADED && staged) FREE((void *)(uintptr_t)staged);
-        }
-    }
-    if(status!=CARD_LOADED) c->refusals++;
-    menu_text(library_active(),status,count,slots);
+    if(!card_worker_start()) { c->status=CARD_MEMORY;c->detail=0;c->loaded=0;c->refusals++;return; }
+    uint32_t serial=c->request+1;
+    if(!serial) serial=1;
+    __atomic_store_n(&c->request,serial,__ATOMIC_RELEASE);
+    card_wake();
+    for(unsigned i=0;i<CARD_WAIT_POLLS && __atomic_load_n(&c->result,__ATOMIC_ACQUIRE)!=serial;i++) TASK_SLEEP(CARD_WAIT_MS);
+    if(__atomic_load_n(&c->result,__ATOMIC_ACQUIRE)!=serial) { c->status=CARD_BUSY;c->detail=0;c->loaded=0; }
+    menu_show();
 }
 
 /* ---- label font --------------------------------------------------------- */
@@ -1603,20 +2259,86 @@ uint32_t z8_photo_lut_text_font(uint32_t language,uint32_t id,const volatile uin
 /* ---- menu ------------------------------------------------------------- */
 #define ROW_DISABLE ((void (*)(void *,uint32_t,uint32_t))(uintptr_t)0x403b1ed0)
 
+/* GUI task: what the camera does for the selected bank, and the card-row
+ * status that explains it. */
+static uint32_t menu_state(const Z8LookBundle *b,uint32_t *index,uint32_t *status,uint32_t *count,uint32_t *slots)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8CardLibrary *c=&s->card;
+    volatile Z8Persist *p=&s->persist;
+    uint32_t state=effective(b,index);
+    *count=0;*slots=0;
+    if(state==Z8_EFFECTIVE_RESTORING) *status=CARD_RESTORING;
+    else if(state==Z8_EFFECTIVE_UNRESOLVED) *status=CARD_UNRESOLVED;
+    else if(state==Z8_EFFECTIVE_UNAVAILABLE) {
+        *status=p->reason==CARD_LOADED?CARD_NOT_IN_LIBRARY:p->reason;
+        *slots=p->detail;
+    } else { *status=c->status;*count=c->loaded;*slots=c->detail; }
+    return state;
+}
+
+/* Rewrite the menu strings when the status or the published library changed
+ * since they were written (GUI task, before the page or row is drawn). */
+static void menu_refresh(const Z8LookBundle *b,uint32_t status,uint32_t count,uint32_t slots)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    uint32_t key[2]={status|count<<8|slots<<16|1u<<24,__atomic_load_n(&p->library_generation,__ATOMIC_ACQUIRE)};
+    if(p->text_key[0]==key[0] && p->text_key[1]==key[1]) return;
+    menu_text(b,status,count,slots);
+    p->text_key[0]=key[0];p->text_key[1]=key[1];
+}
+
+/* GUI task: bring the menu strings up to date. */
+static void menu_show(void)
+{
+    const Z8LookBundle *b=library_wait();
+    uint32_t index,status,count,slots;
+    menu_state(b,&index,&status,&count,&slots);
+    menu_refresh(b,status,count,slots);
+    library_exit();
+}
+
+static void preview_wake(void)
+{
+    volatile Z8Preview *p=&Z8_STATE->preview;
+    if(p->worker && p->worker_started) EVENT_SET(((PreviewWorker *)(uintptr_t)p->worker)->event,1);
+}
+
 int z8_photo_lut_menu_entry(void *page)
 {
+    volatile Z8LutState *s=Z8_STATE;
+    const Z8LookBundle *b=library_wait();
+    uint32_t index,status,count,slots,state=menu_state(b,&index,&status,&count,&slots);
+    menu_refresh(b,status,count,slots);
+    uint32_t looks=s->ready?b->count:0;
+    library_exit();
     /* Look rows past the active library are disabled, which the native list
      * hides (QEMU run-01; the pinned row state of the pixel-shift browser). */
-    const Z8LookBundle *b=library_active();
-    for(uint32_t look=1;look<=Z8_LUT_MAX_LOOKS;look++) ROW_DISABLE(page,z8_row_of(look),look>b->count);
-    uint32_t row=z8_row_of(choice());
+    for(uint32_t look=1;look<=Z8_LUT_MAX_LOOKS;look++) ROW_DISABLE(page,z8_row_of(look),look>looks);
+    /* The mark names what the camera applies: Off, the applied look, or the
+     * card row while the selected bank's look is restoring or unavailable;
+     * opening the page then retries the card at once. */
+    uint32_t row=state==Z8_EFFECTIVE_OFF?0:state==Z8_EFFECTIVE_APPLIED?z8_row_of(index):Z8_LOAD_ROW;
+    if(row==Z8_LOAD_ROW) { __atomic_store_n(&s->card.retry_now,1,__ATOMIC_RELEASE);card_wake(); }
     /* Right after a card load ask for the cursor on the result row. Where the
      * native re-entry finally places it is not established; the rebuilt page
      * shows the result row either way (QEMU qemu-ui-c). */
-    if(__atomic_exchange_n(&Z8_STATE->card.show_result,0,__ATOMIC_ACQ_REL)) SET_CURSOR(page,Z8_OPTION_FIRST+Z8_LOAD_ROW);
+    if(__atomic_exchange_n(&s->card.show_result,0,__ATOMIC_ACQ_REL)) SET_CURSOR(page,Z8_OPTION_FIRST+Z8_LOAD_ROW);
     else if(ENTRY_GUARD(page)!=1) SET_CURSOR(page,Z8_OPTION_FIRST+row);
     return SET_MARK(page,Z8_OPTION_FIRST+row,1);
 }
+
+/* Record writers (GUI task and the native settings task) take turns. */
+static void record_lock(void)
+{
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    for(;;) {
+        uint32_t free=0;
+        if(__atomic_compare_exchange_n(&p->writer,&free,1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+        TASK_SLEEP(1);
+    }
+}
+static void record_unlock(void) { __atomic_store_n(&Z8_STATE->persist.writer,0,__ATOMIC_RELEASE); }
 
 /* The stock dispatcher passes its transition request (page at +0, target
  * state at +0xC) and goes to the target read back afterwards (pixel-shift
@@ -1629,7 +2351,7 @@ int z8_photo_lut_menu_ok(void *request)
     uint64_t page=read64((uintptr_t)request);
     uint64_t list=read64(page+0x50),rows=read64(list+0x10);
     uint32_t cursor=(uint32_t)read16(page+0x58)+read16(page+0x32);
-    if(cursor>=Z8_ROWS || !Z8_STATE->ready) return 0;
+    if(cursor>=Z8_ROWS || Z8_STATE->magic!=Z8_STATE_MAGIC) return 0;
     uint32_t item=read32(rows+(uint64_t)cursor*44+24);
     if(item<Z8_OPTION_FIRST || item>=Z8_OPTION_FIRST+Z8_ROWS) return 0;
     uint32_t row=item-Z8_OPTION_FIRST;
@@ -1639,17 +2361,18 @@ int z8_photo_lut_menu_ok(void *request)
         *(volatile uint32_t *)((uintptr_t)request+REQUEST_TARGET)=Z8_MENU_STATE;
         return 0;
     }
+    uint32_t bank=read32(Z8_BANK_INDEX);
+    if(bank>=Z8_BANKS) return 0;
+    Z8BankSlot slot={0};
     uint32_t option=row?row-1:0;
-    /* Publication also runs in this GUI task, so the library is stable here. */
-    const Z8LookBundle *b=library_active();
-    if(option>b->count) return 0;           /* an unused row keeps the selection */
-    save_selection(0,option,b->tag);
-    Z8_STATE->choice=option;
-    /* Request native NVRAM serialization. It compares and writes the entire
-     * 0x2e0-byte photo block, including these alignment bytes. */
-    REQUEST_SAVE();
-    if(Z8_STATE->preview.worker && Z8_STATE->preview.worker_started)
-        EVENT_SET(((PreviewWorker *)(uintptr_t)Z8_STATE->preview.worker)->event,1);
+    if(option) {
+        const Z8LookBundle *b=library_wait();
+        unsigned valid=Z8_STATE->ready && option<=b->count;
+        if(valid) { slot.kind=Z8_DESIRED_LOOK;copy_bytes(slot.id,b->looks[option-1].id,sizeof(slot.id)); }
+        library_exit();
+        if(!valid) return 0;                /* an unused row keeps the selection */
+    }
+    desire_bank(bank,&slot);
     return 0;
 }
 
@@ -1657,13 +2380,17 @@ int z8_photo_lut_photo_refresh(void *page)
 {
     int result=PHOTO_REFRESH(page);
     void *child=page?CHILD(page,Z8_MENU_ITEM,0x4ba7):0;
-    uint32_t selected=choice();
+    const Z8LookBundle *b=library_wait();
+    uint32_t index,status,count,slots,state=menu_state(b,&index,&status,&count,&slots);
+    menu_refresh(b,status,count,slots);
+    library_exit();
     if(child) {
         /* The reused row's stock value is a graphic. Reset its native kind
          * before binding a static language-table string (kind2). */
         if(read32((uintptr_t)child+12)!=2) BIND(child,0,0);
-        /* Strings: +2 Off, +3 card-load row, +4.. the looks. */
-        uint32_t text=selected?Z8_STRING_FIRST+3+selected:Z8_STRING_FIRST+2;
+        /* Strings: +2 Off, +3 card row (status), +4.. the looks. */
+        uint32_t text=state==Z8_EFFECTIVE_OFF?Z8_STRING_FIRST+2:
+                      state==Z8_EFFECTIVE_APPLIED?Z8_STRING_FIRST+3+index:Z8_STRING_FIRST+3;
         if(read32((uintptr_t)child+8)!=text || read32((uintptr_t)child+12)!=2) BIND(child,text,2);
         CONTENT(child,text);
     }
@@ -1672,23 +2399,14 @@ int z8_photo_lut_photo_refresh(void *page)
 
 void z8_photo_lut_bank_reset_result(const uint64_t *saved)
 {
-    if(Z8_STATE->magic!=Z8_STATE_MAGIC || !Z8_STATE->ready || !(saved[0]&1)) return;
-    uint32_t kind=(uint32_t)saved[19],bank=kind==9?0:kind-10;
-    if(bank>=4) return;
+    volatile Z8LutState *s=Z8_STATE;
+    if(s->magic!=Z8_STATE_MAGIC || !(saved[0]&1)) return;
+    uint32_t kind=(uint32_t)saved[19],bank=kind==9?read32(Z8_BANK_INDEX):kind-10;
+    if(bank>=Z8_BANKS) return;
     /* Individual-bank reset deliberately excludes the folder-name item from
-     * its531-ID list. Reset our independent setting only after native success,
-     * to the active library's default. Whole-camera resets copy the patched
-     * group6 defaults, which name the built-in library (tag 0). */
-    const Z8LookBundle *b;
-    while(!(b=library_enter())) TASK_SLEEP(1);
-    uint32_t initial=b->initial,tag=b->tag;
-    library_exit();
-    save_selection(bank+1,initial,tag);
-    if(read32(UINT64_C(0xa03d48164))==bank) {
-        save_selection(0,initial,tag);
-        Z8_STATE->choice=initial;
-        if(Z8_STATE->preview.worker && Z8_STATE->preview.worker_started)
-            EVENT_SET(((PreviewWorker *)(uintptr_t)Z8_STATE->preview.worker)->event,1);
-    }
-    REQUEST_SAVE();
+     * its 531-ID list. Reset the bank's look only after native success, to
+     * the firmware default. */
+    Z8BankSlot slot;
+    default_slot(&slot);
+    desire_bank(bank,&slot);
 }

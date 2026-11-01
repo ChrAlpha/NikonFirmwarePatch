@@ -42,7 +42,7 @@ python photo_lut.py library verify looks.bin                        # 从原始 
 2. **写入存储卡**：`python photo_lut.py library card looks.bin /存储卡根目录`，在卡根目录生成 `Z8LUTLIB.BIN`。
 3. **在相机中载入**：照片拍摄菜单 > 照片 LUT > **从存储卡载入 LUT**。
 
-进阶：`build` 加 `--library looks.bin` 可把风格内置进固件（输出附 `builtin-library.bin`）。菜单库保存的是风格位置；换装内置风格不同的固件后，**须在每个拍摄菜单库重新设置照片 LUT**，固件无法识别旧选择原指的风格。
+进阶：`build` 加 `--library looks.bin` 可把风格内置进固件（输出附 `builtin-library.bin`）。A–D 拍摄菜单库分别保存完整变换标识，改名或调整顺序后仍能对应原风格；移除或改变网格的风格会显示不可用。
 
 存储卡载入规则：
 
@@ -56,7 +56,11 @@ python photo_lut.py library verify looks.bin                        # 从原始 
 
 选择“从存储卡载入 LUT”后，菜单页不关闭而是立即重建：该行改为显示结果（如“存储卡 LUT：已载入 8 个（卡槽 1）”），下方列出新风格。拒绝时当前风格和各菜单库选择都不变。
 
-**存储卡风格只在本次开机有效**，不写入相机存储。关机（包括电池拔出）后只剩内置风格（默认没有）；指向存储卡风格的选择显示为“关闭”，不会改用同位置的其他风格。同一次开机内再次载入时，各菜单库按变换标识重新对应：新库中仍有的风格保持选中（位置可变），没有的变为关闭；重新开机后不会恢复存储卡风格的选择。载入空库即清空本次开机的所有风格。菜单只列出当前库中的风格。
+**导入一次，正常关机后自动恢复。** 相机内部保存当前风格库来源和 A–D 各菜单库的完整变换标识；风格网格仍保存在卡上的 `Z8LUTLIB.BIN`。下次开机无需进入菜单、载入或重选，固件会自动读取存储卡并恢复选择。选择“关闭”只关闭效果，保留已导入库的来源；即使四个菜单库都关闭，下次开机仍自动载入该库。原厂菜单的“复制”同时复制该菜单库的 LUT 选择，之后修改来源菜单库不会影响副本。
+
+菜单只列出当前库中的风格：显式载入存储卡库会替换内置库；重启继续使用同一来源。原来选择的风格若不在当前库中，会保留原标识并显示不可用，不会误用同位置或同名风格。卡缺失、延迟就绪、文件损坏或两卡冲突时，固件保留选择并自动重试；启动工作任务暂时缺少内存或系统资源时，也由原厂设置任务自动重试。只在当前菜单库需要恢复或尚未载入导入库时重试，未使用菜单库缺少风格不会反复读卡。风格恢复前阻止拍摄，选择“关闭”即可拍摄。已载入的库留在 RAM 中，取出卡不会改变其风格。
+
+首次从旧版的“位置”选择升级时，固件无法还原其完整标识，会要求重新选择；全局重置恢复内置库及其默认风格。返回原厂固件后，原厂设置仍可读取，原厂保存会清除本功能的扩展记录。
 
 每次拍摄在分配输出时锁定所选风格：复制其网格、标识和名称，之后改选或载入新库都不影响已开始的拍摄。
 
@@ -85,7 +89,7 @@ Z8_PHOTO_LUT_ROM=z8-main-payload.bi python -B -m unittest discover -s tests -p '
 
 ### 验证范围
 
-宿主测试覆盖库格式、编辑、导出、错误输入和与相机校验代码的一致性；载入、菜单库对应、拍摄锁定和 XMP 写入由实际编译的固件代码在 Unicorn 中执行（文件系统和 XMP 合成器为桩）。QEMU 模拟器另行运行原厂菜单与存储卡。实机菜单显示、存储卡读取、色彩、速度及 Lightroom/NX Studio 的显示均未验证。
+宿主测试覆盖库格式、编辑、导出、错误输入和与相机校验代码的一致性；自动恢复、延迟读取时的选择合并、菜单库默认值、拍摄锁定和 XMP 写入由实际编译的固件代码在 Unicorn 中执行（文件系统和 XMP 合成器为桩）。原厂设置代码测试还在模拟 NOR 上执行第 16 节读写、模式 4 恢复及默认值，覆盖中断写入和原厂前缀保留。QEMU 模拟器另行运行原厂菜单与存储卡。实机菜单显示、存储卡读取、色彩、速度及 Lightroom/NX Studio 的显示均未验证。
 
 ## English
 
@@ -125,7 +129,7 @@ Every change writes and reads back a complete temporary file before replacing th
 2. **Copy to a card**: `python photo_lut.py library card looks.bin /card/root` writes `Z8LUTLIB.BIN` to the card root.
 3. **Load in the camera**: Photo shooting menu > Photo LUT > **Load LUTs from card**.
 
-Advanced: `build --library looks.bin` builds looks into the firmware (the output adds `builtin-library.bin`). Shooting banks save a look position; after installing firmware with different built-in looks, **set Photo LUT again in every shooting bank** — the firmware cannot tell which look an old selection meant.
+Advanced: `build --library looks.bin` builds looks into the firmware (the output adds `builtin-library.bin`). Shooting banks A–D save full transform identities: renaming or reordering preserves the choice; a removed or changed transform remains unavailable.
 
 Card load rules:
 
@@ -139,7 +143,11 @@ Card load rules:
 
 After Load LUTs from card the page does not close; it is rebuilt at once, that row showing the result (for example "Card LUTs: 8 loaded (slot 1)") with the new looks below it. A refusal keeps the current looks and every bank's selection.
 
-**Card looks last only for the current power-on** and are not stored in the camera. After switching off (including battery removal) only built-in looks remain (none by default); selections that pointed to card looks show Off and never fall back to another look at the same position. Within one power-on, each further load remaps every shooting bank by transform identity: a look that is still present stays selected (its position may change), others become Off. A restart never restores card selections. Loading an empty library clears all looks for the session. The menu lists only the current library's looks.
+**Import once; normal power cycles restore automatically.** Internal settings retain the active library source and each A–D bank's full transform identity; the grids stay in `Z8LUTLIB.BIN` on the card. Startup restores the library and choices without a menu visit, Load or reselection. Off disables the effect and retains the imported library source: even with all four banks Off, startup still reloads that library. The native bank Copy command copies its LUT choice too; later source-bank edits do not change the copy.
+
+The menu lists the active library only. Explicitly importing a card library replaces the built-in library, and restart restores that same source. If a bank's chosen transform is absent, its identity stays saved and the look is unavailable; a same-name or same-position look never replaces it. Missing, delayed, corrupt or conflicting cards retain choices and trigger automatic retries. The native settings task also retries startup when the restore worker temporarily lacks memory or task resources. Retries stop once the active bank is resolved and the imported library has loaded; an unused bank's missing look causes no repeated card reads. Capture is blocked until the selected look restores or Off is chosen. A published library remains in RAM when its card is removed.
+
+On the first upgrade from legacy position-based selections, their full identities cannot be reconstructed and the camera asks for a new choice. Whole-settings reset returns to the built-in library and its default look. Stock firmware can still read its original settings; saving with stock firmware clears this feature's extension record.
 
 Each capture latches its look when its output is reserved: it copies the grid, identity and name, so changing the selection or loading a library never affects a capture already under way.
 
@@ -168,4 +176,4 @@ Without `Z8_PHOTO_LUT_ROM` only host tests run; `Z8_PHOTO_LUT_SAMPLE_JPEG` may n
 
 ### Evidence
 
-Host tests cover the library format, editing, exports, malformed input and parity with the camera's validator; loading, bank remapping, capture latching and XMP insertion run the actual compiled firmware code in Unicorn with stubbed file system and XMP composer. The QEMU emulator separately runs the original menus and card. Physical menu drawing, card reads, colour, speed and Lightroom/NX Studio display are not verified.
+Original-ROM settings tests additionally execute section-16 read/write, mode-4 restore and defaults over modelled NOR, including interrupted writes and stock-prefix preservation. Host tests cover the library format, editing, exports, malformed input and parity with the camera's validator; automatic restore, pending-change merges, bank defaults, capture latching and XMP insertion run the actual compiled firmware code in Unicorn with stubbed file system and XMP composer. The QEMU emulator separately runs the original menus and card. Physical menu drawing, card reads, colour, speed and Lightroom/NX Studio display are not verified.

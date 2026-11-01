@@ -272,13 +272,13 @@ def validate_runtime(raw):
     """Independent structural check of the bundle the firmware applies."""
     if len(raw) < HEADER+MAX_LOOKS*ENTRY:
         raise ValueError('Truncated LUT library header')
-    magic, version, size, count, default, checksum, tag, identifier = struct.unpack_from(HEADER_FORMAT, raw)
+    magic, version, size, count, default, checksum, reserved, identifier = struct.unpack_from(HEADER_FORMAT, raw)
     if magic != MAGIC or version != VERSION:
         raise ValueError('Not a Z8LUT003 photo LUT library')
     if size > len(raw) or size > MAX_BYTES or size < HEADER+MAX_LOOKS*ENTRY:
         raise ValueError('Invalid or truncated LUT library size')
     raw = raw[:size]
-    if (count > MAX_LOOKS or default > count or tag or zlib.crc32(raw[HEADER:]) != checksum):
+    if (count > MAX_LOOKS or default > count or reserved or zlib.crc32(raw[HEADER:]) != checksum):
         raise ValueError('Invalid LUT library header or checksum')
     expected = hashlib.sha256(b'z8photolut/library/1\0'+struct.pack('<I', default)+raw[HEADER:]).digest()
     if identifier != expected:

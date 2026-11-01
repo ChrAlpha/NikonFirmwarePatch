@@ -13,7 +13,7 @@ from pathlib import Path
 import struct
 import unittest
 
-from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,desire,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,LUT,branch,compile_code
 
 try:
@@ -154,7 +154,7 @@ class CompiledGraphMachine(NativeGraphMachine):
         self.m.mem_write(LUT,looks)
         self.m.mem_write(STATE,struct.pack('<Q6I',0x32545354554c385a,2,
             metadata['runtime_layout']['state_bytes'],choice,256,1,0))
-        self.m.mem_write(0xa03d482ba,bytes([choice]))
+        desire(self.m,self.layout,choice,bundle=LUT)
         # Derive capacity and immutable lease fields by running the real LUT
         # allocator, isolating only the native pool allocation operation.
         allocated=self.call(symbols['z8_photo_lut_output_alloc'],42,0x38,0x20000,CONFIG)

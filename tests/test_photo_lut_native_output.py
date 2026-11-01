@@ -13,7 +13,7 @@ import struct
 import unittest
 
 from z8photolut.library import look_id
-from photo_lut_fixtures import LEASE_BYTES,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import LEASE_BYTES,desire,record_bytes,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,LUT,branch,compile_code
 
 try:
@@ -54,6 +54,7 @@ class NativeOutputMachine:
         self.frees=[]
         self.constructed=[]
         self.tasks=[]
+        self.forecast_events=[]
         self.native_bytes=0
         self.m.mem_map(BASE,(len(rom)+4095)&~4095)
         self.m.mem_write(BASE,rom)
@@ -73,7 +74,8 @@ class NativeOutputMachine:
         self.m.mem_write(LUT,looks)
         self.m.mem_write(STATE,struct.pack('<Q6I',0x32545354554c385a,2,
             metadata['runtime_layout']['state_bytes'],2,256,1,0))
-        self.m.mem_write(0xa03d482ba,b'\x02')
+        self.layout=metadata['runtime_layout']
+        desire(self.m,self.layout,2,bundle=LUT)
         # Execute native 41186718 with the image-RAM cached-alias contract.
         self.m.mem_write(0xa0497d030,struct.pack('<QIIQII',0x800000000,1,0,0xa00000000,0,0))
         if separate:
@@ -143,6 +145,9 @@ class NativeOutputMachine:
         elif address==0x40d2d5cc:
             self.tasks.append(address)
             self._return()
+        elif address==0x40d2bc8c:
+            self.forecast_events.append((x0,machine.reg_read(regs.UC_ARM64_REG_X1)))
+            self._return(1)
         elif address==0x4127ab40:
             value=machine.reg_read(regs.UC_ARM64_REG_X1)&255
             length=machine.reg_read(regs.UC_ARM64_REG_X2)
@@ -168,7 +173,7 @@ class NativeOutputMachine:
         self.m.mem_write(INFO,bytes(0x3000))
         for offset,value in [(0x294,format),(0x298,dimension),(0x290,quality),(0x2fc,alternate)]:
             self.m.mem_write(INFO+offset,struct.pack('<I',value))
-        self.m.mem_write(0xa03d482ba,bytes([choice]))
+        desire(self.m,self.layout,choice,bundle=LUT)
 
     def construct(self):
         return self.call(0x41048d78,42,INFO)
@@ -432,7 +437,7 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
         free_units=total_units-machine.owner(resource)[1]//unit
         for choice in (0,1,2):
             with self.subTest(prospective_choice=choice):
-                machine.m.mem_write(0xa03d482ba,bytes([choice]))
+                desire(machine.m,machine.layout,choice,bundle=LUT)
                 required=align512(native)+LEASE_BYTES+(TRANSFORM if choice==2 else 0)
                 units=(required+unit-1)//unit
                 self.assertEqual(machine.forecast(),(required,free_units//units,total_units//units))
@@ -442,6 +447,45 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
                 self.assertEqual(machine.call(0x4104886c,INFO,INFO+0x26c,0),native)
         self.assertEqual(machine.call(0x41049504,resource),1)
         self.assertEqual(machine.free_units(),total_units)
+
+    def test_forecast_refresh_posts_native_event_only_after_initialization(self):
+        machine=self.machine()
+        object=0xa03bc6970
+        persist=STATE+machine.layout['persist_offset']
+        # settings_restored follows pending_mask and pending_library.
+        machine.m.mem_write(persist+machine.layout['persist_pending_offset']+8,struct.pack('<I',1))
+        power=STATE+machine.layout['preview_offset']+machine.layout['power_paused_offset']
+        refresh=machine.symbols['z8_photo_lut_capture_refresh']
+        for active,callback,event,paused in ((0,0x40f95258,27,0),(1,0,27,0),
+                                              (1,0x40f95258,0,0),(1,0x40f95258,27,1)):
+            machine.m.mem_write(0xa03bc6bd0,bytes([active]))
+            machine.m.mem_write(object+0x48,struct.pack('<Q',callback))
+            machine.m.mem_write(object+0x38,struct.pack('<i',event))
+            machine.m.mem_write(power,struct.pack('<I',paused))
+            machine.call(refresh)
+        self.assertEqual(machine.forecast_events,[])
+        machine.m.mem_write(power,struct.pack('<I',0))
+        machine.call(refresh)                    # real 40f964e8 and 40c002a0; OS event isolated
+        self.assertEqual(machine.forecast_events,[(object+0x38,1)])
+
+    def test_unavailable_look_blocks_native_forecast_and_allocation_then_recovers(self):
+        machine=self.machine()
+        machine.configure(format=3)
+        persist=STATE+machine.layout['persist_offset']
+        machine.m.mem_write(persist,record_bytes([bytes.fromhex('ab'*32),None,None,None],1))
+        self.assertEqual(machine.forecast(),(0x80000000,0,0))
+        self.assertEqual(machine.construct(),0)
+        self.assertEqual(machine.constructed,[])
+        # Recomputing the same native forecast after Off or a resolved choice
+        # restores capacity, without changing output-pool configuration.
+        for choice in (0,2):
+            with self.subTest(choice=choice):
+                desire(machine.m,machine.layout,choice,bundle=LUT)
+                self.assertGreater(machine.forecast()[1],0)
+                resource=machine.construct()
+                self.assertTrue(resource)
+                self.assertEqual(machine.footer(resource)[6],choice)
+                self.assertEqual(machine.call(0x41049504,resource),1)
 
     def test_clamped_and_exhausted_native_allocations_return_null_before_layout(self):
         clamped=self.machine(pool_units=1)

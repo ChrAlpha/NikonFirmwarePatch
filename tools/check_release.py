@@ -115,6 +115,7 @@ SOURCE_FILES=(
     'tests/photo_lut_native.c',
     'tests/test_photo_lut.py',
     'tests/test_photo_lut_card.py',
+    'tests/test_photo_lut_persistence.py',
     'tests/test_photo_lut_font.py',
     'tests/test_photo_lut_hooks.py',
     'tests/test_photo_lut_library.py',

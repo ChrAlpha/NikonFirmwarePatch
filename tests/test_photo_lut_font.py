@@ -58,7 +58,7 @@ class FontFactsTests(unittest.TestCase):
         facts = json.loads((ROOT/'resources/photo-lut-fonts.json').read_text())['fonts']
         for group, font in enumerate((16, 2, 0)):
             texts = [*MENU_TEXT[group], *(row[group] for row in card_texts())]
-            self.assertEqual(len(texts), 4+8)
+            self.assertEqual(len(texts), 4+11)
             for text in texts:
                 with self.subTest(group=group, text=text):
                     missing = [c for c in text if ord(c) >= 0x20 and

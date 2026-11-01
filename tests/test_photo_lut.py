@@ -76,19 +76,13 @@ class PhotoLutTests(unittest.TestCase):
             self.assertEqual(validate_runtime(raw)['count'],1)
             storage=C.create_string_buffer(raw)
             self.assertEqual(self.lib.z8_lut_validate(storage,len(raw)),0)
-            # Header magic/version/size/count/default/CRC, entry fields, name,
-            # identity digest, entry padding and samples: both readers reject.
-            for at in [0,8,12,16,20,24,32,63,64,68,72,76,80,84,88,150,152,183,184,len(raw)-1]:
+            # Header magic/version/size/count/default/CRC/reserved, entry fields,
+            # name, identity digest, entry padding and samples: both readers reject.
+            for at in [0,8,12,16,20,24,28,32,63,64,68,72,76,80,84,88,150,152,183,184,len(raw)-1]:
                 corrupt=bytearray(raw);corrupt[at]^=0x40
                 with self.subTest(at=at),self.assertRaises(ValueError): validate_runtime(corrupt)
                 copy=C.create_string_buffer(bytes(corrupt))
                 self.assertNotEqual(self.lib.z8_lut_validate(copy,len(raw)),0)
-            # The camera writes its own session tag into a published library;
-            # a host file must carry tag 0.
-            for at in [28]:
-                corrupt=bytearray(raw);corrupt[at]^=0x40
-                with self.subTest(at=at),self.assertRaises(ValueError): validate_runtime(corrupt)
-                self.assertEqual(self.lib.z8_lut_validate(C.create_string_buffer(bytes(corrupt)),len(raw)),0)
         # Valid checksums cannot legitimize an overlapping/truncated sample span.
         corrupt=bytearray(self.cycle);struct.pack_into('<I',corrupt,64,64)
         struct.pack_into('<I',corrupt,24,zlib.crc32(corrupt[64:]))

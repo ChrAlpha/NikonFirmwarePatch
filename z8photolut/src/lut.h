@@ -24,11 +24,10 @@ typedef struct {
     uint8_t padding[8];
 } Z8LookEntry;
 
-/* tag: 0 for the library built into the firmware; a published card
- * library carries its nonzero session tag (never trusted as identity). */
+/* reserved: 0 in every bundle (validated). */
 typedef struct {
     uint64_t magic;
-    uint32_t version, bytes, count, initial, crc32, tag;
+    uint32_t version, bytes, count, initial, crc32, reserved;
     uint8_t library_id[32];
     Z8LookEntry looks[Z8_LUT_MAX_LOOKS];
 } Z8LookBundle;
@@ -51,6 +50,7 @@ enum {
 };
 
 uint32_t z8_lut_crc32(const void *, uint32_t);
+void z8_lut_sha256(const void *data,uint32_t bytes,uint8_t digest[32]);
 void z8_lut_look_id(uint32_t grid,const uint16_t *samples,uint8_t digest[32]);
 unsigned z8_lut_name_valid(const char *name,unsigned capacity);
 unsigned z8_lut_validate(const Z8LookBundle *, uint32_t available);

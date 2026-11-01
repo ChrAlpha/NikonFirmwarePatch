@@ -11,9 +11,24 @@
 #define Z8_MENU_STATE 0x1du       /* borrowed hidden photo state 29 holding the option page */
 #define Z8_LABELS 12u             /* strings Z8_STRING_FIRST+0..11: title, help, Off, load row, 8 looks */
 #define Z8_STRING_FIRST 3137u
-/* Native photo folder name is a six-byte blob at group6+0. Its two
- * alignment bytes are descriptor-unowned and persisted with all five banks. */
-#define Z8_SAVED_CHOICE ((uint8_t *)(uintptr_t)UINT64_C(0xa03d482ba))
+/* Native photo folder name is a six-byte blob at group6+0 of each of the
+ * five 0x2e0-byte photo-bank blobs (current, A..D). Its two alignment bytes
+ * are descriptor-unowned and persisted with the blob. Firmware up to abe1a72
+ * kept a session selection there; now they only say whether the bank record
+ * below is authoritative (Z8_OWNED_RECORDED) or never written (0). */
+#define Z8_OWNED_BYTES UINT64_C(0xa03d482ba)
+#define Z8_BANK_STRIDE 0x2e0u
+#define Z8_BANK_COPIES 5u
+#define Z8_OWNED_RECORDED 0xffffu
+#define Z8_BANKS 4u
+#define Z8_BANK_INDEX UINT64_C(0xa03d48164)      /* native selected photo bank 0..3 */
+#define Z8_SETTINGS_LOADED UINT64_C(0xa03bddcc8) /* byte: native section-15 restore succeeded */
+/* Fixed settings blob 16 (group 0x31): its mirrored region also stores the
+ * bank record right after the stock bytes in the same mirrored region commit. */
+#define Z8_BLOB_SECTION 0x10u
+#define Z8_BLOB_GROUP 0x31u
+#define Z8_BLOB UINT64_C(0xa03dabdc0)
+#define Z8_BLOB_BYTES 0xcdb0u
 #define Z8_PREVIEW_SLOTS 8u
 /* Menu text lives in the loaded image; its RAM copy is writable at this
  * fixed alias (the same bias as the private runtime 0x40bf0000->0xa101f0000). */
@@ -84,21 +99,76 @@ typedef struct {
     Z8JpegJob jobs[Z8_JPEG_JOBS];
 } Z8JpegWorker;
 
-/* A card library loaded for this power-on session. The built-in image
- * library is never modified; the heap is rebuilt at every boot. */
+/* The card library published in RAM (restored automatically at boot or
+ * loaded from the menu). The built-in image library is never modified. */
 typedef struct {
-    uint64_t active;                    /* session bundle; 0 = built-in */
-    uint64_t staged;                    /* validated, owned by whoever exchanges it out */
+    uint64_t active;                    /* card bundle; 0 = built-in; published by the card worker */
     uint32_t readers,publishing;        /* counted guard of the global library */
-    uint32_t request,result,wanted;     /* GUI request / worker result serials */
-    uint32_t status,detail,loaded;      /* last result shown in the menu */
+    uint32_t request,result;            /* explicit Load request / worker result serials */
+    uint32_t status,detail,loaded;      /* last explicit Load result */
+    uint32_t retry_now;                 /* menu visit: retry a missing look at once */
+    uint32_t unload;                    /* whole reset: back to the built-in library */
     uint64_t worker;                    /* task block and wake event */
     uint32_t worker_id,worker_state,event_ready,show_result;
-    uint64_t attempts,publications,refusals;
+    uint32_t attempts,publications,refusals;
 } Z8CardLibrary;
 
 enum { Z8_XMP_NOT_READY,Z8_XMP_NOT_JPEG,Z8_XMP_HEADER,Z8_XMP_BRANCH,Z8_XMP_LEASE,Z8_XMP_OFF,
        Z8_XMP_PACKET,Z8_XMP_NOT_APPLIED,Z8_XMP_GATES };
+
+/* Desired look of one photo bank: Off, a full transform identity, or
+ * unresolved (identity not known: never fabricated, never shown as Off). */
+enum { Z8_DESIRED_OFF,Z8_DESIRED_LOOK,Z8_DESIRED_UNRESOLVED };
+#define Z8_PENDING_LIBRARY 0x10u
+typedef struct {
+    uint8_t kind,reserved[3];
+    uint8_t id[32];
+} Z8BankSlot;
+#define Z8_RECORD_MAGIC 0x4b42385au     /* "Z8BK" */
+/* Which library the configuration uses: the built-in one, or the card's
+ * Z8LUTLIB.BIN (restored at every start, also while every bank is Off). */
+enum { Z8_LIBRARY_BUILTIN,Z8_LIBRARY_CARD };
+typedef struct {
+    uint32_t magic;
+    uint16_t version,bytes;
+    uint32_t library,reserved;
+    Z8BankSlot banks[Z8_BANKS];
+    uint8_t sha256[32];                 /* over the bytes above */
+} Z8BankRecord;
+
+/* Where the record came from this boot (observability and tests). UNREAD:
+ * the stored region could not be read, so nothing is known and nothing is
+ * stored until an actual read succeeds. */
+enum { Z8_SOURCE_NONE,Z8_SOURCE_STORED,Z8_SOURCE_FRESH,Z8_SOURCE_MIGRATED,Z8_SOURCE_LOST,
+       Z8_SOURCE_DEFAULTS,Z8_SOURCE_RETAINED,Z8_SOURCE_UNREAD };
+/* Outcome of reading the stored blob-16 region (mode-4 settings callback, or
+ * a later read before a store). LOST: the region itself is unreadable (the
+ * native caller then uses blob defaults); UNREAD: our copy of the tail could
+ * not be made (no memory), the region was not judged. */
+enum { Z8_BLOB_PENDING,Z8_BLOB_VALID,Z8_BLOB_ABSENT,Z8_BLOB_CORRUPT,Z8_BLOB_LOST,Z8_BLOB_UNREAD,
+       Z8_BLOB_SKIPPED };
+/* Card library restore, as shown for a bank whose look is not published. */
+enum { Z8_RESTORE_WAITING,Z8_RESTORE_READING,Z8_RESTORE_DONE };
+/* What the camera does for the selected bank (last evaluated). */
+enum { Z8_EFFECTIVE_OFF,Z8_EFFECTIVE_APPLIED,Z8_EFFECTIVE_RESTORING,Z8_EFFECTIVE_UNAVAILABLE,
+       Z8_EFFECTIVE_UNRESOLVED };
+
+typedef struct {
+    Z8BankRecord record;                /* desired looks once ready */
+    Z8BankSlot pending[Z8_BANKS];       /* changes made before a stored record could be read */
+    uint32_t sequence,writer;           /* sequence odd while written; one writer at a time */
+    uint32_t ready,authoritative;       /* ready: usable; authoritative: from an actual read, may be stored */
+    uint32_t source,blob,pending_mask;  /* pending_mask: bit per bank, Z8_PENDING_LIBRARY */
+    uint32_t pending_library;
+    uint32_t settings_restored,defaults,retained;
+    uint32_t library_generation,restore,reason,detail,retries;
+    uint32_t commits,late_reads,blob_writes,blob_reads,refused_writes,alloc_retries;
+    uint32_t effective;                 /* Z8_EFFECTIVE_* of the selected bank, last evaluated */
+    uint32_t refused_forecasts,refused_allocations;   /* captures withheld: look not applied */
+    uint32_t pending_sources;           /* nibble per destination: original unread bank + 1, or zero */
+    uint32_t cancelled_request;         /* whole reset cancels explicit imports through this serial */
+    uint32_t text_key[2];               /* menu text last written: packed status, library generation */
+} Z8Persist;
 
 typedef struct {
     uint64_t magic;
@@ -123,6 +193,7 @@ typedef struct {
     uint32_t xmp_last_kind,xmp_last_file,xmp_last_class,xmp_last_lease;  /* lease: jpeg_lease result, ~0 unread */
     uint64_t xmp_last_graph;
     uint32_t xmp_last_choice,xmp_last_applied;
+    Z8Persist persist;
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)
@@ -151,10 +222,18 @@ int z8_photo_lut_menu_entry(void *page);
 int z8_photo_lut_menu_ok(void *request);
 uint32_t z8_photo_lut_text_font(uint32_t language,uint32_t id,const volatile uint16_t *text,uint32_t bytes);
 int z8_photo_lut_photo_refresh(void *page);
+int z8_photo_lut_bank_copy(uint32_t,uint32_t,const uint32_t *,uint32_t);
+uint32_t z8_photo_lut_settings_wait(void *,uint32_t,uint32_t *);
+uint32_t z8_photo_lut_settings_restored(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+void z8_photo_lut_defaults(void);
+uint32_t z8_photo_lut_blob_read(uint32_t section,uint64_t buffer,uint32_t bytes);
+uint32_t z8_photo_lut_blob_write(uint32_t section,uint64_t buffer,uint32_t bytes);
+uint32_t z8_photo_lut_blob_loaded(uint32_t group);
 _Static_assert(offsetof(Z8LutState,preview)==120,"telemetry prefix ABI");
 _Static_assert(sizeof(Z8PreviewSlot)==256,"preview slot ABI");
 _Static_assert(sizeof(Z8JpegJob)==112,"JPEG job ABI");
 _Static_assert(offsetof(Z8JpegWorker,jobs)==72,"JPEG worker ABI");
-_Static_assert(sizeof(Z8CardLibrary)==96,"card library ABI");
+_Static_assert(sizeof(Z8CardLibrary)==88,"card library ABI");
+_Static_assert(sizeof(Z8BankRecord)==0xc0,"bank record ABI");
 _Static_assert(sizeof(Z8LutState)<=4096,"private runtime region");
 #endif
