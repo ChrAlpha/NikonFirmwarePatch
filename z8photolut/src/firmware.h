@@ -97,6 +97,9 @@ typedef struct {
     uint64_t attempts,publications,refusals;
 } Z8CardLibrary;
 
+enum { Z8_XMP_NOT_READY,Z8_XMP_NOT_JPEG,Z8_XMP_HEADER,Z8_XMP_BRANCH,Z8_XMP_LEASE,Z8_XMP_OFF,
+       Z8_XMP_PACKET,Z8_XMP_NOT_APPLIED,Z8_XMP_GATES };
+
 typedef struct {
     uint64_t magic;
     uint32_t version, bytes, choice, strength, ready, error;
@@ -112,7 +115,11 @@ typedef struct {
     Z8JpegWorker jpeg;
     Z8CardLibrary card;
     uint64_t xmp_appended,xmp_refused;   /* provenance written / refused by the helper */
-    uint32_t xmp_error,xmp_reserved;
+    uint32_t xmp_error,xmp_calls;
+    /* Observability only (never consulted): why a JPEG packet was left
+     * native, per Z8_XMP_* gate, and the last addresses the hook received. */
+    uint32_t xmp_skipped[Z8_XMP_GATES];
+    uint64_t xmp_last_header,xmp_last_packet;
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)

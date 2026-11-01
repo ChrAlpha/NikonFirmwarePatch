@@ -12,7 +12,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from photo_lut_fixtures import LEASE_BYTES, runtime_bundle
-from test_photo_lut_native_graph import (CAPTURE, CompiledGraphMachine, JPEG_GRAPH, NEF_GRAPH, OWNER,
+from test_photo_lut_native_graph import (CAPTURE, CompiledGraphMachine, JPEG_GRAPH, NEF_GRAPH, OWNER, STATE,
                                          PinnedRomTestCase, Uc, compile_code)
 from z8photolut.library import look_id
 
@@ -23,7 +23,9 @@ except ImportError:
     pass
 
 COMPOSER = 0x406e3698
-PACKET = 0xa12000000
+PACKET = 0xa12000000                  # General heap
+TRANSLATE = 0x41186718                 # raw address -> CPU (cached) alias, via the boot region table
+GATES = ('not ready', 'not JPEG', 'header', 'branch', 'lease', 'off', 'packet', 'not applied')
 SIZE = 33759
 NS = 'https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/'
 RESULT = 0x5a5a
@@ -94,7 +96,24 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         self.assertEqual(m.reg_read(regs.UC_ARM64_REG_PC), 0x60000000)
         return m.reg_read(regs.UC_ARM64_REG_X0)
 
-    def compose(self, machine, file_id=0, graph=JPEG_GRAPH, *, applied=None, kind=None, header=None):
+    def translate(self, machine, raw):
+        """Run the original 0x41186718 the header builder uses for its packet buffer."""
+        m = machine.m
+        m.reg_write(regs.UC_ARM64_REG_X0, raw)
+        m.reg_write(regs.UC_ARM64_REG_X30, 0x60000000)
+        m.emu_start(TRANSLATE, 0x60000000, count=1000)
+        return m.reg_read(regs.UC_ARM64_REG_X0)
+
+    def telemetry(self, machine):
+        layout = self.metadata['runtime_layout']
+        calls = struct.unpack('<I', machine.m.mem_read(STATE+layout['xmp_offset']+20, 4))[0]
+        skipped = struct.unpack('<8I', machine.m.mem_read(STATE+layout['xmp_skipped_offset'], 32))
+        header, packet = struct.unpack('<2Q', machine.m.mem_read(STATE+layout['xmp_skipped_offset']+32, 16))
+        appended, refused = struct.unpack('<2Q', machine.m.mem_read(STATE+layout['xmp_offset'], 16))
+        return dict(calls=calls, skipped={g: n for g, n in zip(GATES, skipped) if n}, header=header, packet=packet,
+                    appended=appended, refused=refused)
+
+    def compose(self, machine, file_id=0, graph=JPEG_GRAPH, *, applied=None, kind=None, header=None, packet=PACKET):
         native_kind = machine.graph(file_id, graph)
         if applied is not None:
             machine.write32(machine.footer+244, applied)
@@ -102,10 +121,12 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         # (the file id): run that original prefix. NEF never reaches this arm.
         if kind is None:
             kind = self.composer_kind(machine, file_id) if file_id in (0, 4) else native_kind
-        result = self.hook(machine, kind, file_id, 0xa03000000, SIZE, PACKET, graph+0x48 if header is None else header)
+        if packet != PACKET:
+            machine.m.mem_map(packet & ~0xfff, 0x10000)
+        result = self.hook(machine, kind, file_id, 0xa03000000, SIZE, packet, graph+0x48 if header is None else header)
         self.assertEqual(result, RESULT)
         self.assertEqual(len(machine.composed), 1)
-        return bytes(machine.m.mem_read(PACKET, SIZE))
+        return bytes(machine.m.mem_read(packet, SIZE))
 
     def provenance(self, packet):
         self.assertEqual(len(packet), SIZE)
@@ -138,32 +159,65 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         machine = self.machine()
         self.assertEqual([self.composer_kind(machine, f) for f in (0, 4)], [0, 4])
 
+    def test_image_ram_packets_from_the_native_translator_are_annotated(self):
+        # The header buffer is image RAM translated by 0x41186718 (0x406c32bc..c8):
+        # its whole cached alias window 0xc00000000..0xe00000000 is accepted.
+        for raw in (0x800020000, 0x87ff00000, 0x9fff00000):
+            with self.subTest(raw=hex(raw)):
+                machine = self.machine()
+                packet = self.translate(machine, raw)
+                self.assertEqual(packet, raw+0x400000000)
+                fields = self.provenance(self.compose(machine, 4, applied=1, packet=packet))
+                self.assertEqual(fields['LookName'], NAME)
+                self.assertEqual(self.telemetry(machine), dict(calls=1, skipped={}, header=JPEG_GRAPH+0x48,
+                                                                 packet=packet, appended=1, refused=0))
+
     def test_failed_off_and_unsupported_outputs_are_not_claimed(self):
         cases = {
-            'main encode not applied': dict(machine=dict(), compose=dict(applied=0)),
-            'only a secondary stage applied': dict(machine=dict(), compose=dict(applied=0b110)),
-            'look Off': dict(machine=dict(choice=0), compose=dict(applied=1)),
-            'NEF': dict(machine=dict(), compose=dict(file_id=2, graph=NEF_GRAPH, applied=1)),
-            'non-JPEG kind': dict(machine=dict(), compose=dict(applied=1, kind=1)),
-            'kind unlike its file id': dict(machine=dict(), compose=dict(file_id=4, applied=1, kind=0)),
-            'header outside its graph': dict(machine=dict(), compose=dict(applied=1, header=JPEG_GRAPH+0x50)),
+            'main encode not applied': (dict(), dict(applied=0), 'not applied'),
+            'only a secondary stage applied': (dict(), dict(applied=0b110), 'not applied'),
+            'look Off': (dict(choice=0), dict(applied=1), 'off'),
+            'NEF': (dict(), dict(file_id=2, graph=NEF_GRAPH, applied=1), 'not JPEG'),
+            'non-JPEG kind': (dict(), dict(applied=1, kind=1), 'not JPEG'),
+            'kind unlike its file id': (dict(), dict(file_id=4, applied=1, kind=0), 'not JPEG'),
+            'header outside its graph': (dict(), dict(applied=1, header=JPEG_GRAPH+0x50), 'header'),
+            'packet past the image alias window': (dict(), dict(applied=1, packet=0xe00000000), 'packet'),
+            'packet in raw image RAM': (dict(), dict(applied=1, packet=0x900000000), 'packet'),
         }
-        for label, case in cases.items():
+        for label, (machine_options, compose_options, gate) in cases.items():
             with self.subTest(label=label):
-                self.assertEqual(self.compose(self.machine(**case['machine']), **case['compose']), native_packet())
+                machine = self.machine(**machine_options)
+                self.assertEqual(self.compose(machine, **compose_options), native_packet())
+                observed = self.telemetry(machine)
+                self.assertEqual((observed['calls'], observed['skipped'], observed['appended'], observed['refused']),
+                                 (1, {gate: 1}, 0, 0))
+
+    def test_unready_state_is_counted_and_uninitialized_state_is_untouched(self):
+        machine = self.machine()
+        machine.write32(STATE+24, 0)                                    # ready = 0 (invalid built-in library)
+        self.assertEqual(self.compose(machine, applied=1), native_packet())
+        self.assertEqual(self.telemetry(machine)['skipped'], {'not ready': 1})
+        machine = self.machine()
+        machine.m.mem_write(STATE, bytes(8))                            # no state magic
+        self.assertEqual(self.compose(machine, applied=1), native_packet())
+        observed = self.telemetry(machine)
+        self.assertEqual((observed['calls'], observed['skipped'], observed['packet']), (0, {}, 0))
 
     def test_alternate_kind0_branch_and_foreign_owner_are_not_claimed(self):
         machine = self.machine()
         machine.graph(0, JPEG_GRAPH)
         machine.write32(machine.footer+244, 1)
-        for label, mutate in [('alternate branch', lambda: machine.m.mem_write(JPEG_GRAPH+0x4c, b'\x01')),
-                              ('owner+0x80 descriptor', lambda: machine.write64(JPEG_GRAPH, OWNER+0x80))]:
+        expected = {}
+        for label, gate, mutate in [('alternate branch', 'branch', lambda: machine.m.mem_write(JPEG_GRAPH+0x4c, b'\x01')),
+                                    ('owner+0x80 descriptor', 'lease', lambda: machine.write64(JPEG_GRAPH, OWNER+0x80))]:
             with self.subTest(label=label):
                 saved = bytes(machine.m.mem_read(JPEG_GRAPH, 0x60))
                 mutate()
                 machine.composed.clear()
                 self.hook(machine, 0, 0, 0xa03000000, SIZE, PACKET, JPEG_GRAPH+0x48)
                 self.assertEqual(bytes(machine.m.mem_read(PACKET, SIZE)), native_packet())
+                expected[gate] = 1
+                self.assertEqual(self.telemetry(machine)['skipped'], expected)
                 machine.m.mem_write(JPEG_GRAPH, saved)
 
     def test_no_op_look_is_recorded_as_not_applied(self):

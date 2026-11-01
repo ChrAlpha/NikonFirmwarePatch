@@ -9,7 +9,8 @@ __attribute__((used)) const uint32_t z8_photo_lut_runtime_layout[]={
     offsetof(Z8PreviewSlot,apply_sequence),offsetof(Z8PreviewSlot,flags),
     offsetof(Z8Preview,applies),offsetof(Z8Preview,display_epoch),Z8_PREVIEW_SLOTS,
     offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy),offsetof(Z8LutState,jpeg_previews_applied),
-    offsetof(Z8LutState,jpeg),offsetof(Z8LutState,card),offsetof(Z8LutState,xmp_appended)
+    offsetof(Z8LutState,jpeg),offsetof(Z8LutState,card),offsetof(Z8LutState,xmp_appended),
+    offsetof(Z8LutState,xmp_skipped)
 };
 
 /* Clang may lower fixed aggregate copies to memcpy in freestanding code. */
@@ -1177,25 +1178,47 @@ unsigned z8_photo_lut_file_graph(uint32_t file,uint64_t capture,uint64_t owner,u
 #define XMP_COMPOSE ((uint32_t (*)(uint32_t,uint32_t,uint64_t,uint32_t,uint64_t))(uintptr_t)0x406e3698)
 static uint8_t read8(uint64_t p) { return *(volatile const uint8_t *)(uintptr_t)p; }
 
+/* The header builder writes the packet through 0x41186718's translation of
+ * its header resource (0x406c32bc..c8; 0x406c40a0..b0 for the second call):
+ * raw image RAM 0x800000000..0xa00000000 becomes its cached alias, raw +
+ * 0x400000000, the same window jpeg_lease admits. A General-heap buffer is
+ * returned unchanged. */
+static int packet_span(uint64_t p,uint64_t n)
+{ return main_span(p,n) || range(p,n,UINT64_C(0xc00000000),UINT64_C(0xe00000000)); }
+
+static uint32_t xmp_skip(unsigned gate,uint32_t result)
+{
+    __atomic_fetch_add(&Z8_STATE->xmp_skipped[gate],1,__ATOMIC_RELAXED);
+    return result;
+}
+
 uint32_t z8_photo_lut_xmp(uint32_t kind,uint32_t file,uint64_t settings,uint32_t size,uint64_t packet,uint64_t header)
 {
     uint32_t result=XMP_COMPOSE(kind,file,settings,size,packet);
     volatile Z8LutState *s=Z8_STATE;
+    /* Without initialized state nothing, not even telemetry, is written. */
+    if(s->magic!=Z8_STATE_MAGIC) return result;
+    __atomic_fetch_add(&s->xmp_calls,1,__ATOMIC_RELAXED);
+    s->xmp_last_header=header;s->xmp_last_packet=packet;
+    if(!s->ready) return xmp_skip(Z8_XMP_NOT_READY,result);
     /* JPEG files have ids 0 and 4; dispatch 0x440c6de8 sends both to this
      * header arm, which passes composer kind (id==0 ? 0 : 4) (0x406c328c..a4),
      * so the kind always equals the file id here. NEF and others stay native. */
-    if(s->magic!=Z8_STATE_MAGIC || !s->ready || (file!=0 && file!=4) || kind!=file) return result;
-    if(!cpu_span(header,0x18) || (header&7)) return result;
+    if((file!=0 && file!=4) || kind!=file) return xmp_skip(Z8_XMP_NOT_JPEG,result);
+    if(!cpu_span(header,0x18) || (header&7)) return xmp_skip(Z8_XMP_HEADER,result);
     uint64_t graph=read64(header+0x10);
-    /* The header context is graph+0x48; the alternate kind0 arm (graph+0x4c
-     * = 1, graph+0x00 = owner+0x80) is not an output the LUT hooks touch. */
-    if(graph!=header-0x48 || !cpu_span(graph,0x50) || read8(graph+0x4c)!=0 || read32(graph+0x48)!=file) return result;
+    if(graph!=header-0x48 || !cpu_span(graph,0x50)) return xmp_skip(Z8_XMP_HEADER,result);
+    /* The alternate kind0 arm (graph+0x4c = 1, graph+0x00 = owner+0x80) is
+     * not an output the LUT hooks touch. */
+    if(read8(graph+0x4c)!=0 || read32(graph+0x48)!=file) return xmp_skip(Z8_XMP_BRANCH,result);
     JpegLease lease;volatile JpegLease *storage=0;
-    if(jpeg_lease(read64(graph)-0x38,&lease,&storage) || !lease.choice || !cpu_span(packet,size)) return result;
+    if(jpeg_lease(read64(graph)-0x38,&lease,&storage)) return xmp_skip(Z8_XMP_LEASE,result);
+    if(!lease.choice) return xmp_skip(Z8_XMP_OFF,result);
+    if(!packet_span(packet,size)) return xmp_skip(Z8_XMP_PACKET,result);
     uint32_t applied=__atomic_load_n(&storage->applied,__ATOMIC_ACQUIRE);
     /* A real look is claimed only for a successful transformed main encode;
      * a no-op look is recorded as such. Anything else writes nothing. */
-    if(!lease.identity && !(applied&1)) return result;
+    if(!lease.identity && !(applied&1)) return xmp_skip(Z8_XMP_NOT_APPLIED,result);
     Z8LutProvenance record;
     for(unsigned i=0;i<sizeof(record);i++) ((uint8_t *)&record)[i]=0;
     copy_bytes(record.name,lease.name,sizeof(record.name));
