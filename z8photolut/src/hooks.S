@@ -74,6 +74,23 @@ z8_photo_lut_\name\()_entry:
 .endm
 jpeg_preview_entry medium
 jpeg_preview_entry small
+/* Both native JPEG APP1 XMP composer calls (0x406c35c4, 0x406c40ec) keep
+ * the per-file header context in x19; pass it as the sixth argument. */
+.global z8_photo_lut_xmp_entry
+.type z8_photo_lut_xmp_entry,%function
+z8_photo_lut_xmp_entry:
+    mov x5, x19
+    b z8_photo_lut_xmp
+.size z8_photo_lut_xmp_entry, .-z8_photo_lut_xmp_entry
+/* Replaces `bl 0x4032e19c` at 0x4032b748 in the kind-2 glyph builder; the
+ * label text (x8) and its byte length (w9) are live there. */
+.global z8_photo_lut_text_font_entry
+.type z8_photo_lut_text_font_entry,%function
+z8_photo_lut_text_font_entry:
+    mov x2, x8
+    mov w3, w9
+    b z8_photo_lut_text_font
+.size z8_photo_lut_text_font_entry, .-z8_photo_lut_text_font_entry
 .global z8_photo_lut_boot_entry
 .type z8_photo_lut_boot_entry,%function
 z8_photo_lut_boot_entry:

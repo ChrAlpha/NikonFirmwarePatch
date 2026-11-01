@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "firmware.h"
+#include "fonts.h"
 
 __attribute__((used)) const uint32_t z8_photo_lut_runtime_layout[]={
     sizeof(Z8LutState),offsetof(Z8LutState,preview),offsetof(Z8Preview,slots),
@@ -8,7 +9,7 @@ __attribute__((used)) const uint32_t z8_photo_lut_runtime_layout[]={
     offsetof(Z8PreviewSlot,apply_sequence),offsetof(Z8PreviewSlot,flags),
     offsetof(Z8Preview,applies),offsetof(Z8Preview,display_epoch),Z8_PREVIEW_SLOTS,
     offsetof(Z8Preview,power_paused),offsetof(Z8LutState,jpeg_busy),offsetof(Z8LutState,jpeg_previews_applied),
-    offsetof(Z8LutState,jpeg)
+    offsetof(Z8LutState,jpeg),offsetof(Z8LutState,card),offsetof(Z8LutState,xmp_appended)
 };
 
 /* Clang may lower fixed aggregate copies to memcpy in freestanding code. */
@@ -39,11 +40,42 @@ static uint8_t *cpu_address(uint64_t raw)
     if(cached!=raw && cached!=raw+UINT64_C(0x400000000)) return 0;
     return (uint8_t *)(uintptr_t)cached;
 }
+/* The active library is the built-in image bundle or this session's card
+ * bundle. Publication (GUI task) first quiesces preview work, then raises
+ * `publishing` and waits until every counted reader has left. A reader that
+ * observes publication in progress treats the look as unavailable. */
+static const Z8LookBundle *library_active(void)
+{
+    uint64_t active=__atomic_load_n(&Z8_STATE->card.active,__ATOMIC_ACQUIRE);
+    return active?(const Z8LookBundle *)(uintptr_t)active:Z8_BUILTIN;
+}
+static const Z8LookBundle *library_enter(void)
+{
+    volatile Z8CardLibrary *c=&Z8_STATE->card;
+    __atomic_fetch_add(&c->readers,1,__ATOMIC_SEQ_CST);
+    if(!__atomic_load_n(&c->publishing,__ATOMIC_SEQ_CST)) return library_active();
+    __atomic_fetch_sub(&c->readers,1,__ATOMIC_RELEASE);
+    return 0;
+}
+static void library_exit(void) { __atomic_fetch_sub(&Z8_STATE->card.readers,1,__ATOMIC_RELEASE); }
+
+/* A bank stores its look index and the tag of the library that index
+ * belongs to. Any other library makes the selection Off, never a
+ * different look at the same position. */
+static uint32_t selection(const Z8LookBundle *b)
+{
+    /* One 16-bit load: index and tag always come from the same store. */
+    uint32_t pair=__atomic_load_n((volatile uint16_t *)Z8_SAVED_CHOICE,__ATOMIC_ACQUIRE);
+    uint32_t value=pair&255,tag=pair>>8;
+    if(!Z8_STATE->ready || !b || tag!=b->tag || value>b->count) value=0;
+    Z8_STATE->choice=value;
+    return value;
+}
 static uint32_t choice(void)
 {
-    uint32_t value=__atomic_load_n(Z8_SAVED_CHOICE,__ATOMIC_ACQUIRE);
-    if(!Z8_STATE->ready || value>Z8_BUNDLE->count) value=0;
-    Z8_STATE->choice=value;
+    const Z8LookBundle *b=library_enter();
+    uint32_t value=selection(b);
+    if(b) library_exit();
     return value;
 }
 
@@ -241,7 +273,7 @@ static void preview_worker(void *argument)
             output.uv_bytes=(uint64_t)output.uv_stride*(output.height/output.uv_divisor);
             Z8Look look;
             p->started=ticks();
-            error=z8_lut_select(Z8_BUNDLE,selected,256,&look);
+            error=z8_lut_select(library_active(),selected,256,&look);
             if(!error && !look.identity) {
                 acquire_cache(p);
                 if(p->cache && p->cache_choice!=selected) {
@@ -599,22 +631,27 @@ void z8_photo_lut_power_cancel(void)
     }
 }
 
+static void menu_text(const Z8LookBundle *,uint32_t status,uint32_t count,uint32_t slots);
+
 void z8_photo_lut_boot(void)
 {
     volatile Z8LutState *s=Z8_STATE;
     uint64_t boots=0;
-    if(s->magic==Z8_STATE_MAGIC && s->version==2 && s->bytes==sizeof(*s)) {
+    if(s->magic==Z8_STATE_MAGIC && s->version==3 && s->bytes==sizeof(*s)) {
         boots=s->boots;
     }
     volatile uint8_t *p=(volatile uint8_t *)s;
     for(unsigned i=0;i<sizeof(*s);i++) p[i]=0;
-    s->version=2;s->bytes=sizeof(*s);s->boots=boots+1;s->strength=256;
-    s->error=z8_lut_validate(Z8_BUNDLE,Z8_LUT_BUNDLE_LIMIT);
+    s->version=3;s->bytes=sizeof(*s);s->boots=boots+1;s->strength=256;
+    s->error=z8_lut_validate_image(Z8_BUILTIN,Z8_LUT_BUNDLE_LIMIT);
     /* Native DS initializes later. The authoritative selection is read from
      * the current photo bank at each menu/capture boundary, never from a
      * previous task's private RAM. */
     s->choice=0;
     s->ready=s->error==Z8_LUT_OK;
+    /* The heap is rebuilt at every boot, so any card library is gone: menu
+     * text always restarts from the built-in library. */
+    if(s->ready) menu_text(Z8_BUILTIN,0,0,0);   /* status 0: "Load LUTs from card" */
     s->magic=Z8_STATE_MAGIC;
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
@@ -789,24 +826,39 @@ static unsigned jpeg_transform(const Z8Surface *f,uint8_t *source_y,uint8_t *sou
 #define JPEG_TINY_BYTES (192u*120u*2u)
 #define JPEG_THUMB_BYTES 0x3600u
 #define JPEG_STORAGE_BYTES (JPEG_SURFACE_BYTES+JPEG_MEDIUM_BYTES+JPEG_SMALL_BYTES+JPEG_TINY_BYTES+JPEG_THUMB_BYTES)
+/* The lease latches the look at reservation: a private copy of its samples
+ * (after the JPEG scratch, inside this capture's own output owner) plus its
+ * identity and name. Every later JPEG step and its provenance use only this
+ * snapshot, so a library change can never retarget an admitted capture. */
 typedef struct {
     uint64_t magic,owner,base,capacity,scratch;
     uint32_t scratch_bytes,choice;
-    uint64_t compressed_bytes,reserved;
+    uint64_t compressed_bytes,samples;      /* raw address of the sample copy, or 0 */
+    uint32_t grid,identity,tag,sample_bytes;
+    uint8_t id[32];
+    char name[64];
+    uint8_t immutable_reserved[16];
     /* Keep mutable CPU ownership on a separate cache line. */
     uint64_t thumbnail[4];
-    uint32_t locks[4],thumbnail_ready,mutable_reserved[3];
+    uint32_t locks[4],thumbnail_ready,applied,mutable_reserved[2];
 } JpegLease;
-_Static_assert(sizeof(JpegLease)==128,"JPEG lease occupies two cache lines");
+#define JPEG_LEASE_IMMUTABLE 192u
+_Static_assert(sizeof(JpegLease)==256 && offsetof(JpegLease,thumbnail)==JPEG_LEASE_IMMUTABLE,
+               "JPEG lease: three immutable lines, then one CPU line");
 
-static uint32_t jpeg_required_bytes(uint32_t bytes,uint64_t format,uint32_t selected,uint32_t *scratch)
+static uint32_t look_bytes(const Z8LookBundle *b,uint32_t selected)
+{
+    return selected?(b->looks[selected-1].bytes+63u)&~63u:0;
+}
+
+static uint32_t jpeg_required_bytes(uint32_t bytes,uint64_t format,const Z8LookBundle *b,uint32_t selected,uint32_t *scratch)
 {
     /* The capture-settings block may live in pool0x22's cached image RAM
      * (observed C3.11 address c40000008), not only the main metadata arena. */
     if((format&3) || !cpu_span(format,0x94)) return 0;
     Z8Look look;
-    if(z8_lut_select(Z8_BUNDLE,selected,256,&look)) return 0;
-    *scratch=(!look.identity && look.strength && (JPEG_ENABLED(format)&1))?JPEG_STORAGE_BYTES:0;
+    if(z8_lut_select(b,selected,256,&look)) return 0;
+    *scratch=(!look.identity && look.strength && (JPEG_ENABLED(format)&1))?JPEG_STORAGE_BYTES+look_bytes(b,selected):0;
     uint64_t offset=((uint64_t)bytes+511)&~UINT64_C(511);
     uint64_t required=offset+*scratch+sizeof(JpegLease);
     return bytes && required<=UINT32_MAX?(uint32_t)required:0;
@@ -815,7 +867,10 @@ static uint32_t jpeg_required_bytes(uint32_t bytes,uint64_t format,uint32_t sele
 uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t special)
 {
     uint32_t bytes=((uint32_t (*)(uint64_t,uint64_t,uint32_t))(uintptr_t)0x4104886c)(settings,format,special);
-    uint32_t scratch=0,required=jpeg_required_bytes(bytes,format,choice(),&scratch);
+    const Z8LookBundle *b=library_enter();
+    if(!b) return bytes;
+    uint32_t scratch=0,required=jpeg_required_bytes(bytes,format,b,selection(b),&scratch);
+    library_exit();
     /* Only the prospective pool0x38 photo count uses this wrapper. Keep
      * the native compressed layout and its zero-size unit queries intact. */
     return required?required:bytes;
@@ -823,16 +878,20 @@ uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t s
 
 uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,uint64_t configuration)
 {
-    uint32_t selected=choice(),scratch=0;
     if(configuration>UINT64_MAX-0x26c || pool!=0x38) return 0;
-    uint32_t required=jpeg_required_bytes(bytes,configuration+0x26c,selected,&scratch);
-    if(!required) return 0;
+    /* During a library publication the native allocation retry runs again. */
+    const Z8LookBundle *b=library_enter();
+    if(!b) return 0;
+    uint32_t selected=selection(b),scratch=0;
+    uint64_t owner=0;
+    uint32_t required=jpeg_required_bytes(bytes,configuration+0x26c,b,selected,&scratch);
+    if(!required) goto done;
     /* A transform reservation is admitted only with its worker running. */
-    if(scratch && !jpeg_worker_start()) return 0;
+    if(scratch && !jpeg_worker_start()) goto done;
     uint64_t offset=((uint64_t)bytes+511)&~UINT64_C(511);
-    uint64_t owner=POOL_ALLOC(frame,pool,required);
-    if(!owner) return 0;
-    if(!main_span(owner,0x18) || (owner&7)) return 0;
+    owner=POOL_ALLOC(frame,pool,required);
+    if(!owner) goto done;
+    if(!main_span(owner,0x18) || (owner&7)) { owner=0;goto done; }
     uint64_t descriptor=read64(owner+8);
     if(!main_span(descriptor,12) || (descriptor&7)) goto failed;
     uint64_t raw=read64(descriptor),capacity=read32(descriptor+8);
@@ -845,12 +904,27 @@ uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,u
     JpegLease *lease=(JpegLease *)(cpu+capacity-sizeof(JpegLease));
     invalidate(lease,sizeof(*lease));
     *lease=(JpegLease){.magic=JPEG_LEASE_MAGIC,.owner=owner,.base=raw,.capacity=capacity,
-        .scratch=raw+offset,.scratch_bytes=scratch,.choice=selected,.compressed_bytes=bytes};
+        .scratch=raw+offset,.scratch_bytes=scratch,.choice=selected,.compressed_bytes=bytes,.tag=b->tag};
+    if(selected) {
+        const Z8LookEntry *e=&b->looks[selected-1];
+        lease->grid=e->grid;lease->identity=e->identity;
+        copy_bytes(lease->id,e->id,sizeof(lease->id));copy_bytes(lease->name,e->name,sizeof(lease->name));
+        if(scratch) {
+            uint8_t *copy=cpu+offset+JPEG_STORAGE_BYTES;
+            lease->samples=raw+offset+JPEG_STORAGE_BYTES;lease->sample_bytes=e->bytes;
+            invalidate(copy,look_bytes(b,selected));
+            copy_bytes(copy,(const uint8_t *)b+e->offset,e->bytes);
+            clean(copy,look_bytes(b,selected));
+        }
+    }
     clean(lease,sizeof(*lease));
-    return owner;
+    goto done;
 failed:
     POOL_FREE(owner);
-    return 0;
+    owner=0;
+done:
+    library_exit();
+    return owner;
 }
 
 static unsigned jpeg_lease(uint64_t owner,JpegLease *lease,volatile JpegLease **storage)
@@ -864,17 +938,36 @@ static unsigned jpeg_lease(uint64_t owner,JpegLease *lease,volatile JpegLease **
     uint8_t *cpu=cpu_address(raw);
     if(!cpu || (uintptr_t)cpu!=raw+UINT64_C(0x400000000)) return Z8_LUT_BAD_SPAN;
     const JpegLease *source=(const JpegLease *)(cpu+capacity-sizeof(*lease));
-    /* The second line contains live CPU locks, never DMA data. */
-    invalidate(source,64);
+    /* The last line contains live CPU locks, never DMA data. */
+    invalidate(source,JPEG_LEASE_IMMUTABLE);
     *lease=*source;
+    uint32_t copy=(lease->sample_bytes+63u)&~63u;
     if(lease->magic!=JPEG_LEASE_MAGIC || lease->owner!=owner || lease->base!=raw ||
-       lease->capacity!=capacity || lease->reserved || !lease->compressed_bytes ||
-       lease->compressed_bytes>capacity-sizeof(*lease) ||
+       lease->capacity!=capacity || !lease->compressed_bytes ||
+       lease->compressed_bytes>capacity-sizeof(*lease) || lease->choice>Z8_LUT_MAX_LOOKS ||
        lease->scratch!=raw+((lease->compressed_bytes+511)&~UINT64_C(511)) ||
-       (lease->scratch_bytes && lease->scratch_bytes!=JPEG_STORAGE_BYTES) ||
        !range(lease->scratch,(uint64_t)lease->scratch_bytes+sizeof(*lease),raw,raw+capacity))
         return Z8_LUT_BAD_SPAN;
+    if(lease->scratch_bytes) {
+        /* A transform lease carries a whole private look grid. */
+        if(!lease->choice || lease->identity || lease->scratch_bytes!=JPEG_STORAGE_BYTES+copy ||
+           (lease->grid!=17 && lease->grid!=33 && lease->grid!=65) ||
+           lease->sample_bytes!=lease->grid*lease->grid*lease->grid*6 ||
+           lease->samples!=lease->scratch+JPEG_STORAGE_BYTES) return Z8_LUT_BAD_SPAN;
+    } else if(lease->samples || lease->sample_bytes) return Z8_LUT_BAD_SPAN;
     *storage=(volatile JpegLease *)source;
+    return Z8_LUT_OK;
+}
+
+static unsigned lease_look(const JpegLease *lease,Z8Look *look)
+{
+    *look=(Z8Look){0,17,1,0};
+    if(!lease->scratch_bytes) return Z8_LUT_OK;
+    /* CPU-written through the cached alias and cleaned at reservation; no
+     * hardware writes this private copy, so no line can be stale here. */
+    uint8_t *samples=cpu_address(lease->samples);
+    if(!samples) return Z8_LUT_BAD_SPAN;
+    *look=(Z8Look){(const uint16_t *)samples,lease->grid,0,256};
     return Z8_LUT_OK;
 }
 
@@ -907,7 +1000,7 @@ static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned
     volatile Z8LutState *s=Z8_STATE;
     unsigned error=Z8_LUT_BAD_SPAN;
     *applied=0;
-    if(kind>3 || lease->scratch_bytes!=JPEG_STORAGE_BYTES || !main_span(parameters,0x50) || (parameters&7)) goto rejected;
+    if(kind>3 || lease->scratch_bytes<JPEG_STORAGE_BYTES || !main_span(parameters,0x50) || (parameters&7)) goto rejected;
     uint64_t descriptor=read64(parameters+8);
     if(!main_span(descriptor,0x28) || (descriptor&7)) goto rejected;
     uint32_t format=read32(descriptor);
@@ -946,6 +1039,11 @@ static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned
     *(uint64_t *)(uintptr_t)(parameters+8)=(uintptr_t)private_descriptor;
     unsigned result=JPEG_ENCODE(channel,parameters);
     *(uint64_t *)(uintptr_t)(parameters+8)=descriptor;
+    /* 40e82090 returns 1 unless its encode start (40c9b648) failed; with a
+     * result block at params+0x48 it also stores completion (state+0xbc==0)
+     * in that block's first byte (40e8222c..40e82250). */
+    uint64_t status=read64(parameters+0x48);
+    unsigned encoded=result==1 && (!status || *(volatile const uint8_t *)(uintptr_t)status==1);
     if(kind==0) {
         s->jpeg_finished=ticks();
         __atomic_fetch_add(&s->jpeg_applied,1,__ATOMIC_RELAXED);
@@ -955,7 +1053,7 @@ static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned
         __atomic_fetch_add(&s->jpeg_preview_pixels,(uint64_t)f.width*f.height,__ATOMIC_RELAXED);
     }
     __atomic_fetch_sub(&s->jpeg_busy,1,__ATOMIC_RELEASE);
-    *applied=1;
+    *applied=encoded;
     return result;
 rejected:
     jpeg_error(kind,error);
@@ -973,11 +1071,16 @@ static unsigned jpeg_output(uint32_t channel,uint64_t parameters,uint64_t owner,
         Z8_STATE->jpeg_choice=lease.choice;Z8_STATE->jpeg_error=0;
     }
     Z8Look look;
-    error=z8_lut_select(Z8_BUNDLE,lease.choice,256,&look);
+    error=lease_look(&lease,&look);
     if(error) { jpeg_error(kind,error);return JPEG_ENCODE(channel,parameters); }
     if(look.identity || !look.strength) return JPEG_ENCODE(channel,parameters);
     jpeg_lock(&storage->locks[kind]);
+    /* Which outputs were successfully encoded from the transformed surface:
+     * provenance may describe an applied look only for these. A repeated
+     * encode of the same output first withdraws its earlier success. */
+    __atomic_fetch_and(&storage->applied,~(1u<<kind),__ATOMIC_ACQ_REL);
     unsigned applied,result=jpeg_encode_locked(channel,parameters,kind,&lease,&look,&applied);
+    if(applied) __atomic_fetch_or(&storage->applied,1u<<kind,__ATOMIC_RELEASE);
     __atomic_store_n(&storage->locks[kind],0,__ATOMIC_RELEASE);
     return result;
 }
@@ -1018,11 +1121,12 @@ unsigned z8_photo_lut_thumbnail(uint32_t channel,uint64_t parameters)
     unsigned error=jpeg_lease(read64(parameters+0x10)-0xe0,&lease,&storage);
     if(error) { jpeg_error(3,error);return JPEG_ENCODE(channel,parameters); }
     Z8Look look;
-    error=z8_lut_select(Z8_BUNDLE,lease.choice,256,&look);
+    error=lease_look(&lease,&look);
     if(error) { jpeg_error(3,error);return JPEG_ENCODE(channel,parameters); }
-    if(look.identity || !look.strength || !lease.scratch_bytes) return JPEG_ENCODE(channel,parameters);
+    if(look.identity || !look.strength) return JPEG_ENCODE(channel,parameters);
     jpeg_lock(&storage->locks[3]);
     __atomic_store_n(&storage->thumbnail_ready,0,__ATOMIC_RELEASE);
+    __atomic_fetch_and(&storage->applied,~(1u<<3),__ATOMIC_ACQ_REL);
     uint64_t private_parameters[10],private_result[12]={0};
     copy_bytes(private_parameters,(const void *)(uintptr_t)parameters,sizeof(private_parameters));
     copy_bytes((void *)storage->thumbnail,(const void *)(uintptr_t)read64(parameters+0x10),sizeof(storage->thumbnail));
@@ -1036,8 +1140,10 @@ unsigned z8_photo_lut_thumbnail(uint32_t channel,uint64_t parameters)
     unsigned result=JPEG_ENCODE(channel,parameters),applied=0;
     unsigned private_ok=jpeg_encode_locked(channel,(uintptr_t)private_parameters,3,&lease,&look,&applied);
     uint32_t bytes=(uint32_t)storage->thumbnail[2];
-    if(private_ok && applied && bytes && bytes<=JPEG_THUMB_BYTES)
+    if(private_ok && applied && bytes && bytes<=JPEG_THUMB_BYTES) {
+        __atomic_fetch_or(&storage->applied,1u<<3,__ATOMIC_RELEASE);
         __atomic_store_n(&storage->thumbnail_ready,1,__ATOMIC_RELEASE);
+    }
     else jpeg_error(3,Z8_LUT_BAD_SPAN);
     clean((const void *)storage->thumbnail,64);
     __atomic_store_n(&storage->locks[3],0,__ATOMIC_RELEASE);
@@ -1063,6 +1169,45 @@ unsigned z8_photo_lut_file_graph(uint32_t file,uint64_t capture,uint64_t owner,u
     return kind;
 }
 
+/* JPEG APP1 XMP provenance (metadata-native NATIVE-XMP.md sections 1, 2, 10, 11).
+ * The native composer writes the whole fixed-size packet; afterwards one
+ * description is added in place, consuming padding, so the packet, APP1 and
+ * every Exif offset keep their sizes. Only the per-file header context, its
+ * graph and the capture's own lease are consulted; no global state. */
+#define XMP_COMPOSE ((uint32_t (*)(uint32_t,uint32_t,uint64_t,uint32_t,uint64_t))(uintptr_t)0x406e3698)
+static uint8_t read8(uint64_t p) { return *(volatile const uint8_t *)(uintptr_t)p; }
+
+uint32_t z8_photo_lut_xmp(uint32_t kind,uint32_t file,uint64_t settings,uint32_t size,uint64_t packet,uint64_t header)
+{
+    uint32_t result=XMP_COMPOSE(kind,file,settings,size,packet);
+    volatile Z8LutState *s=Z8_STATE;
+    /* JPEG files have ids 0 and 4; dispatch 0x440c6de8 sends both to this
+     * header arm, which passes composer kind (id==0 ? 0 : 4) (0x406c328c..a4),
+     * so the kind always equals the file id here. NEF and others stay native. */
+    if(s->magic!=Z8_STATE_MAGIC || !s->ready || (file!=0 && file!=4) || kind!=file) return result;
+    if(!cpu_span(header,0x18) || (header&7)) return result;
+    uint64_t graph=read64(header+0x10);
+    /* The header context is graph+0x48; the alternate kind0 arm (graph+0x4c
+     * = 1, graph+0x00 = owner+0x80) is not an output the LUT hooks touch. */
+    if(graph!=header-0x48 || !cpu_span(graph,0x50) || read8(graph+0x4c)!=0 || read32(graph+0x48)!=file) return result;
+    JpegLease lease;volatile JpegLease *storage=0;
+    if(jpeg_lease(read64(graph)-0x38,&lease,&storage) || !lease.choice || !cpu_span(packet,size)) return result;
+    uint32_t applied=__atomic_load_n(&storage->applied,__ATOMIC_ACQUIRE);
+    /* A real look is claimed only for a successful transformed main encode;
+     * a no-op look is recorded as such. Anything else writes nothing. */
+    if(!lease.identity && !(applied&1)) return result;
+    Z8LutProvenance record;
+    for(unsigned i=0;i<sizeof(record);i++) ((uint8_t *)&record)[i]=0;
+    copy_bytes(record.name,lease.name,sizeof(record.name));
+    copy_bytes(record.id,lease.id,sizeof(record.id));
+    record.grid=lease.grid;record.strength=256;record.identity=lease.identity;
+    uint32_t appended=0;
+    unsigned error=z8_meta_append((char *)(uintptr_t)packet,size,&record,&appended);
+    if(error) { s->xmp_error=error;__atomic_fetch_add(&s->xmp_refused,1,__ATOMIC_RELAXED); }
+    else __atomic_fetch_add(&s->xmp_appended,1,__ATOMIC_RELAXED);
+    return result;
+}
+
 #define ENTRY_GUARD ((int (*)(void *))(uintptr_t)0x403ae0f8)
 #define SET_CURSOR ((void (*)(void *,uint32_t))(uintptr_t)0x403b0048)
 #define SET_MARK ((int (*)(void *,uint32_t,uint32_t))(uintptr_t)0x403b00b8)
@@ -1072,29 +1217,398 @@ unsigned z8_photo_lut_file_graph(uint32_t file,uint64_t capture,uint64_t owner,u
 #define BIND ((int (*)(void *,uint32_t,uint32_t))(uintptr_t)0x4031e178)
 #define REQUEST_SAVE ((void (*)(void))(uintptr_t)0x41012bf4)
 
-int z8_photo_lut_menu_entry(void *page)
+/* Selections are two bytes per photo bank (index, library tag), read and
+ * written as one 16-bit unit so no reader pairs an index with another tag.
+ * Copy 0 is the current settings; 1..4 are banks A..D. */
+#define BANK_COPIES 5u
+#define BANK_STRIDE 0x2e0u
+static uint32_t saved_selection(unsigned copy)
+{ return __atomic_load_n((volatile uint16_t *)(Z8_SAVED_CHOICE+copy*BANK_STRIDE),__ATOMIC_ACQUIRE); }
+static void save_selection(unsigned copy,uint32_t index,uint32_t tag)
+{ __atomic_store_n((volatile uint16_t *)(Z8_SAVED_CHOICE+copy*BANK_STRIDE),(uint16_t)(index|tag<<8),__ATOMIC_RELEASE); }
+
+/* ---- menu text ------------------------------------------------------- */
+enum { CARD_IDLE,CARD_LOADED,CARD_NO_FILE,CARD_INVALID,CARD_CONFLICT,CARD_READ,CARD_MEMORY,CARD_BUSY,CARD_STATES };
+/* English, Simplified and Traditional Chinese; \1 = look count, \2 = slot(s). */
+static const char *const card_text[CARD_STATES][3]={
+    {"Load LUTs from card","从存储卡载入 LUT","從記憶卡載入 LUT"},
+    {"Card LUTs: \1 loaded (slot \2)","存储卡 LUT：已载入 \1 个（卡槽 \2）","記憶卡 LUT：已載入 \1 個（卡槽 \2）"},
+    {"No Z8LUTLIB.BIN on either card","两张卡上都没有 Z8LUTLIB.BIN","兩張卡上都沒有 Z8LUTLIB.BIN"},
+    {"Slot \2 Z8LUTLIB.BIN invalid; unchanged","卡槽 \2 的 Z8LUTLIB.BIN 无效，未更改","卡槽 \2 的 Z8LUTLIB.BIN 無效，未變更"},
+    {"Slots 1 and 2 differ; unchanged","两张卡的 Z8LUTLIB.BIN 不同，未更改","兩張卡的 Z8LUTLIB.BIN 不同，未變更"},
+    {"Slot \2 read error; unchanged","卡槽 \2 读取失败，未更改","卡槽 \2 讀取失敗，未變更"},
+    {"Not enough memory; unchanged","内存不足，未更改","記憶體不足，未變更"},
+    {"Card busy; try again","存储卡正在使用，请重试","記憶卡正在使用，請重試"},
+};
+
+/* Append UTF-8 (validated names or the fixed texts above) as UTF-16 at a
+ * unit position of a block, through the writable alias of the image text. */
+static unsigned text_append(uint64_t block,unsigned n,unsigned limit,const char *utf8,uint32_t count,uint32_t slots)
 {
-    uint32_t selected=choice();
-    if(ENTRY_GUARD(page)!=1) SET_CURSOR(page,Z8_OPTION_FIRST+selected);
-    return SET_MARK(page,Z8_OPTION_FIRST+selected,1);
+    volatile uint16_t *out=(volatile uint16_t *)(uintptr_t)(block+Z8_TEXT_ALIAS);
+    for(const uint8_t *p=(const uint8_t *)utf8;*p && n+2<=limit;) {
+        uint32_t c=*p++;
+        if(c==1) { out[n++]=(uint16_t)('0'+count%10);continue; }
+        if(c==2) {
+            if((slots&1) && n<limit) out[n++]='1';
+            if(slots==3 && n<limit) out[n++]='+';
+            if((slots&2) && n<limit) out[n++]='2';
+            continue;
+        }
+        unsigned extra=c>=0xf0?3:c>=0xe0?2:c>=0xc0?1:0;
+        if(extra) c&=0x3fu>>extra;
+        for(;extra && (*p&0xc0)==0x80;extra--) c=c<<6|(*p++&0x3fu);
+        if(c>=0x10000) { c-=0x10000;out[n++]=(uint16_t)(0xd800|c>>10);out[n++]=(uint16_t)(0xdc00|(c&0x3ff)); }
+        else out[n++]=(uint16_t)c;
+    }
+    return n;
 }
 
-void z8_photo_lut_menu_ok(void *context)
+/* Rewrite the card-load row and the eight look rows for every language;
+ * rows past the library keep a "-" placeholder and are hidden on entry.
+ * Called at boot and from the GUI task, never while a menu is drawn. */
+static void menu_text(const Z8LookBundle *b,uint32_t status,uint32_t count,uint32_t slots)
+{
+    static const uint8_t representative[3]={0,8,9};
+    for(unsigned group=0;group<3;group++) {
+        /* Title, help and Off stay; rewrite from the card-load row start. */
+        uint64_t blob=read64(Z8_LANGUAGE_BLOBS+8*representative[group]);
+        const volatile int32_t *table=(const volatile int32_t *)(uintptr_t)read64(Z8_LANGUAGE_DIRECTORY+8*representative[group]);
+        uint64_t start=blob+(int64_t)table[Z8_STRING_FIRST+3];
+        uint64_t end=Z8_TEXT_BLOCKS_VA+(group+1)*Z8_TEXT_BLOCK_BYTES;
+        if(start<end-Z8_TEXT_BLOCK_BYTES || start>=end || (start&1)) continue;
+        unsigned limit=(unsigned)(end-start)/2;
+        uint32_t at[2+Z8_LUT_MAX_LOOKS];
+        unsigned n=text_append(start,0,limit,card_text[status<CARD_STATES?status:CARD_BUSY][group],count,slots);
+        for(unsigned i=0;i<Z8_LUT_MAX_LOOKS;i++) {
+            at[1+i]=n;
+            /* "1. Name": the position tells similar names apart when a long
+             * name is clipped; library, provenance and exports keep the name. */
+            if(i<b->count) {
+                static const char number[]="1. ";
+                char prefix[sizeof(number)];
+                copy_bytes(prefix,number,sizeof(number));prefix[0]=(char)('1'+i);
+                n=text_append(start,n,limit,prefix,0,0);
+            }
+            n=text_append(start,n,limit,i<b->count?b->looks[i].name:"-",0,0);
+        }
+        at[0]=0;at[1+Z8_LUT_MAX_LOOKS]=n;
+        for(unsigned language=0;language<Z8_LANGUAGES;language++) {
+            if((language==8?1u:language==9?2u:0u)!=group) continue;
+            uint64_t table_va=read64(Z8_LANGUAGE_DIRECTORY+8*language),own_blob=read64(Z8_LANGUAGE_BLOBS+8*language);
+            volatile int32_t *entry=(volatile int32_t *)(uintptr_t)(table_va+Z8_TEXT_ALIAS+4ull*(Z8_STRING_FIRST+3));
+            for(unsigned k=0;k<2+Z8_LUT_MAX_LOOKS;k++) entry[k]=(int32_t)(start+2ull*at[k]-own_blob);
+        }
+    }
+}
+
+/* ---- card session library -------------------------------------------- */
+/* Pinned C3.11 file interface, as used by the pixel-shift and pre-capture
+ * card workers: paths are "A:\..." (slot 1, CFexpress) and "B:\..." (slot 2,
+ * SD); open(path,0,0x20); seek(fd,offset,whence,&position). */
+#define FS_OPEN ((int (*)(const char *,uint32_t,uint32_t))(uintptr_t)0x402daa4c)
+#define FS_CLOSE ((int (*)(int))(uintptr_t)0x402daaac)
+#define FS_READ ((int (*)(int,void *,uint32_t,uint32_t *))(uintptr_t)0x402dab4c)
+#define FS_SEEK ((int (*)(int,uint32_t,uint32_t,uint32_t *))(uintptr_t)0x402dac24)
+#define FS_EXISTS ((int (*)(const char *))(uintptr_t)0x402db1ac)
+#define CACHE_FLUSH ((void (*)(const void *,uint32_t))(uintptr_t)0x40d2b9c8)
+#define CARD_WORKER_CPU 3
+#define CARD_WORKER_PRIORITY 47
+#define CARD_WAIT_POLLS 300u
+#define CARD_WAIT_MS 10u
+enum { FILE_MISSING,FILE_VALID,FILE_INVALID,FILE_READ,FILE_MEMORY };
+
+static unsigned card_read(char drive,uint8_t **found)
+{
+    char path[]="A:\\Z8LUTLIB.BIN";
+    path[0]=drive;*found=0;
+    if(FS_EXISTS(path)<0) return FILE_MISSING;
+    int fd=FS_OPEN(path,0,0x20);
+    if(fd<0) return FILE_READ;
+    unsigned result=FILE_READ;
+    uint32_t end=UINT32_MAX,start=UINT32_MAX,count=0;
+    uint8_t *memory=0;
+    FS_SEEK(fd,0,2,&end);FS_SEEK(fd,0,0,&start);
+    if(start!=0 || end>=0x80000000u) goto done;
+    result=FILE_INVALID;
+    if(end<sizeof(Z8LookBundle)) goto done;
+    uint32_t limit=end<Z8_LUT_BUNDLE_LIMIT?end:Z8_LUT_BUNDLE_LIMIT;
+    memory=ALLOC(limit,0);
+    if(!memory || ((uintptr_t)memory&7)) { result=FILE_MEMORY;goto done; }
+    /* No dirty line may be written back over the transfer, and no stale
+     * line may be read after it. */
+    CACHE_FLUSH(memory,limit);
+    int error=FS_READ(fd,memory,64,&count);
+    CACHE_FLUSH(memory,64);
+    if(error || count!=64) { result=FILE_READ;goto done; }
+    const Z8LookBundle *b=(const Z8LookBundle *)memory;
+    uint32_t bytes=b->bytes;
+    /* A declared bundle beyond the file is truncated; beyond 2 MiB, oversized. */
+    if(b->magic!=Z8_LUT_MAGIC || bytes<sizeof(*b) || bytes>limit) goto done;
+    error=FS_READ(fd,memory+64,bytes-64,&count);
+    CACHE_FLUSH(memory+64,bytes-64);
+    if(error || count!=bytes-64) { result=FILE_READ;goto done; }
+    /* A card file comes from the host tool: tag 0, every look re-hashed. */
+    if(z8_lut_validate(b,bytes)!=Z8_LUT_OK || b->tag) goto done;
+    if(bytes<limit) {
+        uint8_t *exact=ALLOC(bytes,0);
+        if(exact && !((uintptr_t)exact&7)) { copy_bytes(exact,memory,bytes);FREE(memory);memory=exact; }
+        else if(exact) FREE(exact);
+    }
+    result=FILE_VALID;*found=memory;memory=0;
+done:
+    if(memory) FREE(memory);
+    FS_CLOSE(fd);
+    return result;
+}
+
+static int same_bytes(const uint8_t *a,const uint8_t *b,uint32_t n)
+{
+    for(uint32_t i=0;i<n;i++) if(a[i]!=b[i]) return 0;
+    return 1;
+}
+
+/* Both cards are read. A present file that is invalid or unreadable blocks
+ * the load even when the other card's file is valid; two valid files must
+ * be identical bundles. Nothing here changes the active library. */
+static uint8_t *card_load(uint32_t *status,uint32_t *slots)
+{
+    uint8_t *found[2];unsigned result[2];
+    for(unsigned slot=0;slot<2;slot++) result[slot]=card_read((char)('A'+slot),&found[slot]);
+    *status=CARD_NO_FILE;*slots=0;
+    for(unsigned slot=2;slot--;) {
+        if(result[slot]==FILE_MEMORY) *status=CARD_MEMORY;
+        else if(result[slot]==FILE_READ) { *status=CARD_READ;*slots=slot+1; }
+        else if(result[slot]==FILE_INVALID) { *status=CARD_INVALID;*slots=slot+1; }
+    }
+    uint8_t *chosen=0;
+    if(*status==CARD_NO_FILE) {
+        const Z8LookBundle *a=(const Z8LookBundle *)found[0],*b=(const Z8LookBundle *)found[1];
+        if(a && b) {
+            if(a->bytes==b->bytes && same_bytes(found[0],found[1],a->bytes)) { chosen=found[0];*slots=3; }
+            else *status=CARD_CONFLICT;
+        } else if(a) { chosen=found[0];*slots=1; }
+        else if(b) { chosen=found[1];*slots=2; }
+        if(chosen) *status=CARD_LOADED;
+    }
+    for(unsigned slot=0;slot<2;slot++) if(found[slot] && found[slot]!=chosen) FREE(found[slot]);
+    return chosen;
+}
+
+static void card_worker(void *argument)
+{
+    PreviewWorker *worker=argument;
+    volatile Z8CardLibrary *c=&Z8_STATE->card;
+    for(;;) {
+        uint32_t serial=__atomic_load_n(&c->request,__ATOMIC_ACQUIRE);
+        if(serial==__atomic_load_n(&c->result,__ATOMIC_ACQUIRE)) { EVENT_WAIT(worker->event,1,0,1000);continue; }
+        uint32_t status=CARD_BUSY,slots=0;
+        /* Power-down has begun: touch no card (its FS may be unmounting). */
+        uint8_t *chosen=__atomic_load_n(&Z8_STATE->preview.power_paused,__ATOMIC_ACQUIRE)?0:card_load(&status,&slots);
+        /* The GUI stopped waiting: never hand it a result it cannot publish. */
+        if(chosen && __atomic_load_n(&c->wanted,__ATOMIC_ACQUIRE)!=serial) { FREE(chosen);chosen=0;status=CARD_BUSY; }
+        c->status=status;c->detail=slots;c->loaded=chosen?((const Z8LookBundle *)chosen)->count:0;
+        uint64_t previous=__atomic_exchange_n(&c->staged,(uintptr_t)chosen,__ATOMIC_ACQ_REL);
+        if(previous) FREE((void *)(uintptr_t)previous);
+        __atomic_store_n(&c->result,serial,__ATOMIC_RELEASE);
+    }
+}
+
+/* Started from the GUI task only; completed steps are kept and reused. */
+static int card_worker_start(void)
+{
+    volatile Z8CardLibrary *c=&Z8_STATE->card;
+    if(c->worker_state) return 1;
+    PreviewWorker *worker=(PreviewWorker *)(uintptr_t)c->worker;
+    if(!worker && (worker=ALLOC(sizeof(*worker),0))) {
+        for(unsigned i=0;i<sizeof(*worker);i++) ((uint8_t *)worker)[i]=0;
+        c->worker=(uintptr_t)worker;
+    }
+    if(worker && !c->event_ready) {
+        EVENT_CREATE(worker->event,0,1,"PhotoCRD");
+        c->event_ready=worker->event[0]>0;
+    }
+    if(worker && c->event_ready && !c->worker_id) {
+        uint32_t parameters[7]={CARD_WORKER_CPU,CARD_WORKER_PRIORITY,16384,0,0,0,0};
+        copy_bytes((char *)parameters+TASK_NAME,"PhotoCRD",8);
+        TASK_CREATE(worker->task,card_worker,parameters);
+        if(*(int32_t *)worker>0) c->worker_id=*(uint32_t *)worker;
+    }
+    if(!c->worker_id) return 0;
+    TASK_START(worker->task,worker);
+    c->worker_state=1;
+    return 1;
+}
+
+static int same_id(const uint8_t *a,const uint8_t *b) { return same_bytes(a,b,32); }
+
+/* GUI task: the same context as a menu selection and its save request.
+ * Order: preview quiesce (pause, cancel, wait, release cache, discard
+ * pending) -> publishing -> no counted reader -> remap every bank by full
+ * transform identity -> swap -> names -> release -> resume -> save. */
+static int card_publish(Z8LookBundle *next)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8CardLibrary *c=&s->card;
+    if(__atomic_load_n(&s->preview.power_paused,__ATOMIC_ACQUIRE)) { FREE(next);return 0; }
+    z8_photo_lut_mode_enter();
+    __atomic_store_n(&c->publishing,1,__ATOMIC_SEQ_CST);
+    while(__atomic_load_n(&c->readers,__ATOMIC_SEQ_CST)) TASK_SLEEP(1);
+    const Z8LookBundle *previous=library_active();
+    /* A one-byte marker, not a persistent identity: 0 is the built-in
+     * library, a session library gets a nonzero value unlike the previous
+     * one. Every publication remaps every bank by full transform identity
+     * and rewrites every marker, so a stale marker becomes Off here. */
+    uint32_t tag=previous->tag%255+1;
+    next->tag=tag;
+    for(unsigned copy=0;copy<BANK_COPIES;copy++) {
+        uint32_t saved=saved_selection(copy),index=saved&255,mapped=0;
+        if((saved>>8)==previous->tag && index && index<=previous->count)
+            for(unsigned i=0;i<next->count && !mapped;i++)
+                if(same_id(next->looks[i].id,previous->looks[index-1].id)) mapped=i+1;
+        save_selection(copy,mapped,tag);
+    }
+    __atomic_store_n(&c->active,(uintptr_t)next,__ATOMIC_RELEASE);
+    s->choice=saved_selection(0)&255;
+    __atomic_store_n(&c->publishing,0,__ATOMIC_SEQ_CST);
+    if(previous!=Z8_BUILTIN) FREE((void *)(uintptr_t)previous);
+    c->publications++;
+    z8_photo_lut_mode_exit();
+    if(!__atomic_load_n(&s->preview.power_paused,__ATOMIC_ACQUIRE)) REQUEST_SAVE();
+    return 1;
+}
+
+static void card_request(void)
+{
+    volatile Z8CardLibrary *c=&Z8_STATE->card;
+    c->attempts++;
+    uint64_t stale=__atomic_exchange_n(&c->staged,0,__ATOMIC_ACQ_REL);
+    if(stale) FREE((void *)(uintptr_t)stale);
+    uint32_t status=CARD_MEMORY,slots=0,count=0;
+    if(card_worker_start()) {
+        uint32_t serial=c->request+1;
+        if(!serial) serial=1;
+        __atomic_store_n(&c->wanted,serial,__ATOMIC_RELEASE);
+        __atomic_store_n(&c->request,serial,__ATOMIC_RELEASE);
+        EVENT_SET(((PreviewWorker *)(uintptr_t)c->worker)->event,1);
+        for(unsigned i=0;i<CARD_WAIT_POLLS && __atomic_load_n(&c->result,__ATOMIC_ACQUIRE)!=serial;i++) TASK_SLEEP(CARD_WAIT_MS);
+        __atomic_store_n(&c->wanted,0,__ATOMIC_RELEASE);
+        status=CARD_BUSY;
+        if(__atomic_load_n(&c->result,__ATOMIC_ACQUIRE)==serial) {
+            status=c->status;slots=c->detail;count=c->loaded;
+            uint64_t staged=__atomic_exchange_n(&c->staged,0,__ATOMIC_ACQ_REL);
+            if(status==CARD_LOADED && (!staged || !card_publish((Z8LookBundle *)(uintptr_t)staged))) status=CARD_BUSY;
+            else if(status!=CARD_LOADED && staged) FREE((void *)(uintptr_t)staged);
+        }
+    }
+    if(status!=CARD_LOADED) c->refusals++;
+    menu_text(library_active(),status,count,slots);
+}
+
+/* ---- label font --------------------------------------------------------- */
+/* A static label's font family comes from the stock resolver 0x4032e19c
+ * (language, string id); ours are all class 0, the menu font of the UI
+ * language. Nikon's CJK fonts are subsets, so a name may need another
+ * language's menu font. The kind-2 glyph builder (0x4032b648) calls the
+ * resolver once at 0x4032b748 with the label's UTF-16 text in x8 and its
+ * byte length in w9 (font-native FONT-SEAM.md); only our strings change. */
+#define TEXT_FONT ((uint32_t (*)(uint32_t,uint32_t))(uintptr_t)0x4032e19c)
+#define LABEL_BYTES_LIMIT 512u
+
+static int font_has(uint32_t font,uint32_t code)
+{
+    /* Byte-packed {u16 first, u16 glyph, u16 count} records, sorted. */
+    const volatile uint8_t *records=(const volatile uint8_t *)(uintptr_t)z8_rom_fonts[font].records;
+    uint32_t low=0,high=z8_rom_fonts[font].count;
+    while(low<high) {
+        uint32_t middle=(low+high)/2;
+        const volatile uint8_t *r=records+6*middle;
+        uint32_t first=r[0]|(uint32_t)r[1]<<8,count=r[4]|(uint32_t)r[5]<<8;
+        if(code<first) high=middle;
+        else if(code-first>=count) low=middle+1;
+        else return 1;
+    }
+    return 0;
+}
+
+static int font_covers(uint32_t font,const volatile uint16_t *text,uint32_t units)
+{
+    if(font>=Z8_ROM_FONTS) return 0;
+    for(uint32_t i=0;i<units;i++) {
+        uint32_t c=text[i];
+        if(c<0x20) continue;
+        if((c>=0xd800 && c<0xe000) || !font_has(font,c)) return 0;
+    }
+    return 1;
+}
+
+uint32_t z8_photo_lut_text_font(uint32_t language,uint32_t id,const volatile uint16_t *text,uint32_t bytes)
+{
+    uint32_t font=TEXT_FONT(language,id)&255;
+    if(id-Z8_STRING_FIRST>=Z8_LABELS || !text || ((uintptr_t)text&1) || bytes>LABEL_BYTES_LIMIT) return font;
+    uint32_t units=bytes/2;
+    if(font_covers(font,text,units)) return font;
+    /* The menu fonts of English, Simplified and Traditional Chinese, Japanese
+     * and Korean, in that order; none covering the label keeps the UI font. */
+    static const uint8_t languages[]={1,8,9,0,10};
+    for(unsigned i=0;i<sizeof(languages);i++) {
+        uint32_t other=TEXT_FONT(languages[i],id)&255;
+        if(other!=font && font_covers(other,text,units)) return other;
+    }
+    return font;
+}
+
+/* ---- menu ------------------------------------------------------------- */
+#define ROW_DISABLE ((void (*)(void *,uint32_t,uint32_t))(uintptr_t)0x403b1ed0)
+
+int z8_photo_lut_menu_entry(void *page)
+{
+    /* Look rows past the active library are disabled, which the native list
+     * hides (QEMU run-01; the pinned row state of the pixel-shift browser). */
+    const Z8LookBundle *b=library_active();
+    for(uint32_t look=1;look<=Z8_LUT_MAX_LOOKS;look++) ROW_DISABLE(page,z8_row_of(look),look>b->count);
+    uint32_t row=z8_row_of(choice());
+    /* Right after a card load ask for the cursor on the result row. Where the
+     * native re-entry finally places it is not established; the rebuilt page
+     * shows the result row either way (QEMU qemu-ui-c). */
+    if(__atomic_exchange_n(&Z8_STATE->card.show_result,0,__ATOMIC_ACQ_REL)) SET_CURSOR(page,Z8_OPTION_FIRST+Z8_LOAD_ROW);
+    else if(ENTRY_GUARD(page)!=1) SET_CURSOR(page,Z8_OPTION_FIRST+row);
+    return SET_MARK(page,Z8_OPTION_FIRST+row,1);
+}
+
+/* The stock dispatcher passes its transition request (page at +0, target
+ * state at +0xC) and goes to the target read back afterwards (pixel-shift
+ * PS11: 0x403DB910, 0x40508E04 -> 0x403AF53C). Choosing a look keeps the
+ * stock target (back to the photo menu); a card load targets this page again. */
+#define REQUEST_TARGET 0xcu
+int z8_photo_lut_menu_ok(void *request)
 {
     /* Exact stock option-row lookup, with bounds before storing the choice. */
-    uint64_t page=read64((uintptr_t)context);
+    uint64_t page=read64((uintptr_t)request);
     uint64_t list=read64(page+0x50),rows=read64(list+0x10);
     uint32_t cursor=(uint32_t)read16(page+0x58)+read16(page+0x32);
-    if(cursor>Z8_BUNDLE->count || !Z8_STATE->ready) return;
+    if(cursor>=Z8_ROWS || !Z8_STATE->ready) return 0;
     uint32_t item=read32(rows+(uint64_t)cursor*44+24);
-    if(item<Z8_OPTION_FIRST || item>Z8_OPTION_FIRST+Z8_BUNDLE->count) return;
-    __atomic_store_n(Z8_SAVED_CHOICE,(uint8_t)(item-Z8_OPTION_FIRST),__ATOMIC_RELEASE);
-    Z8_STATE->choice=item-Z8_OPTION_FIRST;
+    if(item<Z8_OPTION_FIRST || item>=Z8_OPTION_FIRST+Z8_ROWS) return 0;
+    uint32_t row=item-Z8_OPTION_FIRST;
+    if(row==Z8_LOAD_ROW) {
+        card_request();
+        __atomic_store_n(&Z8_STATE->card.show_result,1,__ATOMIC_RELEASE);
+        *(volatile uint32_t *)((uintptr_t)request+REQUEST_TARGET)=Z8_MENU_STATE;
+        return 0;
+    }
+    uint32_t option=row?row-1:0;
+    /* Publication also runs in this GUI task, so the library is stable here. */
+    const Z8LookBundle *b=library_active();
+    if(option>b->count) return 0;           /* an unused row keeps the selection */
+    save_selection(0,option,b->tag);
+    Z8_STATE->choice=option;
     /* Request native NVRAM serialization. It compares and writes the entire
      * 0x2e0-byte photo block, including these alignment bytes. */
     REQUEST_SAVE();
     if(Z8_STATE->preview.worker && Z8_STATE->preview.worker_started)
         EVENT_SET(((PreviewWorker *)(uintptr_t)Z8_STATE->preview.worker)->event,1);
+    return 0;
 }
 
 int z8_photo_lut_photo_refresh(void *page)
@@ -1106,9 +1620,10 @@ int z8_photo_lut_photo_refresh(void *page)
         /* The reused row's stock value is a graphic. Reset its native kind
          * before binding a static language-table string (kind2). */
         if(read32((uintptr_t)child+12)!=2) BIND(child,0,0);
-        if(read32((uintptr_t)child+8)!=Z8_STRING_FIRST+2+selected || read32((uintptr_t)child+12)!=2)
-            BIND(child,Z8_STRING_FIRST+2+selected,2);
-        CONTENT(child,Z8_STRING_FIRST+2+selected);
+        /* Strings: +2 Off, +3 card-load row, +4.. the looks. */
+        uint32_t text=selected?Z8_STRING_FIRST+3+selected:Z8_STRING_FIRST+2;
+        if(read32((uintptr_t)child+8)!=text || read32((uintptr_t)child+12)!=2) BIND(child,text,2);
+        CONTENT(child,text);
     }
     return result;
 }
@@ -1119,12 +1634,16 @@ void z8_photo_lut_bank_reset_result(const uint64_t *saved)
     uint32_t kind=(uint32_t)saved[19],bank=kind==9?0:kind-10;
     if(bank>=4) return;
     /* Individual-bank reset deliberately excludes the folder-name item from
-     * its531-ID list. Reset our independent setting only after native success.
-     * Whole-camera resets already copy the patched group6 defaults. */
-    uint8_t initial=(uint8_t)Z8_BUNDLE->initial;
-    __atomic_store_n(Z8_SAVED_CHOICE+(bank+1)*0x2e0,initial,__ATOMIC_RELEASE);
+     * its531-ID list. Reset our independent setting only after native success,
+     * to the active library's default. Whole-camera resets copy the patched
+     * group6 defaults, which name the built-in library (tag 0). */
+    const Z8LookBundle *b;
+    while(!(b=library_enter())) TASK_SLEEP(1);
+    uint32_t initial=b->initial,tag=b->tag;
+    library_exit();
+    save_selection(bank+1,initial,tag);
     if(read32(UINT64_C(0xa03d48164))==bank) {
-        __atomic_store_n(Z8_SAVED_CHOICE,initial,__ATOMIC_RELEASE);
+        save_selection(0,initial,tag);
         Z8_STATE->choice=initial;
         if(Z8_STATE->preview.worker && Z8_STATE->preview.worker_started)
             EVENT_SET(((PreviewWorker *)(uintptr_t)Z8_STATE->preview.worker)->event,1);

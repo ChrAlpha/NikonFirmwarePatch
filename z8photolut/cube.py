@@ -1,4 +1,4 @@
-"""Strict IRIDAS 3D .cube ingestion and deterministic native bundle encoding.
+"""Strict IRIDAS 3D .cube ingestion, runtime resampling and runtime .cube export.
 
 Format reference: OpenColorIO src/OpenColorIO/fileformats/FileFormatIridasCube.cpp.
 Cube rows are red-fastest; native samples are blue-fastest RGB uint16. Input
@@ -7,13 +7,22 @@ domains are baked into a normalized grid, and outputs clip to the SDR range.
 from dataclasses import dataclass
 import hashlib
 import math
+import re
 import shlex
 import struct
-import zlib
 
-MAGIC = b'Z8LUT002'
-HEADER_BYTES, ENTRY_BYTES, MAX_LOOKS, MAX_BYTES = 64, 96, 8, 0x200000
 GRID_SIZES = (17, 33, 65)
+
+# The camera applies a look to the photo it has already rendered: 8-bit
+# full-range BT.601 Y'CbCr of the JPEG in its selected colour space, after
+# the active Picture Control. Cubes made for camera log or HDR encodings
+# expect a different input and would be silently wrong there.
+INPUT_BASIS = 'nikon-rendered-sdr'
+FOREIGN_BASIS = re.compile(
+    r'(?<![a-z0-9])(?:[vnsfcdl]-?log[0-9]?|log-?c[0-9]?|log3g10|hlg|pq|st[ ._-]?2084|'
+    r'(?:rec|bt|itu)[ ._-]?2100|(?:rec|bt|itu)[ ._-]?2020|acescc|acescct|cineon)(?![a-z0-9])',
+    re.IGNORECASE)
+PANASONIC_STYLE = re.compile(r'^\s*#\s*LUMIXPHOTOSTYLE\b\s*(\S*)', re.IGNORECASE | re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -24,6 +33,7 @@ class Cube:
     maximum: tuple
     values: tuple
     source_sha256: str
+    comments: tuple = ()
 
     def sample(self, rgb):
         axes = []
@@ -45,10 +55,16 @@ class Cube:
 def parse(raw, name='Look'):
     if not isinstance(raw, bytes) or len(raw) > 32*1024*1024:
         raise ValueError('Cube input must be UTF-8 bytes, at most 32 MiB')
-    text = raw.decode('utf-8-sig')
-    header, values = {}, []
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError as exc:
+        raise ValueError('Cube input is not UTF-8 text') from exc
+    header, values, comments = {}, [], []
     recognized = {'TITLE', 'LUT_3D_SIZE', 'DOMAIN_MIN', 'DOMAIN_MAX'}
     for line_number, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith('#'):
+            comments.append(line.strip())
+            continue
         # A comment marker inside a quoted title remains part of the title.
         try:
             fields = shlex.split(line, comments=True, posix=True)
@@ -97,9 +113,27 @@ def parse(raw, name='Look'):
     if 'TITLE' in header and len(header['TITLE']) != 1:
         raise ValueError('TITLE must be one quoted string')
     title = header.get('TITLE', [name])[0]
-    if not title or len(title.encode('utf-8')) > 63 or any(ord(c) < 32 for c in title):
-        raise ValueError('Look title must be 1..63 UTF-8 bytes without control characters')
-    return Cube(title, size, *limits, tuple(values), hashlib.sha256(raw).hexdigest())
+    if any(ord(c) < 32 for c in title):
+        raise ValueError('TITLE contains control characters')
+    return Cube(title, size, *limits, tuple(values), hashlib.sha256(raw).hexdigest(), tuple(comments))
+
+
+def foreign_basis(cube, filename=''):
+    """Return why a cube appears to expect input other than Nikon-rendered SDR, or ''."""
+    reasons = []
+    for comment in cube.comments:
+        match = PANASONIC_STYLE.match(comment)
+        if match:
+            # Panasonic documents a missing or invalid tag as a V-Log base.
+            style = match.group(1).upper() or 'missing (V-Log)'
+            reasons.append(f'#LUMIXPHOTOSTYLE {style}: made for a Panasonic Photo Style base')
+    for label, text in [('file name', filename), ('TITLE', cube.title), *(('comment', c) for c in cube.comments)]:
+        match = FOREIGN_BASIS.search(text)
+        if match:
+            reasons.append(f'{label} mentions {match.group(0)}')
+    if any(lo < 0 or hi > 1 for lo, hi in zip(cube.minimum, cube.maximum)):
+        reasons.append('DOMAIN_MIN/MAX exceeds 0..1 (scene-referred or shaper input)')
+    return '; '.join(dict.fromkeys(reasons))
 
 
 def encode_samples(cube, size):
@@ -118,63 +152,21 @@ def encode_samples(cube, size):
     return bytes(output), identity
 
 
-def bundle(cubes, *, grid=33, default=0):
-    if not 1 <= len(cubes) <= MAX_LOOKS or not 0 <= default <= len(cubes):
-        raise ValueError('Supply 1..8 looks; default is 0 (Off) or a look index')
-    if len({c.title.casefold() for c in cubes}) != len(cubes):
-        raise ValueError('Look titles must be distinct')
-    payload = bytearray(HEADER_BYTES+MAX_LOOKS*ENTRY_BYTES)
-    details = []
-    for i, cube in enumerate(cubes):
-        samples, identity = encode_samples(cube, grid)
-        offset = (len(payload)+63)&~63
-        payload.extend(bytes(offset-len(payload)))
-        payload.extend(samples)
-        if len(payload) > MAX_BYTES:
-            raise ValueError('LUT bundle exceeds the 2 MiB firmware region; use a smaller grid or fewer looks')
-        entry = struct.pack('<6I64s8s', offset, len(samples), grid, int(identity),
-                            zlib.crc32(samples), 0, cube.title.encode().ljust(64, b'\0'), bytes(8))
-        payload[HEADER_BYTES+i*ENTRY_BYTES:HEADER_BYTES+(i+1)*ENTRY_BYTES] = entry
-        details.append(dict(title=cube.title, input_size=cube.size, native_size=grid,
-                            identity=identity, source_sha256=cube.source_sha256,
-                            domain_min=cube.minimum,domain_max=cube.maximum,
-                            resampling='trilinear',runtime_interpolation='tetrahedral',
-                            output_range='clipped SDR RGB 0..1',
-                            samples_sha256=hashlib.sha256(samples).hexdigest()))
-    struct.pack_into('<8s6I', payload, 0, MAGIC, 2, len(payload), len(cubes), default,
-                     zlib.crc32(payload[HEADER_BYTES:]), 0)
-    return bytes(payload), details
-
-
-def validate_bundle(raw):
-    if len(raw) < HEADER_BYTES+MAX_LOOKS*ENTRY_BYTES or len(raw) > MAX_BYTES:
-        raise ValueError('Invalid LUT bundle size')
-    magic, version, size, count, default, checksum, reserved = struct.unpack_from('<8s6I', raw)
-    if (magic != MAGIC or version != 2 or size != len(raw) or not 1 <= count <= MAX_LOOKS
-            or default > count or reserved or any(raw[32:HEADER_BYTES])
-            or zlib.crc32(raw[HEADER_BYTES:]) != checksum):
-        raise ValueError('Invalid LUT bundle header or checksum')
-    end, titles = HEADER_BYTES+MAX_LOOKS*ENTRY_BYTES, []
-    for i in range(MAX_LOOKS):
-        entry = raw[HEADER_BYTES+i*ENTRY_BYTES:HEADER_BYTES+(i+1)*ENTRY_BYTES]
-        if i >= count:
-            if any(entry):
-                raise ValueError('Nonzero unused look entry')
-            continue
-        at, length, grid, identity, checksum, reserved, title, tail = struct.unpack('<6I64s8s', entry)
-        expected_at = (end+63)&~63
-        if (grid not in GRID_SIZES or at != expected_at or length != grid**3*6
-                or at+length > len(raw) or identity > 1 or reserved or any(tail)
-                or any(raw[end:at]) or zlib.crc32(raw[at:at+length]) != checksum):
-            raise ValueError('Invalid LUT entry bounds or checksum')
-        name, separator, padding = title.partition(b'\0')
-        if not name or not separator or any(padding):
-            raise ValueError('Invalid LUT title')
-        name = name.decode('utf-8')
-        if any(ord(c) < 32 for c in name) or name.casefold() in titles:
-            raise ValueError('Invalid or duplicate LUT title')
-        titles.append(name.casefold())
-        end = at+length
-    if end != len(raw):
-        raise ValueError('Trailing LUT bundle data')
-    return dict(count=count, default=default, bytes=size)
+def runtime_cube(title, grid, samples, comments=()):
+    """Write the applied native grid as a red-fastest .cube with exact uint16 values."""
+    if grid not in GRID_SIZES or len(samples) != grid**3*6:
+        raise ValueError('Invalid runtime sample grid')
+    if any(ord(c) < 32 for c in title+''.join(comments)):
+        raise ValueError('Runtime cube text contains control characters')
+    values = struct.unpack(f'<{grid**3*3}H', samples)
+    # parse() reads TITLE with POSIX shell quoting: inside double quotes only
+    # backslash and the quote itself are escapable, so this round-trips exactly.
+    quoted = title.replace('\\', '\\\\').replace('"', '\\"')
+    rows = [f'# {c}' for c in comments]
+    rows += [f'TITLE "{quoted}"', f'LUT_3D_SIZE {grid}']
+    for b in range(grid):
+        for g in range(grid):
+            for r in range(grid):
+                at = ((r*grid+g)*grid+b)*3
+                rows.append(' '.join(f'{values[at+c]/65535:.9f}' for c in range(3)))
+    return ('\n'.join(rows)+'\n').encode()

@@ -63,6 +63,7 @@ Windows 使用 `py -3 -m venv .venv` 创建环境，用 `.\.venv\Scripts\Activat
 ### 使用与文档
 
 - 功能指南：[ProRes](docs/prores.md#简体中文)、[RAW／预拍摄](docs/raw-precapture.md#简体中文)、[像素位移](docs/pixelshift.md#简体中文)、[开放门／N-RAW](docs/opengate-nraw.md#简体中文)。
+- [照片 LUT](docs/photo-lut.md#简体中文)：独立的开发版工具 `photo_lut.py`，不属于上述 v0.3.0-r1 工具包的四项功能和 15 种组合，尚未实机验收。
 - [已知问题与功能限制](docs/known-issues.md)、[当前验证](docs/validation.md)、[上一公开版记录](docs/validation-v0.2.0.md)。
 - [发布包与独立验证](docs/releases.md)、[更新日志](CHANGELOG.md)。
 
@@ -121,6 +122,7 @@ Build from the official input each time; never use a patched output as input. Ex
 ### Use and documentation
 
 - Feature guides: [ProRes](docs/prores.md#english), [RAW/pre-capture](docs/raw-precapture.md#english), [pixel shift](docs/pixelshift.md#english), [open gate/N-RAW](docs/opengate-nraw.md#english).
+- [Photo LUT](docs/photo-lut.md#english): a separate development tool, `photo_lut.py`; not one of the four features or 15 combinations of the v0.3.0-r1 toolkit, and without physical-camera acceptance.
 - [Known issues and limits](docs/known-issues.md#english), [current validation](docs/validation.md), [previous public release](docs/validation-v0.2.0.md).
 - [Release contents and verification](docs/releases.md), [changelog](CHANGELOG.md).
 

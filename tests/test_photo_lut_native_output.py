@@ -12,7 +12,8 @@ from pathlib import Path
 import struct
 import unittest
 
-from z8photolut.cube import bundle,parse
+from z8photolut.library import look_id
+from photo_lut_fixtures import LEASE_BYTES,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,LUT,branch,compile_code
 
 try:
@@ -35,7 +36,8 @@ SCRATCH_SLICES=(8256*5504*2,1920*1080*2,640*480*2,192*120*2,0x3600)
 SCRATCH=sum(SCRATCH_SLICES)
 LEASE_MAGIC=0x3154504f4c385a4a
 LEASE_FORMAT='<5Q2I2Q'
-LEASE_BYTES=128
+# A transform lease also carries the latched private 17-grid copy.
+TRANSFORM=SCRATCH+snapshot_bytes(17)
 
 
 def align512(value):
@@ -101,11 +103,14 @@ class NativeOutputMachine:
         self.m.reg_write(regs.UC_ARM64_REG_PC,self.m.reg_read(regs.UC_ARM64_REG_X30))
 
     def _map_footer(self,machine,access,address,size,value,user):
-        # Map only the cached footer page, never fabricate image data or RAM
-        # outside a successfully allocated owner's actual capacity.
+        # Map only cached pages of the private tail (latched look copy and
+        # footer), never image data or RAM outside a successfully allocated
+        # owner's actual capacity.
         for owner,raw,capacity in self.allocations:
             footer=raw+0x400000000+capacity-LEASE_BYTES
-            if footer<=address and address+size<=footer+LEASE_BYTES:
+            # The latched copy follows the compressed bytes and the JPEG
+            # scratch, so it can only lie beyond the first SCRATCH bytes.
+            if min(footer,raw+0x400000000+SCRATCH)<=address and address+size<=footer+LEASE_BYTES:
                 machine.mem_map(address&~4095,4096)
                 return True
         return False
@@ -196,8 +201,17 @@ class NativeOutputMachine:
 
     def mutable_footer(self,resource):
         raw,capacity=self.owner(resource)
-        address=raw+0x400000000+capacity-LEASE_BYTES+64
+        address=raw+0x400000000+capacity-LEASE_BYTES+192
         return bytes(self.m.mem_read(address,64))
+
+    def latched(self,resource):
+        raw,capacity=self.owner(resource)
+        address=raw+0x400000000+capacity-LEASE_BYTES
+        grid,identity,tag,size=struct.unpack('<4I',self.m.mem_read(address+64,16))
+        name=bytes(self.m.mem_read(address+112,64)).split(b'\0',1)[0].decode()
+        samples=self.u64(address+56)
+        copy=bytes(self.m.mem_read(samples+0x400000000,size)) if samples else b''
+        return dict(grid=grid,identity=identity,tag=tag,id=bytes(self.m.mem_read(address+80,32)),name=name,samples=copy)
 
     def normalized_metadata(self,resource):
         raw,capacity=self.owner(resource)
@@ -231,8 +245,8 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
                 for g in range(2):
                     for r in range(2):
                         rows.append(' '.join(map(str,(g,b,r) if cycle else (r,g,b))))
-            cubes.append(parse(('\n'.join(rows)+'\n').encode()))
-        cls.looks,_=bundle(cubes,grid=17)
+            cubes.append(('\n'.join(rows)+'\n').encode())
+        cls.looks=runtime_bundle(cubes)
 
     def machine(self,**options):
         return NativeOutputMachine(self.rom,self.code,self.symbols,self.metadata,self.looks,**options)
@@ -288,7 +302,13 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
                 self.assertEqual(extended.native_bytes,budget)
                 raw,capacity=extended.owner(resource)
                 lease=extended.footer(resource)
-                self.assertEqual(lease,(LEASE_MAGIC,resource,raw,capacity,raw+align512(budget),SCRATCH,2,budget,0))
+                self.assertEqual(lease,(LEASE_MAGIC,resource,raw,capacity,raw+align512(budget),TRANSFORM,2,budget,
+                                        raw+align512(budget)+SCRATCH))
+                # The capture owns an exact copy of the look it latched.
+                entry=struct.unpack_from('<6I',self.looks,64+128)
+                samples=self.looks[entry[0]:entry[0]+entry[1]]
+                self.assertEqual(extended.latched(resource),dict(grid=17,identity=0,tag=0,id=look_id(17,samples),
+                                                                 name='Cycle',samples=samples))
                 self.assertEqual(extended.mutable_footer(resource),bytes(64))
                 self.assertEqual(extended.u32(resource),42)
                 self.assertEqual(extended.u32(resource+0x10),POOL)
@@ -346,7 +366,7 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
                 machine=self.machine()
                 machine.configure(format=format,quality=quality)
                 _,native=self.canonical_segments(format,0,quality)
-                required=align512(native)+SCRATCH+LEASE_BYTES
+                required=align512(native)+TRANSFORM+LEASE_BYTES
                 unit=machine.u32(POOL_CONFIG+8)
                 total_units=machine.u32(POOL_CONFIG+12)
                 units=(required+unit-1)//unit
@@ -406,14 +426,14 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
         self.assertTrue(resource)
         lease=machine.footer(resource)
         mutable=machine.mutable_footer(resource)
-        self.assertEqual(lease[5:8],(SCRATCH,2,native))
+        self.assertEqual(lease[5:8],(TRANSFORM,2,native))
         unit=machine.u32(POOL_CONFIG+8)
         total_units=machine.u32(POOL_CONFIG+12)
         free_units=total_units-machine.owner(resource)[1]//unit
         for choice in (0,1,2):
             with self.subTest(prospective_choice=choice):
                 machine.m.mem_write(0xa03d482ba,bytes([choice]))
-                required=align512(native)+LEASE_BYTES+(SCRATCH if choice==2 else 0)
+                required=align512(native)+LEASE_BYTES+(TRANSFORM if choice==2 else 0)
                 units=(required+unit-1)//unit
                 self.assertEqual(machine.forecast(),(required,free_units//units,total_units//units))
                 self.assertEqual(machine.free_units(),free_units)
@@ -444,7 +464,7 @@ class PhotoLutNativeOutputTests(unittest.TestCase):
         self.assertEqual(full.call(0x410477c8,held),1)
         result=full.construct()
         self.assertTrue(result)
-        self.assertEqual(full.footer(result)[5],SCRATCH)
+        self.assertEqual(full.footer(result)[5],TRANSFORM)
         self.assertEqual(full.mutable_footer(result),bytes(64))
         self.assertEqual(full.call(0x410477c8,result),1)
         self.assertEqual(full.call(0x40cdafa0,POOL),1)

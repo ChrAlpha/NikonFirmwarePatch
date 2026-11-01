@@ -13,7 +13,7 @@ from pathlib import Path
 import struct
 import unittest
 
-from z8photolut.cube import bundle,parse
+from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,LUT,branch,compile_code
 
 try:
@@ -160,8 +160,8 @@ class CompiledGraphMachine(NativeGraphMachine):
         allocated=self.call(symbols['z8_photo_lut_output_alloc'],42,0x38,0x20000,CONFIG)
         if allocated!=OWNER:
             raise AssertionError('Compiled allocator did not initialize the fixture owner')
-        self.footer=CACHED+self.capacity-128
-        self.private_descriptor=self.footer+64
+        self.footer=CACHED+self.capacity-LEASE_BYTES
+        self.private_descriptor=self.footer+192
 
     def map_cached(self,address,bytes):
         first=address&~4095
@@ -177,7 +177,10 @@ class CompiledGraphMachine(NativeGraphMachine):
             self.capacity=(requested+511)&~511
             self.write64(OWNER+8,OUTPUT_RESOURCE)
             self.m.mem_write(OUTPUT_RESOURCE,struct.pack('<QI',RAW,self.capacity))
-            self.map_cached(CACHED+self.capacity-128,128)
+            # Private tail: the latched look copy (after <512 bytes of
+            # alignment slack) and the lease footer.
+            tail=LEASE_BYTES+snapshot_bytes(17)+512
+            self.map_cached(CACHED+self.capacity-tail,tail)
             machine.reg_write(regs.UC_ARM64_REG_X0,OWNER)
             machine.reg_write(regs.UC_ARM64_REG_PC,machine.reg_read(regs.UC_ARM64_REG_X30))
             return
@@ -185,17 +188,16 @@ class CompiledGraphMachine(NativeGraphMachine):
 
     def finish_thumbnail(self):
         scratch=self.u64(self.footer+32)
-        storage_bytes=self.u32(self.footer+40)
-        if not storage_bytes:
+        if self.u32(self.footer+40)!=JPEG_STORAGE+snapshot_bytes(17):
             raise AssertionError('No private thumbnail storage was reserved')
         # This is the publication contract of the completed private encode.
         # Pixel conversion and encoding are covered by their own regressions.
-        raw=scratch+storage_bytes-0x3600
+        raw=scratch+JPEG_STORAGE-0x3600
         cached=raw+0x400000000
         self.map_cached(cached,len(PRIVATE_THUMBNAIL))
         self.m.mem_write(cached,PRIVATE_THUMBNAIL)
         self.descriptor(self.private_descriptor,raw,PRIVATE_THUMBNAIL)
-        self.write32(self.footer+112,1)
+        self.write32(self.footer+240,1)
 
     def compiled_graph(self,file_id,graph,callsite):
         wrapper=self.symbols['z8_photo_lut_file_graph']
@@ -274,8 +276,8 @@ class PhotoLutCompiledGraphTests(PinnedRomTestCase):
                 for g in range(2):
                     for r in range(2):
                         rows.append(' '.join(map(str,(g,b,r) if cycle else (r,g,b))))
-            cubes.append(parse(('\n'.join(rows)+'\n').encode()))
-        cls.looks,_=bundle(cubes,grid=17)
+            cubes.append(('\n'.join(rows)+'\n').encode())
+        cls.looks=runtime_bundle(cubes)
 
     def machine(self,**options):
         return CompiledGraphMachine(self.rom,self.code,self.symbols,self.metadata,self.looks,**options)

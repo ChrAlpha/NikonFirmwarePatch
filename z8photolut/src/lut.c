@@ -12,19 +12,114 @@ uint32_t z8_lut_crc32(const void *data, uint32_t bytes)
     return ~crc;
 }
 
+/* FIPS 180-4 SHA-256, streaming, general registers only. */
+typedef struct { uint32_t h[8]; uint8_t block[64]; uint64_t bytes; } Sha256;
+static const uint32_t sha_k[64]={
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+static uint32_t ror(uint32_t x,unsigned n) { return (x>>n)|(x<<(32-n)); }
+static void sha_block(Sha256 *s)
+{
+    uint32_t w[64],v[8];
+    for(unsigned i=0;i<16;i++)
+        w[i]=(uint32_t)s->block[4*i]<<24|(uint32_t)s->block[4*i+1]<<16|(uint32_t)s->block[4*i+2]<<8|s->block[4*i+3];
+    for(unsigned i=16;i<64;i++)
+        w[i]=w[i-16]+(ror(w[i-15],7)^ror(w[i-15],18)^(w[i-15]>>3))+w[i-7]+(ror(w[i-2],17)^ror(w[i-2],19)^(w[i-2]>>10));
+    for(unsigned i=0;i<8;i++) v[i]=s->h[i];
+    for(unsigned i=0;i<64;i++) {
+        uint32_t t1=v[7]+(ror(v[4],6)^ror(v[4],11)^ror(v[4],25))+((v[4]&v[5])^(~v[4]&v[6]))+sha_k[i]+w[i];
+        uint32_t t2=(ror(v[0],2)^ror(v[0],13)^ror(v[0],22))+((v[0]&v[1])^(v[0]&v[2])^(v[1]&v[2]));
+        for(unsigned j=7;j;j--) v[j]=v[j-1];
+        v[4]+=t1;v[0]=t1+t2;
+    }
+    for(unsigned i=0;i<8;i++) s->h[i]+=v[i];
+}
+static void sha_start(Sha256 *s)
+{
+    static const uint32_t initial[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    for(unsigned i=0;i<8;i++) s->h[i]=initial[i];
+    s->bytes=0;
+}
+static void sha_add(Sha256 *s,const void *data,uint32_t bytes)
+{
+    const uint8_t *p=data;
+    while(bytes) {
+        unsigned at=(unsigned)(s->bytes%64),take=64-at<bytes?64-at:bytes;
+        for(unsigned i=0;i<take;i++) s->block[at+i]=p[i];
+        s->bytes+=take;p+=take;bytes-=take;
+        if(at+take==64) sha_block(s);
+    }
+}
+static void sha_finish(Sha256 *s,uint8_t digest[32])
+{
+    uint64_t bits=s->bytes*8;
+    uint8_t one=0x80,nil=0;
+    sha_add(s,&one,1);
+    while(s->bytes%64!=56) sha_add(s,&nil,1);
+    for(unsigned i=0;i<8;i++) { uint8_t b=(uint8_t)(bits>>(56-8*i));sha_add(s,&b,1); }
+    for(unsigned i=0;i<32;i++) digest[i]=(uint8_t)(s->h[i/4]>>(24-8*(i%4)));
+}
+
+void z8_lut_look_id(uint32_t grid,const uint16_t *samples,uint8_t digest[32])
+{
+    static const char domain[]="z8photolut/look/1\0" Z8_LUT_SEMANTICS;
+    uint8_t g[4]={(uint8_t)grid,(uint8_t)(grid>>8),(uint8_t)(grid>>16),(uint8_t)(grid>>24)};
+    Sha256 s;sha_start(&s);
+    sha_add(&s,domain,sizeof(domain));            /* includes the final NUL separator */
+    sha_add(&s,g,4);
+    sha_add(&s,samples,grid*grid*grid*6);
+    sha_finish(&s,digest);
+}
+
+/* 1..63 bytes of well-formed UTF-8, NUL-padded to capacity; no C0/C1 control,
+ * DEL, surrogate or XML-forbidden U+FFFE/U+FFFF; no outer spaces. Mirrors
+ * z8photolut/library.py check_name so menu text and metadata stay valid. */
+static const uint32_t utf8_minimum[4]={0,0x80,0x800,0x10000};
+unsigned z8_lut_name_valid(const char *name,unsigned capacity)
+{
+    const uint8_t *p=(const uint8_t *)name;
+    unsigned n=0;
+    while(n<capacity && p[n]) n++;
+    if(!n || n>Z8_LUT_NAME_BYTES || n>=capacity || p[0]==' ' || p[n-1]==' ') return 0;
+    for(unsigned i=n;i<capacity;i++) if(p[i]) return 0;
+    for(unsigned i=0;i<n;) {
+        uint32_t c=p[i],extra=c<0x80?0:(c&0xe0)==0xc0?1:(c&0xf0)==0xe0?2:(c&0xf8)==0xf0?3:4;
+        if(extra>3 || (extra && i+extra>=n)) return 0;
+        if(extra) c&=0x3f>>extra;
+        for(unsigned k=1;k<=extra;k++) {
+            if((p[i+k]&0xc0)!=0x80) return 0;
+            c=c<<6|(p[i+k]&0x3f);
+        }
+        if(c<utf8_minimum[extra] || c>0x10ffff || (c>=0xd800 && c<=0xdfff) || c<0x20 ||
+           (c>=0x7f && c<=0x9f) || c==0xfffe || c==0xffff) return 0;
+        i+=extra+1;
+    }
+    return 1;
+}
+
 static int zero(const uint8_t *p,uint32_t n)
 {
     for(uint32_t i=0;i<n;i++) if(p[i]) return 0;
     return 1;
 }
 
-unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available)
+/* `digests`: recompute every transform identity and the library identity.
+ * Card files always need it. The built-in image library is covered by the
+ * firmware package hashes checked at build and installation, so boot checks
+ * only structure, CRCs, names and no-op flags (baseline boot cost). */
+static unsigned validate(const Z8LookBundle *b,uint32_t available,unsigned digests)
 {
     if(!b || ((uintptr_t)b&7) || available<sizeof(*b) ||
-       b->magic!=Z8_LUT_MAGIC || b->version!=2 || b->bytes<sizeof(*b) ||
+       b->magic!=Z8_LUT_MAGIC || b->version!=3 || b->bytes<sizeof(*b) ||
        b->bytes>available || b->bytes>Z8_LUT_BUNDLE_LIMIT ||
-       !b->count || b->count>Z8_LUT_MAX_LOOKS || b->initial>b->count ||
-       b->reserved || !zero(b->padding,sizeof(b->padding))) return Z8_LUT_BAD_BUNDLE;
+       b->count>Z8_LUT_MAX_LOOKS || b->initial>b->count ||
+       b->tag>255) return Z8_LUT_BAD_BUNDLE;
     const uint8_t *raw=(const uint8_t *)b;
     if(z8_lut_crc32(raw+64,b->bytes-64)!=b->crc32) return Z8_LUT_BAD_BUNDLE;
     uint32_t end=sizeof(*b);
@@ -37,32 +132,57 @@ unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available)
         uint32_t next=(end+63)&~63u;
         if((e->grid!=17 && e->grid!=33 && e->grid!=65) || e->offset!=next ||
            e->bytes!=e->grid*e->grid*e->grid*6 || e->offset>b->bytes ||
-           e->bytes>b->bytes-e->offset || e->identity>1 || e->reserved ||
+           e->bytes>b->bytes-e->offset || e->identity>1 || e->flags ||
            !zero(e->padding,sizeof(e->padding)) || !zero(raw+end,next-end)) return Z8_LUT_BAD_BUNDLE;
-        unsigned terminator=0;
-        while(terminator<64 && e->title[terminator]) {
-            if((uint8_t)e->title[terminator]<32) return Z8_LUT_BAD_BUNDLE;
-            terminator++;
-        }
-        if(!terminator || terminator==64 || !zero((const uint8_t *)e->title+terminator,64-terminator)) return Z8_LUT_BAD_BUNDLE;
+        if(!z8_lut_name_valid(e->name,sizeof(e->name))) return Z8_LUT_BAD_BUNDLE;
         if(z8_lut_crc32(raw+e->offset,e->bytes)!=e->crc32) return Z8_LUT_BAD_BUNDLE;
-        /* A corrupted identity flag must never silently disable a real look. */
-        if(e->identity) {
-            const uint16_t *table=(const uint16_t *)(raw+e->offset);
-            for(unsigned r=0;r<e->grid;r++) for(unsigned g=0;g<e->grid;g++) for(unsigned v=0;v<e->grid;v++) {
-                unsigned indices[3]={r,g,v};
-                for(unsigned c=0;c<3;c++) {
-                    uint32_t expected=(indices[c]*65535u+(e->grid-1)/2)/(e->grid-1);
-                    uint32_t actual=*table++;
-                    /* Host round-to-even and nearest-away differ only at ties. */
-                    if(actual+1<expected || actual>expected+1) return Z8_LUT_BAD_BUNDLE;
-                }
+        if(digests) {
+            uint8_t digest[32];
+            z8_lut_look_id(e->grid,(const uint16_t *)(raw+e->offset),digest);
+            for(unsigned k=0;k<32;k++) if(digest[k]!=e->id[k]) return Z8_LUT_BAD_BUNDLE;
+        }
+        for(unsigned k=0;k<i;k++) {
+            unsigned same=1;
+            for(unsigned j=0;j<32 && same;j++) same=b->looks[k].id[j]==e->id[j];
+            if(same) return Z8_LUT_BAD_BUNDLE;
+        }
+        /* The no-op flag must equal exact sample identity (host
+         * library.identity_samples): a corrupted flag must never silently
+         * disable a real look, nor mark a no-op as a transform. */
+        unsigned same=1;
+        const uint16_t *table=(const uint16_t *)(raw+e->offset);
+        for(unsigned r=0;r<e->grid && same;r++) for(unsigned g=0;g<e->grid && same;g++) for(unsigned v=0;v<e->grid && same;v++) {
+            unsigned indices[3]={r,g,v};
+            for(unsigned c=0;c<3;c++) {
+                uint32_t expected=(2u*indices[c]*65535u+e->grid-1)/(2u*(e->grid-1));
+                same&=*table++==expected;
             }
+        }
+        if(same!=e->identity) return Z8_LUT_BAD_BUNDLE;
+        for(unsigned k=0;k<i;k++) {
+            unsigned j=0;
+            while(j<sizeof(e->name) && b->looks[k].name[j]==e->name[j]) j++;
+            if(j==sizeof(e->name)) return Z8_LUT_BAD_BUNDLE;   /* exact duplicate name */
         }
         end=e->offset+e->bytes;
     }
-    return end==b->bytes ? Z8_LUT_OK : Z8_LUT_BAD_BUNDLE;
+    if(end!=b->bytes) return Z8_LUT_BAD_BUNDLE;
+    if(!digests) return Z8_LUT_OK;
+    /* Library identity (host library.py Library.runtime): domain, default,
+     * then every byte after the header. The session tag is header-only. */
+    static const char domain[]="z8photolut/library/1";
+    uint8_t initial[4]={(uint8_t)b->initial,(uint8_t)(b->initial>>8),(uint8_t)(b->initial>>16),(uint8_t)(b->initial>>24)};
+    uint8_t digest[32];
+    Sha256 s;sha_start(&s);
+    sha_add(&s,domain,sizeof(domain));
+    sha_add(&s,initial,4);
+    sha_add(&s,raw+64,b->bytes-64);
+    sha_finish(&s,digest);
+    for(unsigned k=0;k<32;k++) if(digest[k]!=b->library_id[k]) return Z8_LUT_BAD_BUNDLE;
+    return Z8_LUT_OK;
 }
+unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available) { return validate(b,available,1); }
+unsigned z8_lut_validate_image(const Z8LookBundle *b,uint32_t available) { return validate(b,available,0); }
 
 unsigned z8_lut_select(const Z8LookBundle *b,uint32_t choice,uint32_t strength,Z8Look *look)
 {

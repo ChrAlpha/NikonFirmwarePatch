@@ -11,7 +11,7 @@ import tempfile
 from z8prores.menu import Image, NRAW_LAYOUT, NRAW_ROWS, NRAW_PAGE, NRAW_EVENTS, NRAW_OK, NRAW_CALLBACKS
 from z8prores.package import require, sha
 from z8prores.patcher import public_words
-from .cube import validate_bundle
+from .library import ENTRY, HEADER, validate_runtime
 
 ROOT=Path(__file__).resolve().parent
 BASE=0x40160000
@@ -36,7 +36,7 @@ def compile_code(compiler='clang-19'):
     with tempfile.TemporaryDirectory(prefix='z8-photo-lut-') as folder:
         out=Path(folder)
         objects=[]
-        for name in ('lut.c','firmware.c','hooks.S'):
+        for name in ('lut.c','metadata.c','firmware.c','hooks.S'):
             obj=out/(name+'.o')
             subprocess.run([cc,*flags,'-c',str(ROOT/'src'/name),'-o',str(obj)],check=True,capture_output=True,text=True)
             objects.append(str(obj))
@@ -69,7 +69,8 @@ def compile_code(compiler='clang-19'):
     layout=dict(zip(('state_bytes','preview_offset','slots_offset','slot_bytes','request_offset','channel_offset',
                      'cache_resource_offset','paused_offset','apply_sequence_offset','flags_offset',
                      'apply_counter_offset','display_epoch_offset','slot_count','power_paused_offset',
-                     'jpeg_busy_offset','jpeg_preview_offset','jpeg_worker_offset'),struct.unpack_from('<17I',raw,offset)))
+                     'jpeg_busy_offset','jpeg_preview_offset','jpeg_worker_offset','card_offset','xmp_offset'),
+                    struct.unpack_from('<19I',raw,offset)))
     return raw,symbols,dict(sha256=sha(raw),bytes=len(raw),flags=flags,
         compiler=subprocess.check_output([cc,'--version'],text=True).splitlines()[0],
         sources=sources,runtime_layout=layout)
@@ -93,36 +94,63 @@ def load_code(code_source='source',compiler='clang-19'):
     return code,symbols,native
 
 
+TEXT_BLOCKS,BLOCK_BYTES,LOOK_SLOTS,FIRST_STRING=0x408d0000,0x800,8,3137
+# Every language except Simplified (8) and Traditional (9) Chinese uses group 0.
+MENU_TEXT=(
+    ('Photo LUT','Apply a look to photo preview and JPEG; RAW is unchanged. Card looks last until power off.',
+     'Off','Load LUTs from card'),
+    ('照片 LUT','对照片预览和 JPEG 应用风格；RAW 不变。存储卡风格在关机前有效。','关闭','从存储卡载入 LUT'),
+    ('照片 LUT','對照片預覽和 JPEG 套用風格，RAW 不變。記憶卡風格在關機前有效。','關閉','從記憶卡載入 LUT'))
+
+
+def text_block(group,names):
+    """One language group's 12 strings packed as UTF-16, with 13 start offsets.
+
+    Stock tables store start offsets only: a string ends where the next one
+    starts, so ours stay contiguous. Order: title, help, Off, card-load row,
+    eight looks, end. Firmware rewrites everything from the card-load row on
+    (firmware.c menu_text) at boot and after a card load."""
+    # Looks read "N. Name" (firmware.c menu_text); unused rows are hidden.
+    parts=[*MENU_TEXT[group],*(f'{i+1}. {names[i]}' if i<len(names) else '-' for i in range(LOOK_SLOTS))]
+    starts,raw=[],bytearray()
+    for text in parts:
+        starts.append(len(raw));raw.extend(text.encode('utf-16le'))
+    starts.append(len(raw))
+    # Room for the longest card status and eight 63-unit names after Off.
+    require(starts[3]+2*(68+LOOK_SLOTS*(3+63))<=BLOCK_BYTES,'Menu text exceeds its block')
+    return bytes(raw).ljust(BLOCK_BYTES,b'\0'),starts
+
+
 def add_menu(img,names,symbols):
     # Use the existing hidden photo row2 and its otherwise unreachable state1d.
     # The native pixel-shift row44 and every visible stock row remain available.
-    text,tables=bytearray(),bytearray()
-    first=3137
+    # Rows: Off, Load LUTs from card, eight look slots.
+    blocks=[text_block(group,names) for group in range(3)]
+    tables=bytearray()
+    first=FIRST_STRING
     for language in range(36):
         old_table=img.u64(0x311c5a0+language*8)-BASE
         old_blob=img.u64(0x387af58+language*8)-BASE
         offsets=list(struct.unpack_from('<3137i',img.old,old_table))
-        title,help_text,off=('Photo LUT','Apply the selected look to photo preview and JPEG. RAW data is preserved.','Off')
-        if language==8: title,help_text,off=('照片 LUT','选择照片风格。原始数据保留。','关闭')
-        elif language==9: title,help_text,off=('照片 LUT','選擇照片風格。原始資料保留。','關閉')
-        for item in [title,help_text,off,*names]:
-            offsets.append(0x408d0000+len(text)-BASE-old_blob)
-            text.extend(item.encode('utf-16le'))
-        offsets.append(0x408d0000+len(text)-BASE-old_blob)
+        group=1 if language==8 else 2 if language==9 else 0
+        offsets.extend(TEXT_BLOCKS+group*BLOCK_BYTES+start-BASE-old_blob for start in blocks[group][1])
+        require(len(offsets)==first+13,'Unexpected photo LUT string count')
         pointer=0x408e0000+len(tables)
         tables.extend(struct.pack('<'+'i'*len(offsets),*offsets))
         img.put(0x311c5a0+language*8,struct.pack('<Q',pointer),f'photo LUT language directory {language}')
-    require(len(text)<=0x10000 and 0x408e0000+len(tables)<=UI,'Photo LUT strings overflow')
-    img.put(0x408d0000-BASE,text,'photo LUT menu strings',expect_zero=True)
+    require(0x408e0000+len(tables)<=UI,'Photo LUT strings overflow')
+    img.put(TEXT_BLOCKS-BASE,b''.join(raw for raw,_ in blocks),'photo LUT menu text blocks',expect_zero=True)
     img.put(0x408e0000-BASE,tables,'photo LUT language tables',expect_zero=True)
 
     layout=bytearray(img.old[NRAW_LAYOUT:NRAW_LAYOUT+0x110])
     require(struct.unpack_from('<I',layout,0x44)[0]==0x8a6,'Stock option-page title differs')
     struct.pack_into('<I',layout,0x44,first)
     template=list(struct.unpack_from('<11I',img.old,NRAW_ROWS))
-    count=len(names)+1
+    count=LOOK_SLOTS+2
     rows=bytearray()
     for i in range(count):
+        # Rows: Off, Load LUTs from card, looks 1..8 (firmware.h Z8_LOAD_ROW).
+        # Strings FIRST+2 Off, +3 load row, +4.. looks: row i uses FIRST+2+i.
         row=template.copy();row[0]=first+2+i;row[6]=0x35b5+i
         rows.extend(struct.pack('<11I',*row))
     events=bytearray(img.old[NRAW_EVENTS:NRAW_EVENTS+14*32])
@@ -163,13 +191,13 @@ def add_menu(img,names,symbols):
 
 def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     require(len(stock)==81807711 and sha(stock)==STOCK_SHA,'Exact original C3.11 EG is required')
-    validate_bundle(luts)
+    validate_runtime(luts)
     public_words(version)
     require(re.fullmatch(r'[a-z][0-9]',tag),'Tag must be lowercase letter plus digit')
     code,symbols,native=load_code(code_source,compiler)
     img=Image(stock)
     img.put(CODE-BASE,code,'photo LUT native code',expect_zero=True)
-    img.put(LUT-BASE,luts,'photo LUT immutable look bundle',expect_zero=True)
+    img.put(LUT-BASE,luts,'photo LUT immutable built-in look bundle (selection marker 0)',expect_zero=True)
     require(not any(stock[STATE_SOURCE-BASE:STATE_SOURCE-BASE+4096]),'Private runtime source is occupied')
     img.put(0x40eaeb8c-BASE,branch(0x40eaeb8c,symbols['z8_photo_lut_jpeg_entry'],True),
             'main JPEG encode with an isolated input surface',expect=branch(0x40eaeb8c,0x40e82090,True))
@@ -180,6 +208,13 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     for at,name in [(0x40eafe58,'medium'),(0x40eb00ec,'small'),(0x40eb02dc,'thumbnail')]:
         target='z8_photo_lut_'+name+('_entry' if name!='thumbnail' else '')
         img.put(at-BASE,branch(at,symbols[target],True),'isolate JPEG '+name+' from NEF',expect=branch(at,0x40e82090,True))
+    img.put(0x4032b748-BASE,branch(0x4032b748,symbols['z8_photo_lut_text_font_entry'],True),
+            'photo LUT label font family (photo LUT strings only)',expect=branch(0x4032b748,0x4032e19c,True))
+    # Both JPEG APP1 XMP composer calls: native packet first, then a bounded
+    # in-place provenance description for an applied (or no-op) latched look.
+    for at in (0x406c35c4,0x406c40ec):
+        img.put(at-BASE,branch(at,symbols['z8_photo_lut_xmp_entry'],True),
+                'JPEG XMP provenance after the native composer',expect=branch(at,0x406e3698,True))
     for at in (0x40eb1784,0x40eb1dc0):
         img.put(at-BASE,branch(at,symbols['z8_photo_lut_file_graph'],True),
                 'serialize the dedicated JPEG thumbnail',expect=branch(at,0x40eb17e0,True))
@@ -216,8 +251,8 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
     require(stock[0x3ece4dc:0x3ece4e4]==b'NCZ_8\0\0\0','Photo folder defaults/alignment differ')
     require(struct.unpack_from('<6I',stock,0x3eabb98)[:2]==(10,6),'Photo folder descriptor differs')
     initial=struct.unpack_from('<I',luts,20)[0]
-    img.put(0x3ece4e2,bytes([initial,0]),'photo LUT default selection and reserved alignment byte',expect=bytes(2))
-    names=[luts[64+i*96+24:64+i*96+88].split(b'\0',1)[0].decode() for i in range(struct.unpack_from('<I',luts,16)[0])]
+    img.put(0x3ece4e2,bytes([initial,0]),'photo LUT default selection and built-in library marker',expect=bytes(2))
+    names=[luts[HEADER+i*ENTRY+24:HEADER+i*ENTRY+88].split(b'\0',1)[0].decode() for i in range(struct.unpack_from('<I',luts,16)[0])]
     menu=add_menu(img,names,symbols)
     menu['default']='Off' if initial==0 else names[initial-1]
     end=STATE_SOURCE+4096

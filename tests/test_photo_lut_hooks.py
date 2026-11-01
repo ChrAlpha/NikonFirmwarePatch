@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from z8photolut.patcher import compile_code,CODE
 from z8photolut import patcher
+from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,runtime_bundle,snapshot_bytes
 
 
 class PhotoLutPrebuiltTests(unittest.TestCase):
@@ -56,7 +57,7 @@ class NativeScheduler:
         m.mem_map(0x40d2b000,4096);m.mem_map(0x40d2e000,4096);m.mem_map(heap,0x10000)
         for at in (self.SLEEP,self.WAIT,self.SET,self.CREATE,self.START,self.EVENT,self.ALLOC,self.FREE):
             m.mem_write(at,bytes.fromhex('c0035fd6'))
-        m.hook_add(UC_HOOK_CODE,self._service)
+        m.hook_add(UC_HOOK_CODE,self._service,begin=0x40d2b000,end=0x40d2dfff)
 
     def task(self,name,cpu,priority,pc,arguments=()):
         context=self.m.context_save()
@@ -429,27 +430,33 @@ class PhotoLutQueueTests(unittest.TestCase):
     STACKS=(0xa03015000,0xa03017800,0xa0301a000,0xa0301c800,0xa0301f000)
 
     def jpeg_fixture(self,selected=1,capacity=None,available=True,jpeg_enabled=True,fail=None,width=8,height=8):
-        from z8photolut.cube import parse,bundle
         m,state,slot,request,stack,original,before,ids=self.fixture()
         rows=['TITLE "Cycle"','LUT_3D_SIZE 2']+['%d %d %d'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1)]
         identity=['TITLE "Identity"','LUT_3D_SIZE 2']+['%d %d %d'%(r,g,b) for b in (0,1) for g in (0,1) for r in (0,1)]
-        data,_=bundle([parse(('\n'.join(rows)+'\n').encode()),parse(('\n'.join(identity)+'\n').encode())],grid=17)
+        data=runtime_bundle([('\n'.join(rows)+'\n').encode(),('\n'.join(identity)+'\n').encode()])
         m.mem_map(0x409a1000,0x1f000);m.mem_write(0x409a0000,data)
         m.mem_map(0x41186000,4096);m.mem_map(0xc10000000,4096)
         m.mem_map(0x41059000,4096);m.mem_map(0x40e82000,4096)
         m.mem_write(0x41186718,struct.pack('<3I',0xd2c00088,0x8b080000,0xd65f03c0))
         m.mem_write(0x4105903c,struct.pack('<2I',0x52800000|(int(jpeg_enabled)<<5),0xd65f03c0))
         owner=0xa03009000;allocation_descriptor=owner+0x1000;raw=0x820000000
-        scratch=8256*5504*2+1920*1080*2+640*480*2+192*120*2+0x3600
-        required=4096+(scratch if selected==1 and jpeg_enabled else 0)+128
+        transform=selected==1 and jpeg_enabled
+        required=4096+(JPEG_STORAGE+snapshot_bytes(17) if transform else 0)+LEASE_BYTES
         if capacity is None:capacity=(required+511)&~511
         m.mem_write(owner+8,struct.pack('<Q',allocation_descriptor))
         m.mem_write(allocation_descriptor,struct.pack('<QI',raw,capacity))
         m.mem_map(raw+0x400000000,8192)
-        footer=raw+0x400000000+capacity-128
-        if footer>=raw+0x400000000+8192:m.mem_map(footer&~4095,4096)
+        # The latched private look grid follows the JPEG scratch.
+        if transform:
+            first=(raw+0x400000000+4096+JPEG_STORAGE)&~4095
+            m.mem_map(first,((raw+0x400000000+4096+JPEG_STORAGE+snapshot_bytes(17)+4095)&~4095)-first)
+        self.snapshot=raw+0x400000000+4096+JPEG_STORAGE
+        footer=raw+0x400000000+capacity-LEASE_BYTES
+        if footer>=raw+0x400000000+8192:
+            try:m.mem_map(footer&~4095,4096)
+            except Exception:pass # Shares the snapshot's last page.
         m.mem_write(0xa03d482ba,bytes([selected]))
-        allocations=[];freed=[];encodes=[];self.encode_log=[]
+        allocations=[];freed=[];encodes=[];self.encode_log=[];self.encode_failures={}
         pixels=width*height
         self.source=bytes([100])*pixels+bytes([100,180])*(pixels//2)
         self.filtered=bytes([71])*pixels+bytes([186,129])*(pixels//2)
@@ -484,9 +491,13 @@ class PhotoLutQueueTests(unittest.TestCase):
                 uc.mem_write(params+0x24,struct.pack('<I',0x12345678))
                 output=int.from_bytes(uc.mem_read(params+0x10,8),'little')
                 uc.mem_write(output+0x10,struct.pack('<I',128+len(encodes)))
+                # Native 40e82090: returns 1 unless its encode start failed; a
+                # result block gets the completion flag in byte0 (40e82250),
+                # then sizes. Here the size word also records the call order.
+                failure=self.encode_failures.get(len(encodes)-1,'')  # by call index
                 result=int.from_bytes(uc.mem_read(params+0x48,8),'little')
-                if result:uc.mem_write(result,struct.pack('<I',len(encodes)))
-                uc.reg_write(regs.UC_ARM64_REG_X0,1)
+                if result:uc.mem_write(result,struct.pack('<B3xI',int(failure!='incomplete'),len(encodes)))
+                uc.reg_write(regs.UC_ARM64_REG_X0,int(failure!='start'))
                 uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
         m.hook_add(UC_HOOK_CODE,native)
         self.call(m,'z8_photo_lut_output_alloc',stack,x0=42,x1=0x38,x2=4096,x3=0xa03000000)
@@ -572,9 +583,27 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
         self.assertEqual(int.from_bytes(m.mem_read(params+0x24,4),'little'),0x12345678)
         self.assertEqual(encodes[0][2],(0x820001000,0x820001040))
-        self.assertEqual(allocations,[(42,0x38,4096+8256*5504*2+1920*1080*2+640*480*2+192*120*2+0x3600+128)])
+        self.assertEqual(allocations,[(42,0x38,4096+JPEG_STORAGE+snapshot_bytes(17)+LEASE_BYTES)])
         self.assertEqual(freed,[]) # The native output owner retains the tail.
         self.assertEqual(int.from_bytes(m.mem_read(footer,8),'little'),0x3154504f4c385a4a)
+
+    def test_applied_status_requires_native_encode_success_and_is_withdrawn_on_retry(self):
+        # Stage bits: 1 main, 2 medium, 4 small, 8 tiny. Native 40e82090 returns
+        # 0 when its encode start fails; a result block records completion.
+        for failure,expected in [('',1),('start',0),('incomplete',0)]:
+            with self.subTest(failure=failure):
+                m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+                result=params+0x400;m.mem_write(params+0x48,struct.pack('<Q',result))
+                self.encode_failures={0:failure} if failure else {}
+                self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
+                self.assertEqual(int.from_bytes(m.mem_read(footer+244,4),'little'),expected)
+        # A later failed encode of the same output withdraws its earlier success.
+        m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
+        self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+244,4),'little'),1)
+        self.encode_failures={1:'start'}
+        self.run_jpeg(m,[('STGJPEGC','z8_photo_lut_jpeg',(0,params))],service=False)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+244,4),'little'),0)
 
     def test_full_surface_work_runs_in_low_priority_worker_while_cpu1_services_progress(self):
         # 64x32 keeps the worker's LUT computation busy for many ticks.
@@ -757,14 +786,14 @@ class PhotoLutQueueTests(unittest.TestCase):
                 m.mem_write(0xa03d482ba,b'\x01')
                 scheduler,jobs,_=self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(1,params))],service=False)
                 self.assertEqual(encodes,[(1,desc,(0x810000000,0x810000040))])
-                self.assertEqual(allocations,[(42,0x38,4224)])
+                self.assertEqual(allocations,[(42,0x38,4096+LEASE_BYTES)])
                 self.assertEqual(struct.unpack('<3Q',m.mem_read(state+40,24)),(1,0,0))
                 self.assertEqual(freed,[])
 
     def test_nef_only_reservation_has_no_unused_full_jpeg_surface(self):
         *_,allocations,freed,encodes,owner,footer=self.jpeg_fixture(jpeg_enabled=False)
         self.assertNotEqual(owner,0)
-        self.assertEqual(allocations,[(42,0x38,4224)])
+        self.assertEqual(allocations,[(42,0x38,4096+LEASE_BYTES)])
         self.assertEqual(encodes,[])
         self.assertEqual(freed,[])
 
@@ -798,7 +827,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         m.mem_write(params+0x48,struct.pack('<Q',original_result))
         private=0x820001000+8256*5504*2+1920*1080*2+640*480*2
         m.mem_map((private+0x400000000)&~4095,8192)
-        lock=footer+96+3*4
+        lock=footer+224+3*4
         m.mem_write(lock,struct.pack('<I',1))
         waited=[]
         def release_other_user(task):
@@ -810,10 +839,10 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(waited,['STGPJPEG'])
         self.assertEqual([row[2] for row in encodes],[(0x810000000,0x810000040),(private,private+64)])
         self.assertEqual(int.from_bytes(m.mem_read(original_output+0x10,4),'little'),129)
-        self.assertEqual(int.from_bytes(m.mem_read(footer+64+0x10,4),'little'),130)
-        self.assertEqual(int.from_bytes(m.mem_read(original_result,4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+192+0x10,4),'little'),130)
+        self.assertEqual(struct.unpack('<B3xI',m.mem_read(original_result,8)),(1,1))
         self.assertEqual(int.from_bytes(m.mem_read(params+0x48,8),'little'),original_result)
-        self.assertEqual(int.from_bytes(m.mem_read(footer+112,4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+240,4),'little'),1)
         self.assertEqual(int.from_bytes(m.mem_read(lock,4),'little'),0)
         self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
         self.assertEqual(bytes(m.mem_read(desc,0x28)),image)
@@ -860,7 +889,8 @@ class PhotoLutQueueTests(unittest.TestCase):
                         valid=success and 0<=target<4
                         for bank in range(5):
                             changed=valid and (bank==target+1 or bank==0 and selected==target)
-                            self.assertEqual(bytes(m.mem_read(0xa03d482b4+bank*0x2e0,8)),b'FOLDER'+bytes([1 if changed else 2,0x5a]))
+                            # A reset selects the active library's default and its tag (built-in: 0).
+                            self.assertEqual(bytes(m.mem_read(0xa03d482b4+bank*0x2e0,8)),b'FOLDER'+(bytes([1,0]) if changed else bytes([2,0x5a])))
                         self.assertEqual(len(saves),1 if valid else 0)
 
 
