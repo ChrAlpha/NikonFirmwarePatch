@@ -1179,6 +1179,8 @@ unsigned z8_photo_lut_file_graph(uint32_t file,uint64_t capture,uint64_t owner,u
  * every Exif offset keep their sizes. Only the per-file header context, its
  * graph and the capture's own lease are consulted; no global state. */
 #define XMP_COMPOSE ((uint32_t (*)(uint32_t,uint32_t,uint64_t,uint32_t,uint64_t))(uintptr_t)0x406e3698)
+/* Native file-id class: low nibble of the packed id, F -> E (leaf). */
+#define FILE_CLASS ((uint32_t (*)(uint32_t))(uintptr_t)0x4086cd48)
 static uint8_t read8(uint64_t p) { return *(volatile const uint8_t *)(uintptr_t)p; }
 
 /* The header builder writes the packet through 0x41186718's translation of
@@ -1202,26 +1204,37 @@ uint32_t z8_photo_lut_xmp(uint32_t kind,uint32_t file,uint64_t settings,uint32_t
     /* Without initialized state nothing, not even telemetry, is written. */
     if(s->magic!=Z8_STATE_MAGIC) return result;
     __atomic_fetch_add(&s->xmp_calls,1,__ATOMIC_RELAXED);
-    s->xmp_last_header=header;s->xmp_last_packet=packet;
+    s->xmp_last_header=header;s->xmp_last_packet=packet;s->xmp_last_kind=kind;s->xmp_last_file=file;
+    s->xmp_last_graph=0;s->xmp_last_lease=~0u;s->xmp_last_choice=0;s->xmp_last_applied=0;
     if(!s->ready) return xmp_skip(Z8_XMP_NOT_READY,result);
-    /* Both callers hand the header builder the graph builder's return as its
-     * dispatch (0x40eb1788..17b0, 0x40eb1dc4..1dec). A JPEG graph (file ids
-     * 0 and 4) returns settings+0x130 ? 4 : 0 (0x40eb1b0c..b24), independently
-     * of the file id; table 0x440c6de8 sends both to this APP1 arm, which
-     * passes composer kind (dispatch==0 ? 0 : 4) (0x406c328c..a4). NEF and
-     * other files stay native. */
-    if((file!=0 && file!=4) || (kind!=0 && kind!=4)) return xmp_skip(Z8_XMP_NOT_JPEG,result);
+    /* File ids are packed (0x4086cd04: bits 29..30, directory at 19, sequence
+     * at 5, type in the low nibble). The graph builder keeps the full id at
+     * graph+0x48 (0x40eb180c) and dispatches on its class 0x4086cd48 (low
+     * nibble, F -> E); classes 0 and 4 are JPEG files, like file_graph's test.
+     * Both callers then hand the header builder the graph return as its
+     * dispatch (0x40eb1788..17b0, 0x40eb1dc4..1dec): a JPEG graph returns
+     * settings+0x130 ? 4 : 0 (0x40eb1b0c..b24) independently of the class;
+     * table 0x440c6de8 sends both to this APP1 arm, which passes composer kind
+     * (dispatch==0 ? 0 : 4) (0x406c328c..a4). NEF and other files stay native. */
+    uint32_t class=FILE_CLASS(file);
+    s->xmp_last_class=class;
+    if((class!=0 && class!=4) || (kind!=0 && kind!=4)) return xmp_skip(Z8_XMP_NOT_JPEG,result);
     if(!cpu_span(header,0x18) || (header&7)) return xmp_skip(Z8_XMP_HEADER,result);
     uint64_t graph=read64(header+0x10);
+    s->xmp_last_graph=graph;
     if(graph!=header-0x48 || !cpu_span(graph,0x50)) return xmp_skip(Z8_XMP_HEADER,result);
     /* The alternate kind0 arm (graph+0x4c = 1, graph+0x00 = owner+0x80) is
      * not an output the LUT hooks touch. */
     if(read8(graph+0x4c)!=0 || read32(graph+0x48)!=file) return xmp_skip(Z8_XMP_BRANCH,result);
     JpegLease lease;volatile JpegLease *storage=0;
-    if(jpeg_lease(read64(graph)-0x38,&lease,&storage)) return xmp_skip(Z8_XMP_LEASE,result);
+    unsigned leased=jpeg_lease(read64(graph)-0x38,&lease,&storage);
+    s->xmp_last_lease=leased;
+    if(leased) return xmp_skip(Z8_XMP_LEASE,result);
+    s->xmp_last_choice=lease.choice;
     if(!lease.choice) return xmp_skip(Z8_XMP_OFF,result);
     if(!packet_span(packet,size)) return xmp_skip(Z8_XMP_PACKET,result);
     uint32_t applied=__atomic_load_n(&storage->applied,__ATOMIC_ACQUIRE);
+    s->xmp_last_applied=applied;
     /* A real look is claimed only for a successful transformed main encode;
      * a no-op look is recorded as such. Anything else writes nothing. */
     if(!lease.identity && !(applied&1)) return xmp_skip(Z8_XMP_NOT_APPLIED,result);

@@ -120,6 +120,9 @@ typedef struct {
      * native, per Z8_XMP_* gate, and the last addresses the hook received. */
     uint32_t xmp_skipped[Z8_XMP_GATES];
     uint64_t xmp_last_header,xmp_last_packet;
+    uint32_t xmp_last_kind,xmp_last_file,xmp_last_class,xmp_last_lease;  /* lease: jpeg_lease result, ~0 unread */
+    uint64_t xmp_last_graph;
+    uint32_t xmp_last_choice,xmp_last_applied;
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)

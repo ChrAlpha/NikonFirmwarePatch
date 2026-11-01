@@ -45,6 +45,19 @@ CONTRACTS={
     'pool predicate 40cdafa0 compares live free units with the configured total':[
         (0x40cdafe4,'bl #0x40cdb020'),(0x40cdb05c,'bl #0x40cdadb8'),
         (0x40cdb088,'cmp w0, w8'),(0x40cdb08c,'cset w0, eq')],
+    'file class 4086cd48 is the packed id low nibble with F mapped to E (photo LUT XMP gate calls it)':[
+        (0x4086cd48,'and w8, w0, #0xf'),(0x4086cd4c,'cmp w8, #0xf'),(0x4086cd50,'mov w9, #0xe'),
+        (0x4086cd54,'csel w0, w9, w8, eq'),(0x4086cd58,'ret ')],
+    'graph builder keeps the full file id at graph+0x48 and dispatches on its class':[
+        (0x40eb17fc,'mov w22, w0'),(0x40eb180c,'str w22, [x19, #0x48]'),(0x40eb1814,'bl #0x4086cd48')],
+    'both callers pass the graph return as header dispatch and graph+0x48 as header ctx':[
+        (0x40eb1784,'bl #0x40eb17e0'),(0x40eb1788,'mov w21, w0'),(0x40eb17a8,'mov w1, w21'),
+        (0x40eb17ac,'add x2, x8, #0x48'),(0x40eb17b0,'bl #0x406cc130'),
+        (0x40eb1dc0,'bl #0x40eb17e0'),(0x40eb1dc4,'mov w22, w0'),(0x40eb1de4,'mov w1, w22'),
+        (0x40eb1de8,'add x2, x8, #0x48'),(0x40eb1dec,'bl #0x406cc130'),(0x406cc130,'b #0x406c31bc')],
+    'JPEG graph returns settings+0x130 ? 4 : 0':[
+        (0x40eb1b0c,'ldrb w8, [x8, #0x130]'),(0x40eb1b1c,'cmp w8, #0'),(0x40eb1b20,'mov w8, #4'),
+        (0x40eb1b24,'csel w0, wzr, w8, eq')],
     'smaller task priority numbers are higher (mutex ceiling E_ILUSE)':[
         (0x40180108,'ldrb w11, [x11, #0x19]'),(0x4018010c,'cmp w10, w11'),(0x40180110,'b.ls #0x40180130'),
         (0x40180114,'mov w0, #-0x1c')],

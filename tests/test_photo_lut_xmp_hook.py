@@ -26,6 +26,8 @@ COMPOSER = 0x406e3698
 PACKET = 0xa12000000                  # General heap
 TRANSLATE = 0x41186718                 # raw address -> CPU (cached) alias, via the boot region table
 GATES = ('not ready', 'not JPEG', 'header', 'branch', 'lease', 'off', 'packet', 'not applied')
+# Native packed file id: constructor (slot, directory, sequence, type), validator, class.
+MAKE_ID, VALID_ID, CLASS_OF = 0x4086cd04, 0x4086cd5c, 0x4086cd48
 SIZE = 33759
 NS = 'https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/'
 RESULT = 0x5a5a
@@ -97,6 +99,21 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         m.emu_start(0x406c328c, 0x406c32a8, count=16)
         return struct.unpack('<I', m.mem_read(sp+0x88, 4))[0]
 
+    def native(self, machine, address, *arguments):
+        m = machine.m
+        for index, value in enumerate(arguments):
+            m.reg_write(getattr(regs, f'UC_ARM64_REG_X{index}'), value)
+        m.reg_write(regs.UC_ARM64_REG_X30, 0x60000000)
+        m.emu_start(address, 0x60000000, count=64)
+        return m.reg_read(regs.UC_ARM64_REG_X0) & 0xffffffff
+
+    def file_id(self, machine, kind=0, slot=0, directory=100, sequence=1):
+        """A file id from the original constructor 0x4086cd04, accepted by validator 0x4086cd5c."""
+        packed = self.native(machine, MAKE_ID, slot, directory, sequence, kind)
+        if kind < 9:
+            self.assertEqual(self.native(machine, VALID_ID, packed), 1)
+        return packed
+
     def hook(self, machine, *arguments):
         # The helper scans a 33 KB packet; allow more than the fixture's cap.
         m = machine.m
@@ -121,19 +138,26 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         calls = struct.unpack('<I', machine.m.mem_read(STATE+layout['xmp_offset']+20, 4))[0]
         skipped = struct.unpack('<8I', machine.m.mem_read(STATE+layout['xmp_skipped_offset'], 32))
         header, packet = struct.unpack('<2Q', machine.m.mem_read(STATE+layout['xmp_skipped_offset']+32, 16))
+        base = STATE+layout['xmp_skipped_offset']+48
+        kind, file_id, klass, lease = struct.unpack('<4I', machine.m.mem_read(base, 16))
+        graph, = struct.unpack('<Q', machine.m.mem_read(base+16, 8))
+        choice, applied = struct.unpack('<2I', machine.m.mem_read(base+24, 8))
+        self.last = dict(kind=kind, file=file_id, klass=klass, lease=lease, graph=graph, choice=choice, applied=applied)
         appended, refused = struct.unpack('<2Q', machine.m.mem_read(STATE+layout['xmp_offset'], 16))
         return dict(calls=calls, skipped={g: n for g, n in zip(GATES, skipped) if n}, header=header, packet=packet,
                     appended=appended, refused=refused)
 
-    def compose(self, machine, file_id=0, graph=JPEG_GRAPH, *, applied=None, kind=None, header=None, packet=PACKET,
-                path=0):
+    def compose(self, machine, file_id=None, graph=JPEG_GRAPH, *, applied=None, kind=None, header=None,
+                packet=PACKET, path=0):
+        file_id = self.file_id(machine) if file_id is None else file_id
         dispatch = machine.graph(file_id, graph)          # original graph builder 0x40eb17e0
         if applied is not None:
             machine.write32(machine.footer+244, applied)
         if kind is None:
             # JPEG files reach the APP1 arm through the original caller chain;
             # any other file is passed its graph dispatch directly as wrapper input.
-            kind = self.composer_kind(machine, dispatch, path) if file_id in (0, 4) else dispatch
+            kind = (self.composer_kind(machine, dispatch, path) if self.native(machine, CLASS_OF, file_id) in (0, 4)
+                    else dispatch)
         if packet != PACKET:
             machine.m.mem_map(packet & ~0xfff, 0x10000)
         result = self.hook(machine, kind, file_id, 0xa03000000, SIZE, packet, graph+0x48 if header is None else header)
@@ -152,9 +176,10 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         return fields
 
     def test_applied_main_and_secondary_jpeg_get_latched_provenance(self):
-        for file_id in (0, 4):
-            with self.subTest(file_id=file_id):
-                packet = self.compose(self.machine(), file_id, applied=1)
+        for kind in (0, 4):
+            with self.subTest(kind=kind):
+                machine = self.machine()
+                packet = self.compose(machine, self.file_id(machine, kind), applied=1)
                 fields = self.provenance(packet)
                 entry = struct.unpack_from('<6I', self.looks, 64+128)
                 samples = self.looks[entry[0]:entry[0]+entry[1]]
@@ -170,12 +195,13 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
 
     def test_every_original_jpeg_producer_combination_is_annotated(self):
         # The JPEG graph returns settings+0x130 ? 4 : 0 (0x40eb1b0c..b24) for
-        # file ids 0 and 4 alike: settings byte x file id x caller path.
+        # JPEG classes 0 and 4 alike: settings byte x class x caller path.
         for setting in (0, 1):
-            for file_id in (0, 4):
+            for kind in (0, 4):
                 for path in (0, 1):
-                    with self.subTest(setting=setting, file_id=file_id, path=path):
+                    with self.subTest(setting=setting, kind=kind, path=path):
                         machine = self.machine()
+                        file_id = self.file_id(machine, kind)
                         machine.m.mem_write(CONFIG+0x130, bytes([setting]))
                         dispatch = machine.graph(file_id, JPEG_GRAPH)
                         self.assertEqual(dispatch, 4 if setting else 0)
@@ -183,6 +209,36 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
                         fields = self.provenance(self.compose(machine, file_id, applied=1, path=path))
                         self.assertEqual(fields['LookName'], NAME)
                         self.assertEqual(self.telemetry(machine)['skipped'], {})
+                        self.assertEqual((self.last['file'], self.last['kind'], self.last['klass']),
+                                         (file_id, dispatch, kind))
+
+    def test_packed_file_ids_are_classified_like_the_native_graph(self):
+        # Realistic (100NCZ_8/DSC_0001: 0x03200020, 0x03200024) and boundary ids.
+        machine = self.machine()
+        self.assertEqual([self.file_id(machine, k) for k in (0, 4)], [0x03200020, 0x03200024])
+        for slot, directory, sequence in ((0, 100, 1), (1, 999, 9999), (0, 100, 9999), (1, 555, 4321)):
+            for kind in (0, 4):
+                for path in (0, 1):
+                    with self.subTest(slot=slot, directory=directory, sequence=sequence, kind=kind, path=path):
+                        machine = self.machine()
+                        file_id = self.file_id(machine, kind, slot, directory, sequence)
+                        self.assertEqual(self.native(machine, CLASS_OF, file_id), kind)
+                        dispatch = machine.graph(file_id, JPEG_GRAPH)
+                        self.assertEqual((dispatch, machine.u32(JPEG_GRAPH+0x48)), (0, file_id))
+                        fields = self.provenance(self.compose(machine, file_id, applied=1, path=path))
+                        self.assertEqual(fields['LookName'], NAME)
+                        self.assertEqual(self.telemetry(machine)['skipped'], {})
+                        self.assertEqual(self.last, dict(kind=0, file=file_id, klass=kind, lease=0, graph=JPEG_GRAPH,
+                                                         choice=2, applied=1))
+        # Other classes never reach the APP1 arm; as direct wrapper input they stay native.
+        for kind, graph, klass in ((2, NEF_GRAPH, 2), (8, JPEG_GRAPH, 8), (15, JPEG_GRAPH, 14)):
+            with self.subTest(kind=kind):
+                machine = self.machine()
+                file_id = self.file_id(machine, kind)
+                self.assertEqual(self.native(machine, VALID_ID, file_id), int(kind < 9))
+                self.assertEqual(self.compose(machine, file_id, graph, applied=1, kind=0), native_packet())
+                self.assertEqual(self.telemetry(machine)['skipped'], {'not JPEG': 1})
+                self.assertEqual((self.last['file'], self.last['klass'], self.last['lease']), (file_id, klass, 0xffffffff))
 
     def test_image_ram_packets_from_the_native_translator_are_annotated(self):
         # The header buffer is image RAM translated by 0x41186718 (0x406c32bc..c8):
@@ -192,7 +248,7 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
                 machine = self.machine()
                 packet = self.translate(machine, raw)
                 self.assertEqual(packet, raw+0x400000000)
-                fields = self.provenance(self.compose(machine, 4, applied=1, packet=packet))
+                fields = self.provenance(self.compose(machine, self.file_id(machine, 4), applied=1, packet=packet))
                 self.assertEqual(fields['LookName'], NAME)
                 self.assertEqual(self.telemetry(machine), dict(calls=1, skipped={}, header=JPEG_GRAPH+0x48,
                                                                  packet=packet, appended=1, refused=0))
@@ -202,10 +258,10 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
             'main encode not applied': (dict(), dict(applied=0), 'not applied'),
             'only a secondary stage applied': (dict(), dict(applied=0b110), 'not applied'),
             'look Off': (dict(choice=0), dict(applied=1), 'off'),
-            'NEF (direct wrapper input: file 2, graph dispatch 1)': (dict(), dict(file_id=2, graph=NEF_GRAPH, applied=1),
-                                                                    'not JPEG'),
+            'NEF (direct wrapper input: graph dispatch 1)': (dict(), dict(kind_of_file=2, graph=NEF_GRAPH, applied=1),
+                                                            'not JPEG'),
             'JPEG file with kind 1 (direct wrapper input)': (dict(), dict(applied=1, kind=1), 'not JPEG'),
-            'JPEG file with kind 3 (direct wrapper input)': (dict(), dict(file_id=4, applied=1, kind=3), 'not JPEG'),
+            'JPEG file with kind 3 (direct wrapper input)': (dict(), dict(kind_of_file=4, applied=1, kind=3), 'not JPEG'),
             'header outside its graph': (dict(), dict(applied=1, header=JPEG_GRAPH+0x50), 'header'),
             'packet past the image alias window': (dict(), dict(applied=1, packet=0xe00000000), 'packet'),
             'packet in raw image RAM': (dict(), dict(applied=1, packet=0x900000000), 'packet'),
@@ -213,7 +269,10 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         for label, (machine_options, compose_options, gate) in cases.items():
             with self.subTest(label=label):
                 machine = self.machine(**machine_options)
-                self.assertEqual(self.compose(machine, **compose_options), native_packet())
+                options = dict(compose_options)
+                if 'kind_of_file' in options:
+                    options['file_id'] = self.file_id(machine, options.pop('kind_of_file'))
+                self.assertEqual(self.compose(machine, **options), native_packet())
                 observed = self.telemetry(machine)
                 self.assertEqual((observed['calls'], observed['skipped'], observed['appended'], observed['refused']),
                                  (1, {gate: 1}, 0, 0))
@@ -231,7 +290,8 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
 
     def test_alternate_kind0_branch_and_foreign_owner_are_not_claimed(self):
         machine = self.machine()
-        machine.graph(0, JPEG_GRAPH)
+        file_id = self.file_id(machine)
+        machine.graph(file_id, JPEG_GRAPH)
         machine.write32(machine.footer+244, 1)
         expected = {}
         for label, gate, mutate in [('alternate branch', 'branch', lambda: machine.m.mem_write(JPEG_GRAPH+0x4c, b'\x01')),
@@ -240,7 +300,7 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
                 saved = bytes(machine.m.mem_read(JPEG_GRAPH, 0x60))
                 mutate()
                 machine.composed.clear()
-                self.hook(machine, 0, 0, 0xa03000000, SIZE, PACKET, JPEG_GRAPH+0x48)
+                self.hook(machine, 0, file_id, 0xa03000000, SIZE, PACKET, JPEG_GRAPH+0x48)
                 self.assertEqual(bytes(machine.m.mem_read(PACKET, SIZE)), native_packet())
                 expected[gate] = 1
                 self.assertEqual(self.telemetry(machine)['skipped'], expected)
@@ -260,7 +320,7 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
             uc.reg_write(regs.UC_ARM64_REG_X0, RESULT)
             uc.reg_write(regs.UC_ARM64_REG_PC, uc.reg_read(regs.UC_ARM64_REG_X30))
         machine.m.hook_add(UC_HOOK_CODE, keep, begin=COMPOSER, end=COMPOSER)
-        self.hook(machine, 0, 0, 0xa03000000, SIZE, PACKET, JPEG_GRAPH+0x48)
+        self.hook(machine, 0, self.file_id(machine), 0xa03000000, SIZE, PACKET, JPEG_GRAPH+0x48)
         self.assertEqual(bytes(machine.m.mem_read(PACKET, SIZE)), first)
 
 
