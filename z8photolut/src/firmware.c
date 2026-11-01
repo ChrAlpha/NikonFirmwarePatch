@@ -60,9 +60,12 @@ static const Z8LookBundle *library_enter(void)
 }
 static void library_exit(void) { __atomic_fetch_sub(&Z8_STATE->card.readers,1,__ATOMIC_RELEASE); }
 
-/* A bank stores its look index and the tag of the library that index
- * belongs to. Any other library makes the selection Off, never a
- * different look at the same position. */
+/* A bank stores its look index and a one-byte library marker: 0 for the
+ * built-in library, nonzero for this power-on's card session library. A
+ * marker that differs from the active library's reads as Off. Within a
+ * session every publication remaps all banks by full transform identity.
+ * The marker is not a persistent identity: every built-in library is 0, so
+ * firmware with different built-in looks needs reselection (docs). */
 static uint32_t selection(const Z8LookBundle *b)
 {
     /* One 16-bit load: index and tag always come from the same store. */
@@ -1201,10 +1204,13 @@ uint32_t z8_photo_lut_xmp(uint32_t kind,uint32_t file,uint64_t settings,uint32_t
     __atomic_fetch_add(&s->xmp_calls,1,__ATOMIC_RELAXED);
     s->xmp_last_header=header;s->xmp_last_packet=packet;
     if(!s->ready) return xmp_skip(Z8_XMP_NOT_READY,result);
-    /* JPEG files have ids 0 and 4; dispatch 0x440c6de8 sends both to this
-     * header arm, which passes composer kind (id==0 ? 0 : 4) (0x406c328c..a4),
-     * so the kind always equals the file id here. NEF and others stay native. */
-    if((file!=0 && file!=4) || kind!=file) return xmp_skip(Z8_XMP_NOT_JPEG,result);
+    /* Both callers hand the header builder the graph builder's return as its
+     * dispatch (0x40eb1788..17b0, 0x40eb1dc4..1dec). A JPEG graph (file ids
+     * 0 and 4) returns settings+0x130 ? 4 : 0 (0x40eb1b0c..b24), independently
+     * of the file id; table 0x440c6de8 sends both to this APP1 arm, which
+     * passes composer kind (dispatch==0 ? 0 : 4) (0x406c328c..a4). NEF and
+     * other files stay native. */
+    if((file!=0 && file!=4) || (kind!=0 && kind!=4)) return xmp_skip(Z8_XMP_NOT_JPEG,result);
     if(!cpu_span(header,0x18) || (header&7)) return xmp_skip(Z8_XMP_HEADER,result);
     uint64_t graph=read64(header+0x10);
     if(graph!=header-0x48 || !cpu_span(graph,0x50)) return xmp_skip(Z8_XMP_HEADER,result);

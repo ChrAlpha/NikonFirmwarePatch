@@ -12,7 +12,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from photo_lut_fixtures import LEASE_BYTES, runtime_bundle
-from test_photo_lut_native_graph import (CAPTURE, CompiledGraphMachine, JPEG_GRAPH, NEF_GRAPH, OWNER, STATE,
+from test_photo_lut_native_graph import (CAPTURE, CONFIG, CompiledGraphMachine, JPEG_GRAPH, NEF_GRAPH, OWNER, STATE,
                                          PinnedRomTestCase, Uc, compile_code)
 from z8photolut.library import look_id
 
@@ -75,11 +75,23 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         machine.m.hook_add(UC_HOOK_CODE, compose, begin=COMPOSER, end=COMPOSER)
         return machine
 
-    def composer_kind(self, machine, file_id):
-        """Execute 0x406c328c..0x406c32a4 of header builder 0x406c31bc (w21 = dispatch index)."""
+    def composer_kind(self, machine, dispatch, path=0):
+        """Feed an original JPEG graph return through the original caller and header code.
+
+        Caller path 0: 0x40eb1788 mov w21,w0 ... 0x40eb17a8 mov w1,w21 -> header;
+        path 1: 0x40eb1dc4 mov w22,w0 ... 0x40eb1de4 mov w1,w22 -> header. The
+        header builder 0x406c31bc keeps it (0x406c31e8 mov w21,w1), branches
+        through table 0x440c6de8 (0x406c3250..0x406c3270), which must reach the
+        APP1 arm 0x406c3274, and sets the composer kind at 0x406c328c..0x406c32a4."""
         m, sp = machine.m, 0x500f0000
+        first, second = ((0x40eb1788, 0x40eb17a8), (0x40eb1dc4, 0x40eb1de4))[path]
+        m.reg_write(regs.UC_ARM64_REG_X0, dispatch)
+        m.emu_start(first, first+4, count=1)
+        m.emu_start(second, second+4, count=1)
+        m.emu_start(0x406c31e8, 0x406c31ec, count=1)
+        m.emu_start(0x406c3250, 0x406c3274, count=9)          # cmp, b.hi, table load, br
+        self.assertEqual(m.reg_read(regs.UC_ARM64_REG_PC), 0x406c3274)
         m.reg_write(regs.UC_ARM64_REG_SP, sp)
-        m.reg_write(regs.UC_ARM64_REG_X21, file_id)
         m.reg_write(regs.UC_ARM64_REG_X27, PACKET+0x9000)
         m.mem_write(sp+0x88, b'\xff'*4)
         m.emu_start(0x406c328c, 0x406c32a8, count=16)
@@ -113,14 +125,15 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         return dict(calls=calls, skipped={g: n for g, n in zip(GATES, skipped) if n}, header=header, packet=packet,
                     appended=appended, refused=refused)
 
-    def compose(self, machine, file_id=0, graph=JPEG_GRAPH, *, applied=None, kind=None, header=None, packet=PACKET):
-        native_kind = machine.graph(file_id, graph)
+    def compose(self, machine, file_id=0, graph=JPEG_GRAPH, *, applied=None, kind=None, header=None, packet=PACKET,
+                path=0):
+        dispatch = machine.graph(file_id, graph)          # original graph builder 0x40eb17e0
         if applied is not None:
             machine.write32(machine.footer+244, applied)
-        # The JPEG header arm derives the composer kind from its dispatch index
-        # (the file id): run that original prefix. NEF never reaches this arm.
         if kind is None:
-            kind = self.composer_kind(machine, file_id) if file_id in (0, 4) else native_kind
+            # JPEG files reach the APP1 arm through the original caller chain;
+            # any other file is passed its graph dispatch directly as wrapper input.
+            kind = self.composer_kind(machine, dispatch, path) if file_id in (0, 4) else dispatch
         if packet != PACKET:
             machine.m.mem_map(packet & ~0xfff, 0x10000)
         result = self.hook(machine, kind, file_id, 0xa03000000, SIZE, packet, graph+0x48 if header is None else header)
@@ -155,9 +168,21 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
                 at = original.index(b'</rdf:RDF>')
                 self.assertEqual(packet[:at], original[:at])
 
-    def test_original_header_prefix_gives_composer_kind_equal_to_file_id(self):
-        machine = self.machine()
-        self.assertEqual([self.composer_kind(machine, f) for f in (0, 4)], [0, 4])
+    def test_every_original_jpeg_producer_combination_is_annotated(self):
+        # The JPEG graph returns settings+0x130 ? 4 : 0 (0x40eb1b0c..b24) for
+        # file ids 0 and 4 alike: settings byte x file id x caller path.
+        for setting in (0, 1):
+            for file_id in (0, 4):
+                for path in (0, 1):
+                    with self.subTest(setting=setting, file_id=file_id, path=path):
+                        machine = self.machine()
+                        machine.m.mem_write(CONFIG+0x130, bytes([setting]))
+                        dispatch = machine.graph(file_id, JPEG_GRAPH)
+                        self.assertEqual(dispatch, 4 if setting else 0)
+                        self.assertEqual(self.composer_kind(machine, dispatch, path), dispatch)
+                        fields = self.provenance(self.compose(machine, file_id, applied=1, path=path))
+                        self.assertEqual(fields['LookName'], NAME)
+                        self.assertEqual(self.telemetry(machine)['skipped'], {})
 
     def test_image_ram_packets_from_the_native_translator_are_annotated(self):
         # The header buffer is image RAM translated by 0x41186718 (0x406c32bc..c8):
@@ -177,9 +202,10 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
             'main encode not applied': (dict(), dict(applied=0), 'not applied'),
             'only a secondary stage applied': (dict(), dict(applied=0b110), 'not applied'),
             'look Off': (dict(choice=0), dict(applied=1), 'off'),
-            'NEF': (dict(), dict(file_id=2, graph=NEF_GRAPH, applied=1), 'not JPEG'),
-            'non-JPEG kind': (dict(), dict(applied=1, kind=1), 'not JPEG'),
-            'kind unlike its file id': (dict(), dict(file_id=4, applied=1, kind=0), 'not JPEG'),
+            'NEF (direct wrapper input: file 2, graph dispatch 1)': (dict(), dict(file_id=2, graph=NEF_GRAPH, applied=1),
+                                                                    'not JPEG'),
+            'JPEG file with kind 1 (direct wrapper input)': (dict(), dict(applied=1, kind=1), 'not JPEG'),
+            'JPEG file with kind 3 (direct wrapper input)': (dict(), dict(file_id=4, applied=1, kind=3), 'not JPEG'),
             'header outside its graph': (dict(), dict(applied=1, header=JPEG_GRAPH+0x50), 'header'),
             'packet past the image alias window': (dict(), dict(applied=1, packet=0xe00000000), 'packet'),
             'packet in raw image RAM': (dict(), dict(applied=1, packet=0x900000000), 'packet'),
