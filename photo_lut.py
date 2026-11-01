@@ -49,7 +49,7 @@ def show(library, as_json):
         print(json.dumps(details, ensure_ascii=False, indent=2))
         return
     print(f'Library {details["library_id"][:16]}  runtime {details["runtime_bytes"]}/{details["runtime_limit"]} bytes  '
-          f'default: {details["default_name"]}')
+          f'default when embedded: {details["default_name"]}')
     print(f'Input basis: {INPUT_BASIS} (camera-rendered SDR JPEG values)')
     for i, look in enumerate(details['looks'], 1):
         notes = [f'grid {look["grid"]}', f'id {look["id"][:16]}', f'source {look["source_name"]}']
@@ -226,7 +226,7 @@ def parser():
     c = actions.add_parser('move', help='Move a look to a position (identity unchanged)')
     c.add_argument('library', type=Path);c.add_argument('look', **look);c.add_argument('position', type=int)
     c = actions.add_parser('remove', help='Remove a look (an empty library clears the camera looks)');c.add_argument('library', type=Path);c.add_argument('look', **look)
-    c = actions.add_parser('default', help='Set the selection a bank reset returns to')
+    c = actions.add_parser('default', help='Set the default used when this library is embedded in firmware')
     c.add_argument('library', type=Path);c.add_argument('look', help='off, or a look')
     c = actions.add_parser('export', help='Write a look as a new .cube file')
     c.add_argument('library', type=Path);c.add_argument('look', **look);c.add_argument('output', type=Path)

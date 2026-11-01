@@ -99,6 +99,9 @@ class BankRecordLifecycleTests(unittest.TestCase):
         self.alloc_failures, self.fail_program = 0, False
         self.copy_events, self.wait_events, self.cleared = [], [], []
         self.wait_bits, self.wait_status = 0, -1
+        self.pause_wait = False
+        self.section15_attempts, self.other_events = [], []
+        self.allow_unread_shutdown = False
         m.hook_add(UC_HOOK_CODE, self.native)
         return m
 
@@ -118,9 +121,19 @@ class BankRecordLifecycleTests(unittest.TestCase):
                     u.reg_write(regs.UC_ARM64_REG_PC, pc+4)
                     return
         if pc in (0x4017bb8c, 0x4017c040):
+            if self.pause_wait:
+                u.emu_stop(); return
             self.wait_events.append((pc, x(0), x(1), x(2), x(4) if pc == 0x4017c040 else None))
             if self.wait_status == 0: u.mem_write(x(3), struct.pack('<I', self.wait_bits))
             value = self.wait_status & ((1 << 64)-1)
+        elif pc == 0x40d6cafc:
+            status = self.status()
+            self.section15_attempts.append(status)
+            if not self.allow_unread_shutdown:
+                self.assertEqual(status[2:], (1, 1), 'record must be decided before section15 serialization')
+            value = 1
+        elif pc == 0x41017c38:
+            self.other_events.append(pc)
         elif pc == 0x40d2bcc8:
             self.cleared.append(x(1)); value = 1
         elif pc in PASS or pc in (REPLY, SLEEP, FREE):
@@ -155,14 +168,16 @@ class BankRecordLifecycleTests(unittest.TestCase):
         u.reg_write(regs.UC_ARM64_REG_X0, value)
         u.reg_write(regs.UC_ARM64_REG_PC, x(30))
 
-    def call(self, address, *arguments, stop=STOP, stack_fill=None):
+    def call(self, address, *arguments, stop=STOP, stack_fill=None, stack=STACK):
         if stack_fill is not None:
             self.m.mem_write(STACK-0x8000, bytes([stack_fill])*0x8000)
-        self.m.reg_write(regs.UC_ARM64_REG_SP, STACK)
+        self.m.reg_write(regs.UC_ARM64_REG_SP, stack)
         self.m.reg_write(regs.UC_ARM64_REG_X30, stop)
         for index, value in enumerate(arguments):
             self.m.reg_write(getattr(regs, f'UC_ARM64_REG_X{index}'), value)
-        self.m.emu_start(address, stop, count=50_000_000)
+        hook = self.m.hook_add(UC_HOOK_CODE, lambda u, pc, size, data: u.emu_stop() if pc == stop else None)
+        try: self.m.emu_start(address, stop, count=50_000_000)
+        finally: self.m.hook_del(hook)
         self.assertEqual(self.m.reg_read(regs.UC_ARM64_REG_PC), stop)
         return self.m.reg_read(regs.UC_ARM64_REG_X0)
 
@@ -172,11 +187,22 @@ class BankRecordLifecycleTests(unittest.TestCase):
 
     def settings_restored(self, **fill):
         # S1 at 0x4101248c: the native section-15 restore has finished.
-        self.call(self.symbols['z8_photo_lut_settings_restored'], 0x4c01, 0, 1, 0, 0xbe, **fill)
+        self.call(0x4101248c, 0x4c01, 0, 1, 0, 0xbe, stop=0x41012490, **fill)
 
-    def mode4(self, **fill):
-        # The native settings callback that loads blob 16 (guard, read, defaults, loaded).
+    def native_mode4(self, **fill):
         self.call(0x410129d4, 4, **fill)
+
+    def restore_tail(self, **fill):
+        event, bits = BUFFER+0x19000, BUFFER+0x19010
+        self.m.mem_write(event, struct.pack('<i', 27))
+        self.call(self.symbols['z8_photo_lut_settings_wait'], event, 0x1733, bits, **fill)
+
+    def prepare_private(self, order='s1-first', **fill):
+        for step in ([self.settings_restored, self.native_mode4] if order == 's1-first'
+                     else [self.native_mode4, self.settings_restored]):
+            step(**fill)
+        self.boot(**fill)
+        self.saves.clear()       # baseline native wake is separately checked by late-bootstrap tests
 
     def store(self, **fill):
         # The group-0x31 store of the native save producer, through our call site.
@@ -231,18 +257,181 @@ class BankRecordLifecycleTests(unittest.TestCase):
         """Stock-written region (non-default prefix, no record) seen by this firmware."""
         self.machine()
         self.stock_write(self.prefix)
-        self.boot()
-        steps = [self.settings_restored, self.mode4] if order == 's1-first' else [self.mode4, self.settings_restored]
-        for step in steps:
-            step(**({} if fill is None else dict(stack_fill=fill)))
+        self.prepare_private(order, **({} if fill is None else dict(stack_fill=fill)))
+        self.restore_tail(**({} if fill is None else dict(stack_fill=fill)))
 
     def reboot(self, nor, *, order='s1-first', **options):
         self.machine(nor, **options)
-        self.boot()
-        for step in [self.settings_restored, self.mode4] if order == 's1-first' else [self.mode4, self.settings_restored]:
-            step()
+        self.prepare_private(order)
+        self.restore_tail()
+
+    def native_dispatch(self, bits, *, start=0x41012918, stop=0x410129c4):
+        self.m.mem_write(BUFFER+0x19000, struct.pack('<i', 27))
+        self.wait_bits, self.wait_status = bits, 0
+        for reg, value in ((19, BUFFER+0x19000), (20, 0x1733), (21, 0xa03bddcc9),
+                           (22, 0xa03bddd18), (23, 0xa03bddd10)):
+            self.m.reg_write(getattr(regs, f'UC_ARM64_REG_X{reg}'), value)
+        if start == stop:
+            visited = []
+            def completed(u, pc, size, data):
+                if pc == start:
+                    if visited:
+                        u.reg_write(regs.UC_ARM64_REG_PC, STOP); u.emu_stop()
+                    visited.append(pc)
+            hook = self.m.hook_add(UC_HOOK_CODE, completed)
+            try: self.call(start)
+            finally: self.m.hook_del(hook)
+        else: self.call(start, stop=stop)
 
     # ---- cases ---------------------------------------------------------
+    def test_late_bootstrap_reads_before_native_save_and_preserves_live_prefix(self):
+        self.first_boot(); self.store()
+        self.machine(self.nor(), owned=(0xffff,)*5)
+        self.settings_restored(); self.native_mode4(); self.boot()
+        live = bytes((i*13+71) & 255 for i in range(STOCK_BYTES))
+        self.m.mem_write(BLOB, live)             # native changes after its prefix read
+        self.ops.clear()
+        self.native_dispatch(0x1000)
+        self.assertEqual(self.status(), ('stored', 'valid', 1, 1))
+        self.assertEqual(len(self.section15_attempts), 1)
+        self.assertEqual(self.stored(), (live, record_bytes([self.ids[1]]*4)))
+
+    def test_native_defaults_before_late_boot_discard_an_older_valid_tail(self):
+        self.first_boot(); self.store()
+        self.m.mem_write(STATE+self.layout['persist_offset'], record_bytes([self.ids[0]]*4, 1)); self.store()
+        self.machine(self.nor(), owned=(0,)*5, restored_ok=0)
+        self.call(0x41016a60, stop=0x41016a64)
+        self.settings_restored(); self.native_mode4(); self.boot()
+        self.restore_tail()
+        self.assertEqual(self.status(), ('defaults', 'valid', 1, 1))
+        self.assertEqual(self.record(), record_bytes([self.ids[1]]*4))
+
+    def test_wait_blocked_before_private_boot_initializes_in_its_continuation(self):
+        self.first_boot(); self.store()
+        self.machine(self.nor(), owned=(0xffff,)*5)
+        self.settings_restored()
+        event, bits = BUFFER+0x19000, BUFFER+0x19010
+        self.m.mem_write(event, struct.pack('<i', 27))
+        self.pause_wait = True
+        self.m.reg_write(regs.UC_ARM64_REG_SP, STACK)
+        self.m.reg_write(regs.UC_ARM64_REG_X30, STOP)
+        for index, arg in enumerate((event, 0x1733, bits)):
+            self.m.reg_write(getattr(regs, f'UC_ARM64_REG_X{index}'), arg)
+        self.m.emu_start(self.symbols['z8_photo_lut_settings_wait'], STOP, count=1000000)
+        self.assertEqual(self.m.reg_read(regs.UC_ARM64_REG_PC), 0x4017bb8c)
+        waiting = self.m.context_save()
+        self.native_mode4(stack=STACK-0x10000); self.boot(stack=STACK-0x10000)
+        self.m.context_restore(waiting); self.pause_wait = False
+        self.wait_bits, self.wait_status = 0x1000, 0
+        self.m.emu_start(self.m.reg_read(regs.UC_ARM64_REG_PC), STOP, count=50000000)
+        self.assertEqual(self.m.reg_read(regs.UC_ARM64_REG_PC), STOP)
+        self.assertEqual(self.status(), ('stored', 'valid', 1, 1))
+        self.assertEqual(self.m.mem_read(bits, 4), struct.pack('<I', 0x1000))
+        self.assertEqual(self.ops, [])
+
+    def test_early_save_defers_only_save_and_cannot_erase_a_private_tail(self):
+        self.first_boot(); self.store()
+        nor = self.nor()
+        self.machine(nor, owned=(0xffff,)*5)
+        self.settings_restored(); self.native_mode4()
+        live = bytes(reversed(self.prefix)); self.m.mem_write(BLOB, live)
+        # Direct original producer continues after guarded blob16 failure.
+        self.call(0x41012538, stop=0x41012560)
+        self.assertEqual(self.nor(), nor)
+        self.native_dispatch(0x1100, stop=0x41012918)
+        self.assertEqual(self.other_events, [0x41017c38])
+        self.assertEqual(self.section15_attempts, [])
+        self.assertEqual(self.nor(), nor)
+        self.boot(); self.native_dispatch(0x1000)
+        self.assertEqual(self.stored(), (live, record_bytes([self.ids[1]]*4)))
+
+    def test_preboot_native_no_save_completion_is_acknowledged_without_serialization(self):
+        self.machine()
+        self.m.mem_write(0xa03bddcc9, bytes([1]))
+        self.m.mem_write(0xa03bddd18, struct.pack('<Q', 1))
+        self.m.mem_write(0xa03bddd10, bytes([1]))
+        self.native_dispatch(0x1000, stop=0x410129d0)
+        self.assertEqual(self.m.mem_read(0xa03bddd10, 1), bytes(1))
+        self.assertEqual(self.section15_attempts, [])
+        self.assertEqual(self.ops, [])
+
+    def test_oom_defers_and_replays_save_once_with_other_native_events_intact(self):
+        self.first_boot(); self.store()
+        self.machine(self.nor(), owned=(0xffff,)*5)
+        self.prepare_private()
+        self.alloc_failures = 10000
+        self.native_dispatch(0x1100, stop=0x41012918)
+        self.assertEqual(self.other_events, [0x41017c38])
+        self.assertEqual(self.section15_attempts, [])
+        self.assertEqual(self.ops, [])
+        self.m.mem_write(0xa03bddcc9, bytes([1]))
+        self.m.mem_write(0xa03bddd18, struct.pack('<Q', 1))
+        self.m.mem_write(0xa03bddd10, bytes([1]))
+        self.native_dispatch(0x1000, stop=0x410129d0)
+        self.assertEqual(self.m.mem_read(0xa03bddd10, 1), bytes(1))
+        self.assertEqual(self.section15_attempts, [])
+        self.choose_off()
+        self.alloc_failures = 0
+        # Even after tail recovery, no-save acknowledgments cannot consume
+        # the held real save demand or spin on repeated immediate replays.
+        self.m.mem_write(0xa03bddd10, bytes([1]))
+        self.native_dispatch(0x1000, stop=0x410129d0)
+        self.assertEqual(self.section15_attempts, [])
+        self.assertEqual(self.wait_events[-1][0], 0x4017c040)
+        self.m.mem_write(0xa03bddcc9, bytes([0]))
+        self.native_dispatch(0)                  # held SAVE replay, no new incoming event
+        self.assertEqual(len(self.section15_attempts), 1)
+        self.assertEqual(self.stored()[1], record_bytes([None]+[self.ids[1]]*3))
+        self.wait_bits = 0
+        self.restore_tail()
+        self.assertEqual(len(self.section15_attempts), 1)
+
+    def test_persistent_oom_power_down_saves_stock_and_preserves_previous_private_commit(self):
+        self.first_boot(); self.store()
+        previous = self.nor()
+        self.machine(previous, owned=(0xffff,)*5)
+        self.prepare_private(); self.choose_off()
+        self.alloc_failures = 10000
+        self.m.mem_write(STATE+self.layout['preview_offset']+self.layout['power_paused_offset'], struct.pack('<I', 1))
+        self.allow_unread_shutdown = True
+        self.native_dispatch(0x1000)
+        self.assertEqual(len(self.section15_attempts), 1)
+        self.assertEqual(self.nor(), previous)   # latest unsavable Off is not claimed persisted
+        self.assertEqual(self.ops, [])
+        self.assertEqual(self.wait_events[-1][0], 0x4017bb8c)  # native shutdown wait, no periodic poll
+
+    def test_delayed_native_loaded_flag_recovers_without_another_menu_or_event(self):
+        self.first_boot(); self.store()
+        self.machine(self.nor(), owned=(0xffff,)*5)
+        self.settings_restored(); self.boot()
+        self.restore_tail()
+        self.assertEqual(self.u32('blob_reads'), 0)
+        self.assertEqual(self.wait_events[-1][0], 0x4017c040)
+        self.native_mode4(); self.restore_tail()
+        self.assertEqual(self.status(), ('stored', 'valid', 1, 1))
+
+    def test_warm_preparation_quarantines_old_handles_and_retains_or_resets_intent(self):
+        self.first_boot(); self.store()
+        self.m.mem_write(STATE+self.layout['persist_offset'], record_bytes([None]*4, 1))
+        prior = bytes(self.m.mem_read(STATE, 0x1000)); nor = self.nor()
+        for reset in (False, True):
+            with self.subTest(reset=reset):
+                self.machine(nor, owned=(0xffff,)*5, state=prior, loaded=1, restored_ok=0)
+                # Poison old handles: any accidental wake would hit unmapped memory.
+                preview = STATE+self.layout['preview_offset']
+                self.m.mem_write(preview+128, struct.pack('<Q', 0xdead00000))
+                self.m.mem_write(preview+140, struct.pack('<I', 1))
+                card = STATE+self.layout['card_offset']
+                self.m.mem_write(card+48, struct.pack('<Q', 0xbeef00000))
+                self.m.mem_write(card+60, struct.pack('<I', 1))
+                if reset: self.call(0x41016a60, stop=0x41016a64)
+                self.native_mode4()             # native-only even before S1 marker
+                self.settings_restored()
+                self.assertEqual(self.saves, [])
+                self.assertEqual(self.heap, HEAP)
+                self.boot(); self.restore_tail()
+                self.assertEqual(self.record(), record_bytes([self.ids[1]]*4) if reset else record_bytes([None]*4, 1))
+
     def test_first_upgrade_in_either_order_stores_the_default_after_the_stock_bytes(self):
         for order in ('s1-first', 'mode4-first'):
             with self.subTest(order=order):
@@ -290,13 +479,13 @@ class BankRecordLifecycleTests(unittest.TestCase):
         self.assertEqual(self.store() & 1, 1)
         nor = self.nor()
         self.machine(nor, owned=(0xffff,)*5, bank=0)
-        self.boot(); self.settings_restored()
+        self.prepare_private()
         # The stored region is not read yet: bank B is reset natively; nothing
         # is known about A, C or D and nothing may be stored.
         self.reset_bank(11)
         self.assertEqual(self.status(), ('none', 'pending', 0, 0))
         self.assertEqual(self.saves, [])
-        self.mode4(stack_fill=0xa5)
+        self.restore_tail(stack_fill=0xa5)
         merged = list(stored); merged[1] = self.ids[1]
         self.assertEqual(self.status(), ('stored', 'valid', 1, 1))
         self.assertEqual(self.record(), record_bytes(merged))
@@ -309,13 +498,13 @@ class BankRecordLifecycleTests(unittest.TestCase):
         nor = self.nor()
         # Every allocation for the read fails: the stock bytes load, the record is not read.
         self.machine(nor, owned=(0xffff,)*5)
-        self.boot(); self.settings_restored()
+        self.prepare_private()
         self.alloc_failures = 10_000
-        self.mode4()
+        self.restore_tail()
         self.alloc_failures = 0
-        self.assertEqual(self.status(), ('unread', 'unread', 1, 0))
+        self.assertEqual(self.status(), ('none', 'unread', 0, 0))
         self.assertEqual(bytes(self.m.mem_read(BLOB, STOCK_BYTES)), self.prefix)
-        self.assertEqual(self.record(), record_bytes(['unresolved']*4))
+        self.assertEqual(self.record(), bytes(RECORD_BYTES))
         self.assertEqual(self.saves, [])
         # A later store first reads the region; it succeeds now and merges.
         self.reset_bank(12)
@@ -325,9 +514,9 @@ class BankRecordLifecycleTests(unittest.TestCase):
         self.assertEqual(self.stored(), (self.prefix, record_bytes(merged)))
         # If that read fails too, the store is refused and the region kept.
         self.machine(self.nor(), owned=(0xffff,)*5)
-        self.boot(); self.settings_restored()
+        self.prepare_private()
         self.alloc_failures = 10_000
-        self.mode4()
+        self.restore_tail()
         before = self.nor()
         self.assertEqual(self.store() & 1, 0)
         self.assertEqual(self.nor(), before)
@@ -335,9 +524,9 @@ class BankRecordLifecycleTests(unittest.TestCase):
     def test_off_during_unread_restore_is_merged_on_actual_recovery(self):
         self.first_boot(); self.store()
         self.machine(self.nor(), owned=(0xffff,)*5, bank=2)
-        self.boot(); self.settings_restored()
+        self.prepare_private()
         self.alloc_failures = 10_000
-        self.mode4()
+        self.restore_tail()
         self.choose_off()
         self.assertEqual(self.saves, [])
         self.alloc_failures = 0
@@ -403,9 +592,9 @@ class BankRecordLifecycleTests(unittest.TestCase):
         for unread in (False, True):
             with self.subTest(unread=unread):
                 self.machine(nor, owned=(0xffff,)*5)
-                self.boot(); self.settings_restored()
+                self.prepare_private()
                 if unread:
-                    self.alloc_failures = 10000; self.mode4(); self.alloc_failures = 0
+                    self.alloc_failures = 10000; self.restore_tail(); self.alloc_failures = 0
                 self.saves.clear()
                 self.assertEqual(self.copy_bank(0, 1), 1)     # B snapshots original A, identity not read yet
                 self.choose_off()                           # A now Off, B must retain the old original A
@@ -415,7 +604,7 @@ class BankRecordLifecycleTests(unittest.TestCase):
                 self.reset_bank(11)                          # later B default must not retarget D
                 self.assertEqual(self.saves, [])
                 if unread: self.store()                      # actual read recovers and merges deferred copies
-                else: self.mode4()
+                else: self.restore_tail()
                 expected = [None, self.ids[1], original[0], None]
                 self.assertEqual(self.record(), record_bytes(expected))
                 self.store()
@@ -455,6 +644,7 @@ class BankRecordLifecycleTests(unittest.TestCase):
                 self.m.mem_write(STATE+self.layout['preview_offset']+self.layout['power_paused_offset'], struct.pack('<I', int(paused)))
                 self.m.mem_write(BUFFER, struct.pack('<i', 28))
                 self.wait_bits, self.wait_status = 0x20, 0
+                self.wait_events.clear()
                 self.call(self.symbols['z8_photo_lut_settings_wait'], BUFFER, 0x1733, BUFFER+8)
                 self.assertEqual(self.wait_events, [(0x4017bb8c, 28, 0x1733, 1, None)])
                 self.assertEqual(self.m.mem_read(BUFFER+8, 4), struct.pack('<I', 0x20))
@@ -465,7 +655,7 @@ class BankRecordLifecycleTests(unittest.TestCase):
                                                 ((0xffff,)*5, 'lost', ['unresolved']*4, [])]:
             with self.subTest(source=source):
                 self.machine(owned=owned)                 # both vol16 regions erased: no valid region
-                self.boot(); self.settings_restored(); self.mode4(stack_fill=0x5a)
+                self.prepare_private(); self.restore_tail(stack_fill=0x5a)
                 self.assertEqual(self.status(), (source, 'lost', 1, 1))
                 self.assertEqual(self.record(), record_bytes(expected))
                 self.assertEqual(self.saves, stores)
@@ -482,7 +672,7 @@ class BankRecordLifecycleTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.machine(owned=owned, bank=1)
                 self.stock_write(self.prefix)
-                self.boot(stack_fill=0xa5); self.settings_restored(stack_fill=0x5a); self.mode4(stack_fill=0xff)
+                self.prepare_private(stack_fill=0xa5); self.restore_tail(stack_fill=0xff)
                 self.assertEqual(self.status()[0], source)
                 self.assertEqual(self.record(), record_bytes(expected))
                 self.store(stack_fill=0xa5)
@@ -491,13 +681,16 @@ class BankRecordLifecycleTests(unittest.TestCase):
                 self.assertEqual(self.status(), ('stored', 'valid', 1, 1))
                 self.assertEqual(self.record(), record_bytes(expected))
 
-    def test_migration_never_names_a_look(self):
-        # Copy 0 is the selected bank B's latest pair; copies 1..4 are A..D.
-        self.machine(owned=(0x0200, 0x0101, 0x0000, 0x0000, 0x0302), bank=1)
-        self.stock_write(self.prefix)
-        self.boot(); self.settings_restored(); self.mode4()
-        self.assertEqual(self.status(), ('migrated', 'absent', 1, 1))
-        self.assertEqual(self.record(), record_bytes(['unresolved', 'unresolved', None, 'unresolved']))
+    def test_migration_never_names_a_look_and_preserves_tagged_off(self):
+        # Copy 0 is selected B's latest pair. Its low byte is Off even when
+        # a prior card session left a nonzero high-byte library tag.
+        for tagged_off in (0x0200, 0xff00):
+            with self.subTest(tagged_off=hex(tagged_off)):
+                self.machine(owned=(tagged_off, 0x0101, 0x0000, 0x0000, 0x0302), bank=1)
+                self.stock_write(self.prefix)
+                self.prepare_private(); self.restore_tail()
+                self.assertEqual(self.status(), ('migrated', 'absent', 1, 1))
+                self.assertEqual(self.record(), record_bytes(['unresolved', None, None, 'unresolved']))
 
     def test_stock_round_trip_erases_the_record_and_reads_as_lost(self):
         self.first_boot(); self.store()
@@ -524,7 +717,7 @@ class BankRecordLifecycleTests(unittest.TestCase):
         self.first_boot(); self.store()
         first = self.nor()
         self.machine(first, owned=(0xffff,)*5)
-        self.boot(); self.settings_restored(); self.mode4()
+        self.prepare_private(); self.restore_tail()
         self.reset_bank(10)
         self.m.mem_write(STATE+self.layout['persist_offset'], record_bytes([self.ids[2]]*4))
         self.fail_program = True                     # body program never completes: no marker
@@ -539,13 +732,13 @@ class BankRecordLifecycleTests(unittest.TestCase):
         retained = bytes(self.m.mem_read(STATE, 0x1000))
         nor = self.nor()
         self.machine(nor, owned=(0xffff,)*5, state=retained, loaded=1)
-        self.boot(); self.mode4(); self.settings_restored()
+        self.prepare_private(); self.restore_tail()
         self.assertEqual(self.status(), ('retained', 'skipped', 1, 1))
         self.assertEqual(self.record(), record_bytes([self.ids[1]]*4))
-        # Without a retained record nothing is known and nothing is stored.
+        # Without a retained record bootstrap reads the actual tail instead.
         self.machine(nor, owned=(0xffff,)*5, loaded=1)
-        self.boot(); self.mode4(); self.settings_restored()
-        self.assertEqual(self.status(), ('unread', 'skipped', 1, 0))
+        self.prepare_private(); self.restore_tail()
+        self.assertEqual(self.status(), ('stored', 'valid', 1, 1))
         self.assertEqual(self.saves, [])
 
     def test_native_defaults_reset_every_bank(self):

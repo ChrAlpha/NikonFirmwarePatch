@@ -24,7 +24,7 @@ python photo_lut.py library list looks.bin                          # 顺序、�
 python photo_lut.py library rename looks.bin "胶片 A" "胶片 B"
 python photo_lut.py library move looks.bin "胶片 B" 1
 python photo_lut.py library remove looks.bin 2                      # 可删到空库
-python photo_lut.py library default looks.bin off                   # 菜单库重置时的选择
+python photo_lut.py library default looks.bin off                   # 内置此库时的默认选择
 python photo_lut.py library export looks.bin 1 原始.cube --source    # 与导入时逐字节相同
 python photo_lut.py library export looks.bin 1 运行.cube --runtime   # 相机实际应用的重采样网格
 python photo_lut.py library verify looks.bin                        # 从原始 .cube 重新推导并核对（较慢）
@@ -42,7 +42,7 @@ python photo_lut.py library verify looks.bin                        # 从原始 
 2. **写入存储卡**：`python photo_lut.py library card looks.bin /存储卡根目录`，在卡根目录生成 `Z8LUTLIB.BIN`。
 3. **在相机中载入**：照片拍摄菜单 > 照片 LUT > **从存储卡载入 LUT**。
 
-进阶：`build` 加 `--library looks.bin` 可把风格内置进固件（输出附 `builtin-library.bin`）。A–D 拍摄菜单库分别保存完整变换标识，改名或调整顺序后仍能对应原风格；移除或改变网格的风格会显示不可用。
+进阶：`build` 加 `--library looks.bin` 可把风格内置进固件（输出附 `builtin-library.bin`）。A–D 拍摄菜单库分别保存完整变换标识，改名或调整顺序后仍能对应原风格；移除或改变网格的风格会显示不可用。 库文件的默认选择只在内置进固件时生效；存储卡导入不会套用它。单个菜单库重置使用固件内置默认值，仍保留当前库来源；若该默认风格不在当前存储卡库中，会显示不可用，可选择其他风格或关闭。全局重置还会恢复内置库。
 
 存储卡载入规则：
 
@@ -60,7 +60,7 @@ python photo_lut.py library verify looks.bin                        # 从原始 
 
 菜单只列出当前库中的风格：显式载入存储卡库会替换内置库；重启继续使用同一来源。原来选择的风格若不在当前库中，会保留原标识并显示不可用，不会误用同位置或同名风格。卡缺失、延迟就绪、文件损坏或两卡冲突时，固件保留选择并自动重试；启动工作任务暂时缺少内存或系统资源时，也由原厂设置任务自动重试。只在当前菜单库需要恢复或尚未载入导入库时重试，未使用菜单库缺少风格不会反复读卡。风格恢复前阻止拍摄，选择“关闭”即可拍摄。已载入的库留在 RAM 中，取出卡不会改变其风格。
 
-首次从旧版的“位置”选择升级时，固件无法还原其完整标识，会要求重新选择；全局重置恢复内置库及其默认风格。返回原厂固件后，原厂设置仍可读取，原厂保存会清除本功能的扩展记录。
+首次从旧版升级时，非关闭选择无法还原完整标识，会要求重新选择；带旧版会话标记的关闭选择仍保持关闭。全零的旧配置无法区分从未设置与内置库关闭，采用固件默认值。全局重置恢复内置库及其默认风格。返回原厂固件后，原厂设置仍可读取，原厂保存会清除本功能的扩展记录。
 
 每次拍摄在分配输出时锁定所选风格：复制其网格、标识和名称，之后改选或载入新库都不影响已开始的拍摄。
 
@@ -111,7 +111,7 @@ python photo_lut.py library list looks.bin                         # order, name
 python photo_lut.py library rename looks.bin "Film A" "Film B"
 python photo_lut.py library move looks.bin "Film B" 1
 python photo_lut.py library remove looks.bin 2                     # down to an empty library
-python photo_lut.py library default looks.bin off                  # selection after a bank reset
+python photo_lut.py library default looks.bin off                  # default when embedded into firmware
 python photo_lut.py library export looks.bin 1 original.cube --source  # byte-identical to the import
 python photo_lut.py library export looks.bin 1 runtime.cube --runtime  # the resampled grid the camera applies
 python photo_lut.py library verify looks.bin                       # re-derive from the sources (slow)
@@ -129,7 +129,7 @@ Every change writes and reads back a complete temporary file before replacing th
 2. **Copy to a card**: `python photo_lut.py library card looks.bin /card/root` writes `Z8LUTLIB.BIN` to the card root.
 3. **Load in the camera**: Photo shooting menu > Photo LUT > **Load LUTs from card**.
 
-Advanced: `build --library looks.bin` builds looks into the firmware (the output adds `builtin-library.bin`). Shooting banks A–D save full transform identities: renaming or reordering preserves the choice; a removed or changed transform remains unavailable.
+Advanced: `build --library looks.bin` builds looks into the firmware (the output adds `builtin-library.bin`). Shooting banks A–D save full transform identities: renaming or reordering preserves the choice; a removed or changed transform remains unavailable. A library file's default applies when embedded in firmware; card import does not apply it. Individual bank reset uses the firmware's built-in default and retains the current library source. If that transform is absent from the active card library, the bank shows unavailable until another look or Off is selected. Whole-settings reset also returns to the built-in library.
 
 Card load rules:
 
@@ -147,7 +147,7 @@ After Load LUTs from card the page does not close; it is rebuilt at once, that r
 
 The menu lists the active library only. Explicitly importing a card library replaces the built-in library, and restart restores that same source. If a bank's chosen transform is absent, its identity stays saved and the look is unavailable; a same-name or same-position look never replaces it. Missing, delayed, corrupt or conflicting cards retain choices and trigger automatic retries. The native settings task also retries startup when the restore worker temporarily lacks memory or task resources. Retries stop once the active bank is resolved and the imported library has loaded; an unused bank's missing look causes no repeated card reads. Capture is blocked until the selected look restores or Off is chosen. A published library remains in RAM when its card is removed.
 
-On the first upgrade from legacy position-based selections, their full identities cannot be reconstructed and the camera asks for a new choice. Whole-settings reset returns to the built-in library and its default look. Stock firmware can still read its original settings; saving with stock firmware clears this feature's extension record.
+On the first upgrade, legacy non-Off choices need a new selection because their full identities cannot be reconstructed; tagged Off choices stay Off. An all-zero legacy configuration cannot distinguish unused settings from built-in Off and takes the firmware default. Whole-settings reset returns to the built-in library and its default look. Stock firmware can still read its original settings; saving with stock firmware clears this feature's extension record.
 
 Each capture latches its look when its output is reserved: it copies the grid, identity and name, so changing the selection or loading a library never affects a capture already under way.
 

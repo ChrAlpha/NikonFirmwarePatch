@@ -6,6 +6,7 @@
 #define Z8_LOOKS_VA UINT64_C(0x409a0000)
 #define Z8_STATE_VA UINT64_C(0xa101f0000)
 #define Z8_STATE_MAGIC UINT64_C(0x32545354554c385a)
+#define Z8_PREPARE_MAGIC (Z8_STATE_MAGIC|UINT64_C(1))
 #define Z8_OPTION_FIRST 0x35b5u
 #define Z8_MENU_ITEM 0x2caau
 #define Z8_MENU_STATE 0x1du       /* borrowed hidden photo state 29 holding the option page */
@@ -141,10 +142,10 @@ typedef struct {
  * stored until an actual read succeeds. */
 enum { Z8_SOURCE_NONE,Z8_SOURCE_STORED,Z8_SOURCE_FRESH,Z8_SOURCE_MIGRATED,Z8_SOURCE_LOST,
        Z8_SOURCE_DEFAULTS,Z8_SOURCE_RETAINED,Z8_SOURCE_UNREAD };
-/* Outcome of reading the stored blob-16 region (mode-4 settings callback, or
- * a later read before a store). LOST: the region itself is unreadable (the
- * native caller then uses blob defaults); UNREAD: our copy of the tail could
- * not be made (no memory), the region was not judged. */
+/* Private tail observation: LOST is a region without a readable native
+ * commit; UNREAD is a deferred scratch read (no memory). SKIPPED deliberately
+ * uses a validated retained warm record instead of rereading its tail. The
+ * native live prefix is loaded independently before private bootstrap. */
 enum { Z8_BLOB_PENDING,Z8_BLOB_VALID,Z8_BLOB_ABSENT,Z8_BLOB_CORRUPT,Z8_BLOB_LOST,Z8_BLOB_UNREAD,
        Z8_BLOB_SKIPPED };
 /* Card library restore, as shown for a bank whose look is not published. */
@@ -167,6 +168,7 @@ typedef struct {
     uint32_t refused_forecasts,refused_allocations;   /* captures withheld: look not applied */
     uint32_t pending_sources;           /* nibble per destination: original unread bank + 1, or zero */
     uint32_t cancelled_request;         /* whole reset cancels explicit imports through this serial */
+    uint32_t deferred_save;             /* native save event held until startup tail is decided */
     uint32_t text_key[2];               /* menu text last written: packed status, library generation */
 } Z8Persist;
 
@@ -226,9 +228,8 @@ int z8_photo_lut_bank_copy(uint32_t,uint32_t,const uint32_t *,uint32_t);
 uint32_t z8_photo_lut_settings_wait(void *,uint32_t,uint32_t *);
 uint32_t z8_photo_lut_settings_restored(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 void z8_photo_lut_defaults(void);
-uint32_t z8_photo_lut_blob_read(uint32_t section,uint64_t buffer,uint32_t bytes);
+void z8_photo_lut_restore_defaults(void);
 uint32_t z8_photo_lut_blob_write(uint32_t section,uint64_t buffer,uint32_t bytes);
-uint32_t z8_photo_lut_blob_loaded(uint32_t group);
 _Static_assert(offsetof(Z8LutState,preview)==120,"telemetry prefix ABI");
 _Static_assert(sizeof(Z8PreviewSlot)==256,"preview slot ABI");
 _Static_assert(sizeof(Z8JpegJob)==112,"JPEG job ABI");

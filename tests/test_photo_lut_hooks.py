@@ -115,7 +115,7 @@ class NativeScheduler:
             self.task(record['name'],record['cpu'],record['priority'],record['entry'],(x(1),))
             uc.context_restore(context);self._return()
         elif at==self.ALLOC:
-            if self.fail['alloc']:self.fail['alloc']-=1;self.allocations.append(0);self._return(0);return
+            if self.fail['alloc'] and (getattr(self,'alloc_failure_size',None) is None or x(0)==self.alloc_failure_size):self.fail['alloc']-=1;self.allocations.append(0);self._return(0);return
             pointer=self.heap;self.heap+=(x(0)+63)&~63;self.allocations.append(pointer);self._return(pointer)
         elif at==self.FREE:
             self._return()

@@ -216,7 +216,7 @@ def persistence(layout):
         return entry
     def field(name,size,meaning,values=None,type='u32'):
         return probe(name,persist+layout[f'persist_{name}_offset'],size,meaning,type,values)
-    probes=[probe('state_magic',STATE_VA,8,'Z8LUTST2 once the boot hook ran this boot','u64'),
+    probes=[probe('state_magic',STATE_VA,8,'Z8LUTST2 after late boot; low bit set during next native preparation','u64'),
             probe('state_version',STATE_VA+8,4,'private state layout version (4)'),
             probe('boots',STATE_VA+layout['boots_offset'],8,'boot hook runs since cold power-on (state reset each boot)','u64'),
             probe('bank_index',0xa03d48164,4,'native selected photo bank 0..3 (A..D)'),
@@ -243,7 +243,7 @@ def persistence(layout):
             field('commits',4,'record store requests'),
             field('blob_writes',4,'blob-16 region writes with the record'),
             field('refused_writes',4,'blob-16 stores refused (stored record unreadable or no memory)'),
-            field('blob_reads',4,'blob-16 region reads'),
+            field('blob_reads',4,'private tail reads by the settings bootstrap'),
             field('late_reads',4,'blob-16 reads after the record was decided (ignored)'),
             probe('xmp_last_choice',STATE_VA+layout['xmp_last_choice_offset'],4,'look position latched by the last JPEG'),
             probe('xmp_last_applied',STATE_VA+layout['xmp_last_applied_offset'],4,'applied bits latched by the last JPEG')]
@@ -253,8 +253,8 @@ def persistence(layout):
                    record=hex(persist),record_bytes=0xc0,sequence=hex(persist+layout['persist_sequence_offset'])),
         record=dict(section=16,group=0x31,blob='0xa03dabdc0',stock_bytes=0xcdb0,bytes=0xc0,kinds=list(DESIRED),
                     libraries=['built-in','card']),
-        hooks=dict(settings_restored='0x4101248c',defaults=['0x41016a60','0x41016a7c'],blob_read='0x40d6b548',
-                   settings_wait='0x41012924',bank_copy='0x410ddb8c',blob_loaded='0x41012a48',blob_write='0x41012558',bank_reset_result='0x40d68204',save_request='0x41012bf4'),
+        hooks=dict(settings_restored='0x4101248c',defaults=['0x41016a60','0x41016a7c'],
+                   settings_wait='0x41012924',bank_copy='0x410ddb8c',blob_write='0x41012558',bank_reset_result='0x40d68204',save_request='0x41012bf4'),
         probes=probes,
         nor=[dict(name='photo-lut-record-primary',base='0x45e60000',size='0x20000',volume=16,section=16,format=region),
              dict(name='photo-lut-record-mirror',base='0x46240000',size='0x20000',volume=16,section=16,format=region)])
@@ -315,20 +315,17 @@ def build(stock,luts,version,tag,compiler='clang-19',code_source='source'):
                 'photo LUT resource lifecycle '+name,expect=bytes.fromhex(old))
     img.put(0x40d68204-BASE,branch(0x40d68204,symbols['z8_photo_lut_bank_reset_result_entry']),
             'photo LUT bank reset result',expect=bytes.fromhex('95ac8352'))
-    # Bank record lifecycle: section-15 restore finished, native
-    # defaults copied, and blob 16 (group 0x31) read, loaded-skip and store,
-    # whose mirrored region also holds the record after the stock bytes.
-    for at,target,name,why in [(0x4101248c,0x410130e0,'settings_restored','after native section-15 restore'),
+    # Native preparation quarantines prior handles; post-mapping settings
+    # wait reads the private tail before serialization. Native prefix loading
+    # remains unchanged; the fixed-blob writer commits prefix and tail.
+    for at,target,name,why in [(0x4101248c,0x410130e0,'settings_restored','quarantine prior state during native preparation'),
                                (0x41012924,0x40d2bd04,'settings_wait','native settings wait with startup recovery'),
                                (0x410ddb8c,0x41013a14,'bank_copy','explicit shooting-bank item copy'),
-                               (0x41016a60,0x41016480,'defaults','after defaults for a failed restore'),
+                               (0x41016a60,0x41016480,'restore_defaults','native defaults before late private boot'),
                                (0x41016a7c,0x41016480,'defaults','after defaults for a whole reset'),
-                               (0x41012a48,0x41016aac,'blob_loaded','blob-16 read skipped while loaded'),
                                (0x41012558,0x40d6c628,'blob_write','blob-16 store with the bank record')]:
         img.put(at-BASE,branch(at,symbols[f'z8_photo_lut_{name}'],True),'photo LUT bank record: '+why,
                 expect=branch(at,target,True))
-    img.put(0x40d6b548-BASE,branch(0x40d6b548,symbols['z8_photo_lut_blob_read']),
-            'photo LUT bank record: blob-16 read',expect=branch(0x40d6b548,0x40d6c7d8))
     initial=struct.unpack_from('<I',luts,20)[0]
     names=[luts[HEADER+i*ENTRY+24:HEADER+i*ENTRY+88].split(b'\0',1)[0].decode() for i in range(struct.unpack_from('<I',luts,16)[0])]
     menu=add_menu(img,names,symbols)

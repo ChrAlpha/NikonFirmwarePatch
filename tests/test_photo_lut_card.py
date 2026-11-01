@@ -36,6 +36,7 @@ ALIAS = 0x9cf600000
 TEXT, TEXT_END = 0x408d0000, 0x40950000
 DIRECTORY, BLOBS = 0x4327c5a0, 0x439daf58
 OWNED, BANK_INDEX = 0xa03d482ba, 0xa03d48164
+SECTION_READ = 0x40d6c7d8
 REPLY, SECTION, DEFAULTS = 0x410130e0, 0x40d712c8, 0x41016480
 GROUP_LOADED = 0x41016aac
 VALID, BLOB = 1, 0xa03dabdc0
@@ -82,10 +83,10 @@ class PhotoLutCardSessionTests(unittest.TestCase):
         self.text = ctypes.create_string_buffer(image[TEXT-BASE:TEXT_END-BASE], TEXT_END-TEXT)
         m.mem_map_ptr(TEXT, TEXT_END-TEXT, 3, ctypes.addressof(self.text))
         m.mem_map_ptr(TEXT+ALIAS, TEXT_END-TEXT, 3, ctypes.addressof(self.text))
-        for at in (0x402da000, 0x402db000, 0x403ae000, 0x403b0000, 0x403b1000, 0x40d2c000, 0x40d2d000, 0x40d71000,
+        for at in (0x402da000, 0x402db000, 0x403ae000, 0x403b0000, 0x403b1000, 0x40d2c000, 0x40d2d000, 0x40d71000, 0x40d6c000,
                    0x41012000, 0x41013000, 0x41016000, 0x65000000, 0xa03bc6000, 0xa03bdd000, 0xa03d48000, 0xa03d49000, 0xa03f31000):
             m.mem_map(at, 4096)
-        for at in (*FS.values(), ROW_DISABLE, SAVE, REPLY, SECTION, DEFAULTS, GROUP_LOADED, 0x403ae0f8, 0x403b0048, 0x403b00b8):
+        for at in (*FS.values(), ROW_DISABLE, SAVE, REPLY, SECTION, DEFAULTS, GROUP_LOADED, SECTION_READ, 0x403ae0f8, 0x403b0048, 0x403b00b8):
             m.mem_write(at, bytes.fromhex('c0035fd6'))
         m.mem_map(STATE, 0x2000)
         m.mem_map(0xa03000000, 0x20000)
@@ -98,6 +99,8 @@ class PhotoLutCardSessionTests(unittest.TestCase):
         m.mem_map(0xa11010000, 0x1000000)        # heap continuation for card buffers
         m.mem_write(FLUSH, bytes.fromhex('c0035fd6'))
         self.saves, self.disabled, self.fs_calls, self.files, self.cursor = [], [], [], {}, []
+        self.native_prepared = False
+        self.stored_record = record_bytes(banks, library)
         self.reset_on_read = False
         self.reset_pending = False
         self.settings_waits, self.settings_clears = [], []
@@ -142,15 +145,20 @@ class PhotoLutCardSessionTests(unittest.TestCase):
                     self.scheduler._block('wait')
             elif at == 0x40d2bcc8:
                 self.settings_clears.append(x(1))
+            elif at == SECTION:
+                uc.reg_write(regs.UC_ARM64_REG_X0, 0)
+            elif at == SECTION_READ:
+                uc.mem_write(x(1), bytes(0xcdb0)+self.stored_record)
+                uc.reg_write(regs.UC_ARM64_REG_X0, 1)
             elif at == GROUP_LOADED:
-                uc.reg_write(regs.UC_ARM64_REG_X0, int(blob_loaded))
+                uc.reg_write(regs.UC_ARM64_REG_X0, int(blob_loaded and self.native_prepared))
             elif at == SAVE:
                 self.saves.append(self.scheduler.round)
             elif at == ROW_DISABLE:
                 self.disabled.append((x(1), x(2)))
             elif at in (SET_CURSOR, SET_MARK):
                 self.cursor.append(('cursor' if at == SET_CURSOR else 'mark', x(1)-0x35b5))
-        for first, end in ((0x402da000, 0x402dbfff), (0x403b0000, 0x403b1fff), (0x41012000, 0x41012fff), (GROUP_LOADED, GROUP_LOADED), (0x40d2bcc8, 0x40d2bd64)):
+        for first, end in ((0x402da000, 0x402dbfff), (0x403b0000, 0x403b1fff), (0x41012000, 0x41012fff), (GROUP_LOADED, GROUP_LOADED), (0x40d2bcc8, 0x40d2bd64), (SECTION_READ, SECTION_READ), (SECTION, SECTION)):
             m.hook_add(UC_HOOK_CODE, service, begin=first, end=end)
         self.m = m
         # Menu page whose cursor rests on the "Load LUTs from card" row.
@@ -163,11 +171,14 @@ class PhotoLutCardSessionTests(unittest.TestCase):
         self.context, self.page = context, page
         # The real boot hook validates the built-in library and writes the menu text.
         self.call('z8_photo_lut_boot')
+        self.saves.clear()
+        self.native_prepared = True
         layout = self.metadata['runtime_layout']
+        self.m.mem_write(0xa03bddcc8, bytes([1]))
         self.assertEqual(struct.unpack('<6I', m.mem_read(STATE+8, 24))[4:], (1, 0))   # ready, no error
         if power_paused:
             m.mem_write(STATE+layout['preview_offset']+layout['power_paused_offset'], struct.pack('<I', 1))
-        # The native blob-16 read found this stored record (staged until S1).
+        # Native storage supplies this record to the post-mapping tail reader.
         persist = STATE+layout['persist_offset']
         m.mem_write(persist, record_bytes(banks, library))
         m.mem_write(persist+layout['persist_blob_offset'], struct.pack('<I', VALID))
@@ -176,9 +187,10 @@ class PhotoLutCardSessionTests(unittest.TestCase):
         return m
 
     def restore(self, rounds=3000):
-        """S1 in the settings task: decide the record, start the card worker; run until it idles."""
-        task = self.scheduler.task('Settings', 1, 30, self.symbols['z8_photo_lut_settings_restored'], (0x4c01,))
-        self.scheduler.run(lambda: task['finished'], tick=200000, rounds=100)
+        """Run post-mapping settings bootstrap and its card worker until they idle."""
+        event, bits = 0xa0300e000, 0xa0300e010
+        self.m.mem_write(event, struct.pack('<i', 902)); self.scheduler.events[902] = 0
+        self.scheduler.task('Settings', 1, 30, self.symbols['z8_photo_lut_settings_wait'], (event, 0x1733, bits))
         self.settle(rounds)
 
     def pump_reset(self):
@@ -423,24 +435,21 @@ class PhotoLutCardSessionTests(unittest.TestCase):
         self.machine(self.card_file(moved), banks=[self.mono.id]*4, library=1)
         self.assertEqual(self.choice(), 2)
 
-    def test_an_unread_record_asks_the_native_save_to_read_it(self):
+    def test_an_unread_record_is_decided_by_native_settings_wait_without_a_write(self):
         self.machine({}, banks=[self.warm]*4, restored=False)
         layout = self.metadata['runtime_layout']
-        self.m.mem_write(STATE+layout['persist_offset']+layout['persist_blob_offset'], struct.pack('<I', 5))   # unread
+        self.m.mem_write(STATE+layout['persist_offset']+layout['persist_blob_offset'], struct.pack('<I', 5))
         self.restore()
-        self.assertEqual((self.u32('ready'), self.u32('authoritative')), (1, 0))
-        self.assertGreaterEqual(len(self.saves), 1)
-        # Idle scheduling can cross the first backoff; requests remain bounded.
-        self.assertLessEqual(len(self.saves), 2)
-        self.assertEqual(self.choice(), 0)                           # unresolved: nothing admitted with a look
+        self.assertEqual((self.u32('ready'), self.u32('authoritative')), (1, 1))
+        self.assertEqual(self.saves, [])
+        self.assertEqual(self.choice(), 1)
 
     def test_initial_card_worker_failures_recover_in_native_settings_loop_without_menu(self):
         for failure in ('alloc', 'event', 'create'):
             with self.subTest(failure=failure):
                 self.machine(self.card_file(), banks=[self.mono.id]*4, library=1, restored=False)
-                self.scheduler.fail[failure] = 2             # S1 and first native-loop retry fail
-                self.restore()
-                self.assertEqual(self.card()['worker_state'], 0)
+                self.scheduler.fail[failure] = 2             # initial creation and same-iteration retry fail
+                if failure == 'alloc': self.scheduler.alloc_failure_size = 80
                 # Run the actual patched settings event-loop instructions.
                 self.m.mem_write(0x41012918, self.image[0x41012918-BASE:0x410129d4-BASE])
                 self.m.mem_write(0xa03bddccc, struct.pack('<i', 901))
@@ -466,7 +475,7 @@ class PhotoLutCardSessionTests(unittest.TestCase):
                 layout = self.metadata['runtime_layout']
                 self.m.mem_write(STATE+layout['persist_offset']+layout['persist_blob_offset'], struct.pack('<I', 5))
                 self.restore()
-                self.assertEqual((self.u32('ready'), self.u32('authoritative')), (1, 0))
+                self.assertEqual((self.u32('ready'), self.u32('authoritative')), (int(controls.get('blob_loaded', True)),)*2)
                 self.assertEqual(self.saves, [])
 
     def test_unrecognized_banks_ask_for_a_choice(self):

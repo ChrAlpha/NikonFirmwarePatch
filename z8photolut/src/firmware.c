@@ -747,6 +747,7 @@ static const char *const card_text[CARD_STATES][3]={
 static void menu_text(const Z8LookBundle *,uint32_t status,uint32_t count,uint32_t slots);
 static int card_worker_start(void);
 static void card_wake(void);
+static void persist_bootstrap(void);
 static void record_lock(void);
 static void record_unlock(void);
 static void preview_wake(void);
@@ -879,21 +880,12 @@ static uint32_t region_state(uint32_t result,const uint8_t *scratch,Z8BankRecord
     return record_valid(tail)?Z8_BLOB_VALID:Z8_BLOB_CORRUPT;
 }
 
-/* Decide once section 15 is restored and the stored region was read (or the
- * read was skipped / failed), in either order. `stored`, a record just read,
- * is staged in RAM (not yet visible) until then.
- *  VALID   -> the stored record.
- *  ABSENT or LOST (no record in the region, or no readable region: the
- *           native caller defaults the stock blob too) -> by the owned bytes:
- *           a record existed (lost: unresolved), only a pre-record selection
- *           existed (migrated: Off stays Off, else unresolved), or nothing
- *           (the firmware default).
- *  CORRUPT -> every bank unresolved.
- *  native defaults (S2) -> the firmware default.
- *  SKIPPED with a retained warm-start record -> that record.
- *  UNREAD, or SKIPPED without one -> unresolved, not stored; the card
- *  worker asks for a native save, whose store reads the region first.
- * Changes made meanwhile (menu, bank reset) are kept on top. */
+/* Decide from the settings-task tail read, a validated retained warm record,
+ * or an explicit native reset. A valid stored record restores full identities;
+ * absent/lost tails migrate native owned bytes without inventing identities;
+ * corrupt tails leave banks unresolved. Pending explicit edits and original
+ * source references from deferred bank copies are merged before publication.
+ * An undecided record is never written over. */
 static void persist_decide(const Z8BankRecord *stored)
 {
     volatile Z8Persist *p=&Z8_STATE->persist;
@@ -930,7 +922,7 @@ static void persist_decide(const Z8BankRecord *stored)
             /* The current copy holds the selected bank's latest value. */
             uint32_t value=owned(bank==selected?0:bank+1);
             if(recorded) slot->kind=Z8_DESIRED_UNRESOLVED;
-            else if(legacy) slot->kind=value?Z8_DESIRED_UNRESOLVED:Z8_DESIRED_OFF;
+            else if(legacy) slot->kind=(value&0xff)?Z8_DESIRED_UNRESOLVED:Z8_DESIRED_OFF;
             else default_slot(slot);
         }
         source=recorded?Z8_SOURCE_LOST:legacy?Z8_SOURCE_MIGRATED:Z8_SOURCE_FRESH;
@@ -1085,27 +1077,65 @@ static int card_start_needed(void)
  * Stock events still return immediately; once started, use the stock wait. */
 uint32_t z8_photo_lut_settings_wait(void *event,uint32_t mask,uint32_t *bits)
 {
-    if(card_start_needed() && !card_worker_start()) {
+    persist_bootstrap();
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    uint32_t result;
+    if(Z8_STATE->magic==Z8_STATE_MAGIC && (p->authoritative || Z8_STATE->preview.power_paused) && p->deferred_save && !(read32(Z8_SETTINGS_LOADED)&0x100)) {
         if(bits) *bits=0;
-        return ((uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t))(uintptr_t)0x40d2bd64)(event,mask,bits,500);
+        result=1;
+    } else if((card_start_needed() && !card_worker_start()) ||
+              (Z8_STATE->magic==Z8_STATE_MAGIC && !Z8_STATE->preview.power_paused &&
+               (!p->authoritative || (p->deferred_save && (read32(Z8_SETTINGS_LOADED)&0x100))))) {
+        if(bits) *bits=0;
+        result=((uint32_t (*)(void *,uint32_t,uint32_t *,uint32_t))(uintptr_t)0x40d2bd64)(event,mask,bits,500);
+    } else result=((uint32_t (*)(void *,uint32_t,uint32_t *))(uintptr_t)0x40d2bd04)(event,mask,bits);
+    /* This call may have blocked before private boot. Decide the real tail
+     * before the native caller dispatches even its first save event. */
+    persist_bootstrap();
+    if(Z8_STATE->magic!=Z8_STATE_MAGIC && bits && (*bits&0x1000) && !(read32(Z8_SETTINGS_LOADED)&0x100)) {
+        /* Late boot always re-posts SAVE. Preserve preboot RAM changes and
+         * the old private tail until that owner can read it. Native shutdown
+         * no-save acknowledgments still pass through without serialization. */
+        *bits&=~0x1000;
+        ((void (*)(void *,uint32_t))(uintptr_t)0x40d2bcc8)(event,0x1000);
     }
-    return ((uint32_t (*)(void *,uint32_t,uint32_t *))(uintptr_t)0x40d2bd04)(event,mask,bits);
+    if(Z8_STATE->magic==Z8_STATE_MAGIC && bits) {
+        if(read32(Z8_SETTINGS_LOADED)&0x100) { /* incoming SAVE acknowledges completion only */ }
+        else if(p->authoritative || Z8_STATE->preview.power_paused) { *bits|=p->deferred_save;p->deferred_save=0; }
+        else if(*bits&0x1000) {
+            p->deferred_save|=0x1000;*bits&=~0x1000;
+            ((void (*)(void *,uint32_t))(uintptr_t)0x40d2bcc8)(event,0x1000);
+        }
+    }
+    return result;
 }
 
-/* S1: native section-15 restore finished (0x4101248c, settings task). */
+/* Native section-15 preparation finished before late mapping (4101248c). */
 uint32_t z8_photo_lut_settings_restored(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e)
 {
-    volatile Z8LutState *s=Z8_STATE;
-    if(s->magic==Z8_STATE_MAGIC && !s->persist.settings_restored) {
-        s->persist.settings_restored=1;
-        persist_decide(0);
-        if(card_start_needed() && card_worker_start()) card_wake();
-    }
+    /* A native preparation cycle precedes late mapping on cold and warm
+     * paths. Quarantine retained task handles while preserving its record. */
+    if(Z8_STATE->magic==Z8_STATE_MAGIC) Z8_STATE->magic=Z8_PREPARE_MAGIC;
     return SETTINGS_REPLY(a,b,c,d,e);
 }
 
-/* S2: native defaults were copied into every settings group (whole reset,
- * or a failed section-15 restore): every bank gets the firmware default. */
+/* PreparePhase can reset native settings before private boot, including on
+ * retained warm RAM. Invalidate its old private candidate without touching
+ * task pointers from the previous boot. The later bootstrap reads native
+ * preparation status; runtime whole reset has its separate wrapper below. */
+void z8_photo_lut_restore_defaults(void)
+{
+    SETTINGS_DEFAULTS();
+    volatile Z8Persist *p=&Z8_STATE->persist;
+    if((Z8_STATE->magic&~UINT64_C(1))==Z8_STATE_MAGIC) {
+        Z8_STATE->magic=Z8_PREPARE_MAGIC;
+        __atomic_store_n(&p->ready,0,__ATOMIC_RELEASE);
+        __atomic_store_n(&p->authoritative,0,__ATOMIC_RELEASE);
+    }
+}
+
+/* Runtime whole-settings reset: every bank gets the firmware default and
+ * the active library returns to the built-in image. */
 void z8_photo_lut_defaults(void)
 {
     SETTINGS_DEFAULTS();
@@ -1152,47 +1182,31 @@ static uint32_t blob_read_region(uint8_t *scratch,uint64_t buffer,uint32_t bytes
     return result;
 }
 
-/* Blob-16 reads (0x40d6b548 tail branch). The stock bytes are read as before;
- * the record that follows them in the same committed region is decided on. */
-uint32_t z8_photo_lut_blob_read(uint32_t section,uint64_t buffer,uint32_t bytes)
+/* PreparePhase restores section 15 and loads blob 16 before the image's
+ * late private-boot hook. Its loaded flag proves the stock prefix is live;
+ * read only the private tail into scratch, leaving all live native bytes
+ * intact. A retained record follows warm native RAM, even if the native
+ * restore-result byte still records an earlier fresh/default startup. */
+static void persist_bootstrap(void)
 {
     volatile Z8LutState *s=Z8_STATE;
-    if(section!=Z8_BLOB_SECTION || buffer!=Z8_BLOB || bytes!=Z8_BLOB_BYTES || s->magic!=Z8_STATE_MAGIC)
-        return SECTION_READ(section,buffer,bytes);
     volatile Z8Persist *p=&s->persist;
-    p->blob_reads++;
-    uint8_t *scratch=blob_scratch();
-    uint32_t result,blob;
+    if(s->magic!=Z8_STATE_MAGIC || (p->ready && p->authoritative) || !(GROUP_LOADED(Z8_BLOB_GROUP)&1)) return;
+    p->settings_restored=1;
     Z8BankRecord tail;
-    if(scratch) {
-        result=blob_read_region(scratch,buffer,bytes);
-        blob=region_state(result,scratch,&tail);
-        if(result&1) copy_bytes((void *)(uintptr_t)buffer,scratch,Z8_BLOB_BYTES);
+    const Z8BankRecord *stored=0;
+    if(p->retained) p->blob=Z8_BLOB_SKIPPED;
+    else {
+        p->defaults|=!(read32(Z8_SETTINGS_LOADED)&1);
+        uint8_t *scratch=blob_scratch();
+        if(!scratch) { p->blob=Z8_BLOB_UNREAD;return; }
+        p->blob_reads++;
+        p->blob=region_state(blob_read_region(scratch,Z8_BLOB,Z8_BLOB_BYTES),scratch,&tail);
+        if(p->blob==Z8_BLOB_VALID) stored=&tail;
         FREE(scratch);
-    } else {
-        /* The stock bytes still load; only the record is not read. */
-        result=SECTION_READ(section,buffer,bytes);
-        blob=result&1?Z8_BLOB_UNREAD:Z8_BLOB_LOST;
     }
-    if(__atomic_load_n(&p->authoritative,__ATOMIC_ACQUIRE) || p->defaults) p->late_reads++;
-    else if(p->blob==Z8_BLOB_PENDING || (blob!=Z8_BLOB_UNREAD && p->blob!=blob)) {
-        p->blob=blob;
-        persist_decide(blob==Z8_BLOB_VALID?&tail:0);
-    }
-    return result;
-}
-
-/* Mode 4 skips the blob-16 read while the group is already loaded in RAM
- * (0x41012a48), as after a warm start that kept native settings RAM. */
-uint32_t z8_photo_lut_blob_loaded(uint32_t group)
-{
-    uint32_t loaded=GROUP_LOADED(group);
-    volatile Z8LutState *s=Z8_STATE;
-    if(group==Z8_BLOB_GROUP && (loaded&1) && s->magic==Z8_STATE_MAGIC && s->persist.blob==Z8_BLOB_PENDING) {
-        s->persist.blob=Z8_BLOB_SKIPPED;
-        persist_decide(0);
-    }
-    return loaded;
+    persist_decide(stored);
+    if(card_start_needed() && card_worker_start()) card_wake();
 }
 
 /* Blob-16 store in the native save producer (0x41012558): one region write
@@ -1203,8 +1217,11 @@ uint32_t z8_photo_lut_blob_loaded(uint32_t group)
 uint32_t z8_photo_lut_blob_write(uint32_t section,uint64_t buffer,uint32_t bytes)
 {
     volatile Z8LutState *s=Z8_STATE;
-    if(section!=Z8_BLOB_SECTION || buffer!=Z8_BLOB || bytes!=Z8_BLOB_BYTES || s->magic!=Z8_STATE_MAGIC)
+    if(section!=Z8_BLOB_SECTION || buffer!=Z8_BLOB || bytes!=Z8_BLOB_BYTES)
         return SECTION_WRITE(section,buffer,bytes);
+    /* A direct preboot save must not erase a prior tail with a stock-length
+     * write. Late boot re-posts the native save with the same live prefix. */
+    if(s->magic!=Z8_STATE_MAGIC) return 0;
     volatile Z8Persist *p=&s->persist;
     uint8_t *scratch=blob_scratch();
     if(!scratch) { p->refused_writes++;return 0; }
@@ -1231,10 +1248,10 @@ void z8_photo_lut_boot(void)
     uint64_t boots=0;
     Z8BankRecord retained;
     unsigned keep=0;
-    if(s->magic==Z8_STATE_MAGIC && s->version==4 && s->bytes==sizeof(*s)) {
+    if((s->magic&~UINT64_C(1))==Z8_STATE_MAGIC && s->version==4 && s->bytes==sizeof(*s)) {
         boots=s->boots;
-        /* A warm start keeps native settings RAM; the decided record goes
-         * with it, used only if mode 4 skips the blob read as already loaded. */
+        /* A validated private record follows retained native RAM. Native
+         * preparation quarantines its old task handles before this hook. */
         copy_bytes(&retained,(const void *)(uintptr_t)&s->persist.record,sizeof(retained));
         keep=s->persist.ready && s->persist.authoritative && record_valid(&retained);
     }
@@ -1250,6 +1267,10 @@ void z8_photo_lut_boot(void)
     if(s->ready) menu_text(Z8_BUILTIN,CARD_RESTORING,0,0);
     s->magic=Z8_STATE_MAGIC;
     __atomic_thread_fence(__ATOMIC_RELEASE);
+    /* Native PreparePhase and its settings event already exist at this late
+     * mapping seam. Wake that task; its wait continuation restores our tail
+     * before this event can serialize any native settings. */
+    REQUEST_SAVE();
 }
 
 /* Copy the native source into the lease scratch and apply the capture's
@@ -2150,7 +2171,7 @@ static void card_worker(void *argument)
     }
 }
 
-/* Started from the settings task (S1) or the GUI task; one start wins. */
+/* Started by the post-mapping settings task or explicit GUI import. */
 static int card_worker_start(void)
 {
     volatile Z8CardLibrary *c=&Z8_STATE->card;
