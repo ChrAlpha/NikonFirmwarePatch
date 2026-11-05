@@ -7,6 +7,7 @@ ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from features import FEATURES,build,compatibility,selected_features
 from z8prores.package import Package,require_official_input,sha
 from verify import verify_pair
+from z8patch.compiled import compile_unit
 
 def need(ok,message):
     if not ok:raise RuntimeError(message)
@@ -35,10 +36,20 @@ def main():
             print('+'.join(names)+': PASS',flush=True)
             wrong=[f for f in FEATURES if f not in names] or ['framing']
             reject('+'.join(names)+' wrong feature claim',lambda:verify_pair(original,packet,wrong))
-        # Last iteration is all features. Source mode must give the same bytes.
-        source,_=build(pkg.eg,'00.00','t0',list(FEATURES),a.compiler,'source')
-        need(source==eg,'Source/prebuilt mismatch')
-        rows.append(dict(test='all features source/prebuilt equivalence',result='PASS',payload_sha256=sha(source)))
+        # Last iteration is all features. Every unit reviewed with the selected compiler must compile to
+        # its prebuilt bytes; with all units comparable, source mode gives the same payload.
+        version=subprocess.check_output([a.compiler,'--version'],text=True).splitlines()[0]
+        units=json.loads((ROOT/'resources/compiled.json').read_text())['units']
+        comparable=sorted(n for n,u in units.items() if u['compiler']==version)
+        need(comparable,'No unit was reviewed with the selected compiler')
+        for name in comparable:
+            code,_=compile_unit(name,a.compiler)
+            need(sha(code)==units[name]['sha256'],'Source/prebuilt mismatch: '+name)
+        if len(comparable)==len(units):
+            source,_=build(pkg.eg,'00.00','t0',list(FEATURES),a.compiler,'source')
+            need(source==eg,'Source/prebuilt mismatch')
+        rows.append(dict(test='source/prebuilt equivalence',result='PASS',compiler=version,units=comparable,
+                         not_comparable=sorted(set(units)-set(comparable))))
         reject('empty selection',lambda:selected_features([]))
         reject('duplicate selection',lambda:selected_features(['photo-tools','photo-tools']))
         reject('unknown selection',lambda:selected_features(['unknown']))

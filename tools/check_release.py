@@ -102,6 +102,7 @@ SOURCE_FILES=(
     'resources/input.json',
     'resources/precapture.json',
     'resources/profile.json',
+    'tests/test_colour_chain.py',
     'tests/test_compiled_paths.py',
     'tests/validate.py',
     'tests/validate_combinations.py',
@@ -117,6 +118,9 @@ SOURCE_FILES=(
     'z8anamorphic/__init__.py',
     'z8anamorphic/patcher.py',
     'z8anamorphic/src/hooks.S',
+    'z8colour/__init__.py',
+    'z8colour/patcher.py',
+    'z8colour/src/colour.S',
     'z8h265/__init__.py',
     'z8h265/patcher.py',
     'z8h265/src/hooks.S',
@@ -220,7 +224,7 @@ SOURCE_FILES=(
     'z8quality/prores-icons.json',
     'z8quality/src/hooks.S',
 )
-CODE_FILES=('resources/precapture.bin', 'resources/pixelshift.bin', 'resources/pixelshift-af.bin', 'resources/opengate.bin', 'resources/anamorphic.bin', 'resources/h265.bin', 'resources/log.bin', 'resources/quality.bin', 'resources/shared.bin')
+CODE_FILES=('resources/precapture.bin', 'resources/pixelshift.bin', 'resources/pixelshift-af.bin', 'resources/opengate.bin', 'resources/anamorphic.bin', 'resources/h265.bin', 'resources/log.bin', 'resources/quality.bin', 'resources/shared.bin', 'resources/colour.bin')
 MANIFEST='release-manifest.json'
 TAG=r'v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:rc\.[1-9][0-9]*|r[1-9][0-9]*))?'
 def need(ok,message):

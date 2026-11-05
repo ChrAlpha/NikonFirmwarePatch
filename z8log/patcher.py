@@ -19,10 +19,8 @@ LG_PRIV, ALIAS = 0x40B0E000, 0xA0F800000 - 0x40200000      # private page (zero 
 KEYS_BUF_SIZE = 0x1000
 LOG_TYPE = 0xA03D5C0DD
 
-# recording chain and file sites: (address, stock word, hook entry, kind)
-B_SITES = [(0x4111A508, '0800e0f2', 'lg_rgb_hook'), (0x4111A6D4, '2129029b', 'lg_nlg_hook'),
-           (0x41116CB4, '0b250b9b', 'lg_m2_hook'), (0x41116010, '0e00e0f2', 'lg_m1_hook'),
-           (0x4111A198, '75a24039', 'lg_cpxs_hook'), (0x406D2D94, 'e0030032', 'lg_tag26_tail'),
+# file and playback sites: (address, stock word, hook entry); the shared colour unit owns the recording chain
+B_SITES = [(0x406D2D94, 'e0030032', 'lg_tag26_tail'),
            (0x406C1988, '3515891a', 'lg_keycount_hook'), (0x406C196C, '013d0054', 'lg_keyclass_hook'),
            (0x4071F5CC, '1f0d0071', 'lg_keys_gate'), (0x406D3994, 'ff0301d1', 'lg_pc_write'),
            (0x406D05FC, 'a1ffff17', 'lg_pc_parse_tail'), (0x4064D718, 'c9a98552', 'lg_pb_label'),
@@ -240,6 +238,11 @@ def asm_defines():
                 LG_VA_MAT1=at,LG_VA_MAT2=at+0x20,LG_VA_CB1=at+0x40,LG_VA_CB2=at+0x60,
                 TEXT_STYLE=TEXT_STYLE,KEYS_G=LG_PRIV+ALIAS,VA_LAST=LG_PRIV+0x20+ALIAS,PB_TYPE=LG_PRIV+0x21+ALIAS,KEYS_BUF=LG_PRIV+0x100+ALIAS,KEYS_BUF_SIZE=KEYS_BUF_SIZE)
     return defs
+
+def colour_tables():
+    """Recording-chain tables of Log types 1 and 2, in the shared colour unit's CONFIG order."""
+    return [LG_DATA+DATA[k] for k in ('LG_RGB1','LG_RGB2','LG_NLG1','LG_NLG2','LG_M2_1','LG_M2_2',
+                                       'LG_M1_1','LG_M1_2','LG_CPXS1','LG_CPXS2')]
 
 def load_data():
     d=json.loads(Path(__file__).with_name('data.json').read_text())

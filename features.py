@@ -8,6 +8,7 @@ from z8prores.patcher import public_words
 from z8prores.menu import Image
 from z8patch.compiled import load
 from z8patch.shared import Strings, VideoMenu, loader
+from z8colour.patcher import emit as colour_emit
 
 FEATURES = ('framing','video-quality','log-colour','photo-tools')
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
     img = Image(eg)
     strings,menu=Strings(),VideoMenu(eg)
     detail,callbacks={},{}
+    log_tables,still_provider=None,0
 
     def unit(name):
         code,meta=load(name,code_source,compiler)
@@ -92,6 +94,8 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
         part,detail['log']=build_main(eg,code,entries,strings)
         menu.collect(part,0x2E38);merge('log',part)
         callbacks['log']=entries['lg_menu_refresh_hook']
+        from z8log.patcher import colour_tables
+        log_tables=colour_tables()
     if 'photo-tools' in chosen:
         from z8precapture.patcher import edits
         code,meta=load('precapture',code_source,compiler)
@@ -103,6 +107,9 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
         af,_=load('pixelshift-af',code_source,compiler)
         part,detail['pixelshift']=build_main(eg,code,meta['symbols'],af,strings)
         merge('pixelshift',part)
+    if log_tables or still_provider:
+        code,entries=unit('colour')
+        detail['colour']=colour_emit(img,code,entries,log_tables,still_provider)
     detail['strings']=strings.emit(img)
     if callbacks:
         code,entries=unit('shared')

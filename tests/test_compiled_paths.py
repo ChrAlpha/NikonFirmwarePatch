@@ -15,8 +15,8 @@ sys.path.insert(0, str(ROOT))
 from z8patch import compiled
 from tools.check_release import TAG
 
-UNITS = ('precapture','pixelshift','pixelshift-af','opengate','anamorphic','h265','log','quality','shared')
-FOLDERS = {'precapture':'z8precapture/', 'pixelshift':'z8pixelshift/src/', 'pixelshift-af':'z8pixelshift/src/', 'opengate':'z8opengate/src/', 'anamorphic':'z8anamorphic/', 'h265':'z8h265/', 'log':'z8log/', 'quality':'z8quality/', 'shared':'z8patch/src/'}
+UNITS = ('precapture','pixelshift','pixelshift-af','opengate','anamorphic','h265','log','quality','shared','colour')
+FOLDERS = {'precapture':'z8precapture/', 'pixelshift':'z8pixelshift/src/', 'pixelshift-af':'z8pixelshift/src/', 'opengate':'z8opengate/src/', 'anamorphic':'z8anamorphic/', 'h265':'z8h265/', 'log':'z8log/', 'quality':'z8quality/', 'shared':'z8patch/src/', 'colour':'z8colour/'}
 
 
 class WindowsPathView:

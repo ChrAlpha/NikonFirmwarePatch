@@ -77,7 +77,7 @@ def verify_pair(original, candidate, features=None, *, expected_version=None, ex
     profiles=recipes['profiles']
     if features is None:
         features=[]
-        for name,offset in [('framing',0x62E150),('video-quality',0x1C5D48),('log-colour',0xFBA508),('photo-tools',0xE0FE90)]:
+        for name,offset in [('framing',0x62E150),('video-quality',0x1C5D48),('log-colour',0x572D94),('photo-tools',0xE0FE90)]:
             if old[offset:offset+4]!=new[offset:offset+4]:features.append(name)
     need(features and len(features)==len(set(features)) and set(features)<=set(order),'Invalid feature selection')
     features=[f for f in order if f in features]

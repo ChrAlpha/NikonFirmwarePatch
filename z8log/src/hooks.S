@@ -13,7 +13,8 @@
  * Three byte counters after PB_TYPE aid bounded verification and never gate code.
  *
  * Integrated code/data/state addresses come from asm_defines. Text slot 47 and
- * the shared bank/menu/string owners are retained. Colour tables are unchanged.
+ * the shared bank/menu/string owners are retained. The five recording colour-chain
+ * sites belong to the shared colour unit, which reads this module's tables.
  * Hooks replay displaced instructions and return to the original continuations.
  */
 #ifndef LOG_TYPE
@@ -79,104 +80,6 @@
 .endm
 
 .text
-.balign 16
-.global lg_rgb_hook
-lg_rgb_hook:                        // 4111A508: movk x8, #0, lsl #48
-    movk x8, #0, lsl #48
-    cmp x9, #1
-    b.ne 9f                         // SDR is not this path; 2 = HLG
-    stp x10, x11, [sp, #-16]!
-    LOGTYPE 10
-    ldr x11, =LG_RGB1
-    cmp w10, #1
-    b.eq 1f
-    ldr x11, =LG_RGB2
-    cmp w10, #2
-    b.ne 2f
-1:  mov x8, x11
-2:  ldp x10, x11, [sp], #16
-9:  b original_4111A50C             // the next stock instruction sets the flags again (4111A514)
-
-.balign 16
-.global lg_nlg_hook
-lg_nlg_hook:                        // 4111A6D4: madd x1, x9, x2, x10 (x9, x10 dead after; x2 = 1CAh is the copy length)
-    madd x1, x9, x2, x10
-    cmp w9, #1
-    b.ne 9f
-    LOGTYPE 10
-    ldr x9, =LG_NLG1
-    cmp w10, #1
-    b.eq 1f
-    ldr x9, =LG_NLG2
-    cmp w10, #2
-    b.ne 9f
-1:  mov x1, x9
-9:  b original_4111A6D8             // mov w9, #0x16a2; then the copy call
-
-.balign 16
-.global lg_m2_hook
-lg_m2_hook:                         // 41116CB4: madd x11, x8, x11, x9 (x9 = 441A56A8 row base, x8 = row)
-    stp x12, x13, [sp, #-16]!
-    mrs x13, nzcv
-    cmp x8, #1
-    b.ne 8f
-    LOGTYPE 12
-    cmp w12, #1
-    b.ne 1f
-    ldr x9, =(LG_M2_1 - 0x12)
-    b 8f
-1:  cmp w12, #2
-    b.ne 8f
-    ldr x9, =(LG_M2_2 - 0x12)
-8:  msr nzcv, x13
-    ldp x12, x13, [sp], #16
-    madd x11, x8, x11, x9
-    b original_41116CB8
-
-.balign 16
-.global lg_m1_hook
-lg_m1_hook:                         // 41116010: movk x14, #0, lsl #48 (x14 = 441A0A4A base, x13 = row, w11 = S+BCh)
-    movk x14, #0, lsl #48
-    stp x15, x16, [sp, #-16]!
-    mrs x16, nzcv
-    cmp w11, #1
-    b.ne 8f                         // N-Log: S+BCh = 1, row 2
-    LOGTYPE 15
-    cmp w15, #1
-    b.ne 1f
-    ldr x14, =(LG_M1_1 - 0x24)
-    b 8f
-1:  cmp w15, #2
-    b.ne 8f
-    ldr x14, =(LG_M1_2 - 0x24)
-8:  msr nzcv, x16
-    ldp x15, x16, [sp], #16
-    b original_41116014
-
-.balign 16
-.global lg_cpxs_hook
-lg_cpxs_hook:                       // 4111A198: ldrb w21, [x19, #0x28], right after bl 411179CC (record -> ctx+A8h)
-    stp x8, x9, [sp, #-32]!
-    stp x10, x11, [sp, #16]
-    mrs x11, nzcv
-    ldr x8, [x19, #0x98]            // T, read by the stock code at 4111A188 too
-    ldrb w9, [x8, #0x31]
-    cmp w9, #1
-    b.ne 8f
-    LOGTYPE 10
-    ldr x9, =LG_CPXS1
-    cmp w10, #1
-    b.eq 1f
-    ldr x9, =LG_CPXS2
-    cmp w10, #2
-    b.ne 8f
-1:  str x9, [x19, #0xb0]            // the selected record's Pa..Pf table pointer
-8:  msr nzcv, x11
-    ldp x10, x11, [sp, #16]
-    ldp x8, x9, [sp], #32
-    ldrb w21, [x19, #0x28]
-    b original_4111A19C
-
 .balign 16
 .global lg_tag26_tail
 lg_tag26_tail:                      // 406D2D94: mov w0, #1; then str w8, [x1, #0xb0]; ret (leaf).  Entered before the
