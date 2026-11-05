@@ -9,7 +9,7 @@
 照片 LUT 用 3D LUT 给 JPEG 加上风格。每个风格声明其 LUT 制作时针对的输入基准：
 
 - **`nikon-sdr`**（默认）：LUT 作用于相机已渲染的照片，即 JPEG 在当前优化校准（Picture Control）之后、所选色彩空间中的 8 位 Y'CbCr 值。实时取景和 JPEG 使用同一风格。
-- **Log 基准**（N-Log、S-Log3、Log3G10、F-Log2、LogC3、LogC4 或 V-Log，各带其色域）：照片由相机自身的 Log 处理链显影，所用参数表在电脑上针对该风格拟合，再由一个小的残差网格完成 JPEG。见 [Log 风格](#log-风格)。
+- **Log 基准**（N-Log、S-Log3、Log3G10、F-Log2、LogC3、LogC4 或 V-Log，各带其色域）：照片和照片模式的实时取景由相机自身的 Log 处理链显影，所用参数表在电脑上针对该风格拟合，再由一个小的残差网格完成 JPEG 和实时取景画面。见 [Log 风格](#log-风格)。
 
 **NEF 原始数据不变。**
 
@@ -86,12 +86,14 @@ python photo_lut.py library add looks.bin teal.cube --basis arri-logc3 --grid 65
 
 **哪些改变，哪些不变。**
 
-- 只有拍摄时的照片显影使用这些参数表。JPEG 再应用残差；**NEF 内嵌预览带有拟合风格但不含残差**（二者来自同一次显影），NEF 原始数据保持原样。
-- 本版中，Log 风格的实时取景保持相机正常渲染。
+- 拍摄时的照片显影使用这些参数表。JPEG 再应用残差；**NEF 内嵌预览带有拟合风格但不含残差**（二者来自同一次显影），NEF 原始数据保持原样。
+- **照片模式的实时取景**（EVF、液晶屏和 HDMI 输出）也用同一套参数表：相机每次更新取景参数时（约每帧一次），这两次参数构建同样走原厂 N-Log 处理链并使用该风格的参数表。经 CPU 预览路径显示的画面（即 `nikon-sdr` 风格在取景中生效的同一路径，同一 65×65 色度缓存，开销相同）另外应用同一残差网格，使取景接近 JPEG；只有连续两次取景参数构建都已使用该风格的参数表后才开始应用，避免残差落到仍按原参数显影的画面上。残差为恒等时不经过 CPU。不经过该路径的输出只带参数表部分，精度见上表“仅 ISP”一栏。
+- 录像模式、回放、菜单以及 `nikon-sdr` 风格或“关闭”时，取景保持原厂行为；录像模式下 Log 功能组的 N-Log、S-Log3、Log3G10 监看不受影响。切换菜单库、风格或关闭照片 LUT 后，下一次取景参数构建即恢复原厂参数。
+- 显影选择开关（N-Log 色调）只在这几次构建期间打开，结束后立即恢复，测光、直方图、斑马纹和元数据看到的始终是原厂 SDR 设定。照片显影与实时取景各用一份参数表副本和各自的通道，可在不同 CPU 上同时进行；载入新库不会释放正在使用的参数表。
 - 与所有风格一样，所选 Log 风格可用时才允许拍摄。若照片显影没有使用该次拍摄自己的参数表（例如正在发布新库），JPEG 保持原样，元数据也不声明风格。
 - Log 风格不能用 `--runtime` 导出：其网格是相机参数表之后的残差，不是独立变换；`--source` 可导出原始 cube。
 
-**尚未实机验证。** QEMU 模拟器运行原厂固件，但其图像管线只做功能模拟、不应用颜色参数表，因此只能证明显影使用了该风格的参数表、JPEG 精确应用了残差，不能证明颜色。仍需实机确认：照片 ISO 下 18% 灰的曝光位置、照片路径最终的 Y'CbCr 编码、各机身校准是否与视频相同地合成、平滑渐变中的色带，以及分通道曲线。
+**尚未实机验证。** QEMU 模拟器运行原厂固件，但其图像管线只做功能模拟、不应用颜色参数表，因此只能证明显影使用了该风格的参数表、JPEG 精确应用了残差，不能证明颜色。仍需实机确认：照片 ISO 下 18% 灰的曝光位置、照片路径和实时取景最终的 Y'CbCr 编码（残差按 JPEG 的 8 位全范围 BT.601 编码制作，与 `nikon-sdr` 预览路径的前提相同）、取景参数从构建到画面的延迟、各机身校准是否与视频相同地合成、平滑渐变中的色带，以及分通道曲线。
 
 ### 固件与存储卡风格
 
@@ -146,14 +148,14 @@ Z8_PHOTO_LUT_ROM=z8-main-payload.bi python -B -m unittest discover -s tests -p '
 
 ### 验证范围
 
-宿主测试覆盖库格式、编辑、导出、错误输入、输入基准规则、编译器（固件整数格式、先量化后求逆、相机运算核）和与相机校验代码的一致性；自动恢复、延迟读取时的选择合并、菜单库默认值、拍摄锁定、照片显影包装与共享颜色钩子、残差 JPEG 路径和 XMP 写入由实际编译的固件代码在 Unicorn 中执行（文件系统和 XMP 合成器为桩）。原厂设置代码测试还在模拟 NOR 上执行第 16 节读写、模式 4 恢复及默认值，覆盖中断写入和原厂前缀保留。QEMU 模拟器另行运行原厂菜单、存储卡，以及带显影追踪的 Log 风格拍摄。实机菜单显示、存储卡读取、色彩、速度及 Lightroom/NX Studio 的显示均未验证。
+宿主测试覆盖库格式、编辑、导出、错误输入、输入基准规则、编译器（固件整数格式、先量化后求逆、相机运算核）和与相机校验代码的一致性；自动恢复、延迟读取时的选择合并、菜单库默认值、拍摄锁定、照片显影与实时取景构建包装、两个参数表通道（含同时显影）、取景模式判断、选择开关恢复、共享颜色钩子、残差 JPEG 与取景路径和 XMP 写入由实际编译的固件代码在 Unicorn 中执行（文件系统和 XMP 合成器为桩）。原厂设置代码测试还在模拟 NOR 上执行第 16 节读写、模式 4 恢复及默认值，覆盖中断写入和原厂前缀保留。QEMU 模拟器另行运行原厂菜单、存储卡，以及带显影和取景构建追踪的 Log 风格拍摄与录像模式。实机菜单显示、存储卡读取、色彩、速度及 Lightroom/NX Studio 的显示均未验证。
 
 ## English
 
 Photo LUT gives JPEGs a look from a 3D LUT. Each look declares the input its LUT was made for:
 
 - **`nikon-sdr`** (default): the LUT acts on the photo the camera has already rendered, the JPEG's 8-bit Y'CbCr after the active Picture Control, in the selected colour space. Live view and JPEG use the same look.
-- **A Log basis** (N-Log, S-Log3, Log3G10, F-Log2, LogC3, LogC4 or V-Log, each with its gamut): the still is developed through the camera's own Log chain with tables fitted to the look on the computer, then a small residual grid finishes the JPEG. See [Log looks](#log-looks).
+- **A Log basis** (N-Log, S-Log3, Log3G10, F-Log2, LogC3, LogC4 or V-Log, each with its gamut): the still and photo-mode live view are developed through the camera's own Log chain with tables fitted to the look on the computer, then a small residual grid finishes the JPEG and the live picture. See [Log looks](#log-looks).
 
 **NEF raw data is never changed.**
 
@@ -230,12 +232,14 @@ The 8-bit Y'CbCr hand-off alone costs about 0.2 dE00 at the median; the remainin
 
 **What changes and what does not.**
 
-- Only the still develop of a capture uses the tables. The JPEG gets the residual; **NEF embedded previews carry the fitted look without the residual** (one develop feeds both), while the NEF raw data stays original.
-- Live view stays the camera's normal rendering for Log looks in this release.
+- The still develop of a capture uses the tables. The JPEG gets the residual; **NEF embedded previews carry the fitted look without the residual** (one develop feeds both), while the NEF raw data stays original.
+- **Photo-mode live view** (EVF, LCD and HDMI output) uses the same tables: whenever the camera updates its live-view parameters (about once per frame), those two builds also run the native N-Log chain with the look's tables. Frames shown through the CPU preview path (the path through which `nikon-sdr` looks reach live view, with the same 65×65 chroma cache and cost) additionally get the same residual grid, so live view approaches the JPEG; it starts only after two consecutive live builds used the look's tables, so the residual never lands on frames still developed with the previous ones. An identity residual skips the CPU. Outputs outside that path carry the tables only, with the "ISP only" accuracy in the table above.
+- Movie mode, playback, menus, `nikon-sdr` looks and Off keep native live view; the Log feature group's N-Log, S-Log3 and Log3G10 monitoring in movie mode is unaffected. After a bank or look change, or turning photo LUT off, the next live-view build is native again.
+- The develop selector (N-Log tone) is set only for the duration of these builds and restored right after, so metering, histogram, zebras and metadata always see the native SDR setting. The still develop and live view each use their own table copy and lane and may build at the same time on different CPUs; loading a new library never frees tables in use.
 - A capture is admitted only when the selected Log look is available, as for every look. If the still develop did not use the capture's own tables (for example a library publication in progress), the JPEG stays native and its metadata claims no look.
 - The `--runtime` export is refused for Log looks: their grid is a residual after the camera's tables, not a standalone transform. `--source` exports the original cube.
 
-**Not verified on a camera.** The QEMU emulator runs the original firmware with a functional image pipeline that does not apply colour tables, so it proves the develop uses the look's tables and the JPEG gets exactly the residual, not the colours. The physical-camera checks still open: exposure placement of 18 % grey at still ISOs, the still path's final Y'CbCr encoding, whether each body's calibration composes as for video, banding in smooth gradients, and per-channel curves.
+**Not verified on a camera.** The QEMU emulator runs the original firmware with a functional image pipeline that does not apply colour tables, so it proves the develop uses the look's tables and the JPEG gets exactly the residual, not the colours. The physical-camera checks still open: exposure placement of 18 % grey at still ISOs, the final Y'CbCr encoding of the still path and of live view (the residual is built for the JPEG's 8-bit full-range BT.601 encoding, the same premise as the `nikon-sdr` preview path), the delay from a live build to its frames, whether each body's calibration composes as for video, banding in smooth gradients, and per-channel curves.
 
 ### Firmware and card looks
 
@@ -290,4 +294,4 @@ Without `Z8_PHOTO_LUT_ROM` only host tests run; `Z8_PHOTO_LUT_SAMPLE_JPEG` may n
 
 ### Evidence
 
-Original-ROM settings tests additionally execute section-16 read/write, mode-4 restore and defaults over modelled NOR, including interrupted writes and stock-prefix preservation. Host tests cover the library format, editing, exports, malformed input, input-basis rules, the compiler (firmware integer formats, quantise-then-invert, the camera kernel) and parity with the camera's validator; automatic restore, pending-change merges, bank defaults, capture latching, the still-develop wrappers with the shared colour hooks, the residual JPEG path and XMP insertion run the actual compiled firmware code in Unicorn with stubbed file system and XMP composer. The QEMU emulator separately runs the original menus, card and a Log-look capture with traced still develop. Physical menu drawing, card reads, colour, speed and Lightroom/NX Studio display are not verified.
+Original-ROM settings tests additionally execute section-16 read/write, mode-4 restore and defaults over modelled NOR, including interrupted writes and stock-prefix preservation. Host tests cover the library format, editing, exports, malformed input, input-basis rules, the compiler (firmware integer formats, quantise-then-invert, the camera kernel) and parity with the camera's validator; automatic restore, pending-change merges, bank defaults, capture latching, the still-develop and live-view build wrappers, both provider lanes (including simultaneous builds), the live-view mode gate, selector restore, the shared colour hooks, the residual JPEG and live-view paths and XMP insertion run the actual compiled firmware code in Unicorn with stubbed file system and XMP composer. The QEMU emulator separately runs the original menus, card, a Log-look capture with traced still-develop and live-view builds, and movie mode. Physical menu drawing, card reads, colour, speed and Lightroom/NX Studio display are not verified.
