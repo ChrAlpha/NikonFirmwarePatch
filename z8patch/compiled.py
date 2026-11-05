@@ -30,6 +30,10 @@ SPECS.update({
     'quality':dict(source='z8quality/src/hooks.S', flags=ASM,asm_base=0x40A41000,limit=0x40A50000,folder='z8quality'),
     'shared':dict(source='z8patch/src/shared.S', flags=ASM,asm_base=0x40980000,limit=0x40980F00,folder='z8patch/src'),
     'colour':dict(source='z8colour/src/colour.S', flags=ASM,asm_base=0x40981000,limit=0x40981F00,folder='z8colour'),
+    # One translation unit (lut.c, metadata.c, firmware.c and hooks.S); its hooks lead the code at the cave.
+    'photo-lut':dict(source='z8photolut/src/unit.c', flags=FLAGS+['-mno-outline-atomics','-fno-vectorize','-fno-slp-vectorize','-Iz8photolut/src'],
+                     cave=0x40B50000, limit=0x40B68000, entry='z8_photo_lut_jpeg_entry', folder='z8photolut/src', suffixes=C_SOURCES,
+                     general_registers=True),
 })
 
 
