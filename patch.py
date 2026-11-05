@@ -11,6 +11,9 @@ sys.dont_write_bytecode = True
 from z8prores.package import Package, PACKAGE_BYTES, RESOURCES, require, require_official_input, sha
 from features import build, compatibility, FEATURES
 
+INTERACTIVE_LABELS = ('Framing / 开放门＋反挤压＋N-RAW 四档', 'Video quality / ProRes＋H.265 品质', 'Log colour / Log 色彩',
+                      'Photo tools / RAW 预拍＋像素偏移', 'Photo LUT / 照片 LUT（卡上风格库）')
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -19,8 +22,8 @@ def main():
     ap.add_argument('--version', help='Output version NN.NN; choose a distinct identity for a different feature set')
     ap.add_argument('--tag', default='p0', help='Internal revision suffix: lowercase letter plus digit; default p0')
     group = ap.add_mutually_exclusive_group()
-    group.add_argument('--features', nargs='+', choices=FEATURES, help='Explicit nonempty selection of the four feature groups')
-    group.add_argument('--interactive', action='store_true', help='Choose one or more of the four features')
+    group.add_argument('--features', nargs='+', choices=FEATURES, help='Explicit nonempty selection of the feature groups')
+    group.add_argument('--interactive', action='store_true', help='Choose one or more of the feature groups')
     ap.add_argument('--code-source', choices=['prebuilt', 'source'], default='prebuilt',
                     help='Native patch code: reviewed prebuilt Release bytes (default), or explicitly compile from source')
     ap.add_argument('--compiler', help='Clang executable; requires --code-source source; default clang')
@@ -33,11 +36,14 @@ def main():
     if a.check and (a.output or a.version or a.tag != 'p0' or a.interactive or a.compiler or a.code_source != 'prebuilt'):
         ap.error('--check cannot be combined with output options')
     if a.interactive:
-        print('1: Framing / 开放门＋反挤压＋N-RAW 四档\n2: Video quality / ProRes＋H.265 品质\n3: Log colour / Log 色彩\n4: Photo tools / RAW 预拍＋像素偏移\n5: All / 全选')
-        choice=input('Select numbers separated by commas / 用逗号分隔 [1,2,3,4 or 5]: ').strip()
+        groups=[str(i) for i in range(1,len(FEATURES)+1)]
+        every=str(len(FEATURES)+1)
+        print('\n'.join(f'{n}: {label}' for n,label in zip(groups+[every],INTERACTIVE_LABELS+('All / 全选',))))
+        choice=input(f'Select numbers separated by commas / 用逗号分隔 [{",".join(groups)} or {every}]: ').strip()
         parts=[v.strip() for v in choice.split(',')]
-        require(parts and len(parts)==len(set(parts)) and (parts==['5'] or all(p in ('1','2','3','4') for p in parts)), 'Select 1,2,3,4 or 5 for all')
-        a.features=list(FEATURES) if parts==['5'] else [FEATURES[int(p)-1] for p in parts]
+        require(parts and len(parts)==len(set(parts)) and (parts==[every] or all(p in groups for p in parts)),
+                f'Select {",".join(groups)} or {every} for all')
+        a.features=list(FEATURES) if parts==[every] else [FEATURES[int(p)-1] for p in parts]
     require(a.check or a.features, 'Choose --features or --interactive explicitly')
     selected = a.features or list(FEATURES)
     require(a.firmware.is_file(), 'Input must be a regular firmware file')
@@ -89,6 +95,9 @@ def main():
                                         history_ceiling=30, c15=True, c30=True,
                                         raw_compression=['HE', 'HE-star'], dx=True, lossless_fallback='HE-star',
                                         diagnostic_footer=False, budget_us=1500000, space_refusal_fallback='stock JPEG only', remaining_count='NEF-aware plus ordinary JPEG grade/star estimate for eligible FX/DX/L frames; release admission/overflow still use stock JPEG plan')
+    if 'photo-lut' in selected:
+        report['photo_lut'] = dict(control='Photo shooting menu > Photo LUT', library='Z8LUTLIB.BIN at either card root',
+                                   builtin_looks=0, manage='photo_lut.py library', raw_unchanged=True)
     # Create only after validation. Exclusive creation never replaces input or an earlier build.
     # On I/O failure the directory is kept, without a successful manifest, for inspection.
     a.output.mkdir(parents=True, exist_ok=False)

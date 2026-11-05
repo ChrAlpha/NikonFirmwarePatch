@@ -15,8 +15,8 @@ sys.path.insert(0, str(ROOT))
 from z8patch import compiled
 from tools.check_release import TAG
 
-UNITS = ('precapture','pixelshift','pixelshift-af','opengate','anamorphic','h265','log','quality','shared','colour')
-FOLDERS = {'precapture':'z8precapture/', 'pixelshift':'z8pixelshift/src/', 'pixelshift-af':'z8pixelshift/src/', 'opengate':'z8opengate/src/', 'anamorphic':'z8anamorphic/', 'h265':'z8h265/', 'log':'z8log/', 'quality':'z8quality/', 'shared':'z8patch/src/', 'colour':'z8colour/'}
+UNITS = ('precapture','pixelshift','pixelshift-af','opengate','anamorphic','h265','log','quality','shared','colour','photo-lut')
+FOLDERS = {'precapture':'z8precapture/', 'pixelshift':'z8pixelshift/src/', 'pixelshift-af':'z8pixelshift/src/', 'opengate':'z8opengate/src/', 'anamorphic':'z8anamorphic/', 'h265':'z8h265/', 'log':'z8log/', 'quality':'z8quality/', 'shared':'z8patch/src/', 'colour':'z8colour/', 'photo-lut':'z8photolut/src/'}
 
 
 class WindowsPathView:
@@ -66,6 +66,9 @@ class CompiledPathTests(unittest.TestCase):
             'z8quality/src/hooks.S': b'/* star fixture */\n',
             'z8quality/icons/fixture.png': b'fake png fixture\n',
             'z8patch/src/shared.S': b'/* shared fixture */\n',
+            'z8photolut/src/unit.c': b'/* photo LUT fixture */\n',
+            'z8photolut/src/hooks.S': b'/* photo LUT hooks fixture */\n',
+            'z8photolut/src/lut.h': b'#define FIXTURE 1\n',
         }
         for name, raw in self.sources.items():
             target = self.root / name

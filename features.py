@@ -1,4 +1,4 @@
-"""Compose four feature groups against one exact original C3.11 payload."""
+"""Compose five feature groups against one exact original C3.11 payload."""
 import binascii
 import json
 import re
@@ -7,10 +7,10 @@ from z8prores.package import require, sha
 from z8prores.patcher import public_words
 from z8prores.menu import Image
 from z8patch.compiled import load
-from z8patch.shared import Strings, VideoMenu, loader
+from z8patch.shared import PhotoMenu, Strings, VideoMenu, loader
 from z8colour.patcher import emit as colour_emit
 
-FEATURES = ('framing','video-quality','log-colour','photo-tools')
+FEATURES = ('framing','video-quality','log-colour','photo-tools','photo-lut')
 ROOT = Path(__file__).resolve().parent
 STOCK_SHA = 'f85e0138e2f5e660ece8560de62e0d12cb795e0e14983e50f20b61dce906c46c'
 
@@ -36,8 +36,8 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
     require(len(eg)==81807711 and sha(eg)==STOCK_SHA, 'Incompatible input: exact original C3.11 EG required')
     require(code_source in ('source','prebuilt'), 'Select prebuilt or source')
     img = Image(eg)
-    strings,menu=Strings(),VideoMenu(eg)
-    detail,callbacks={},{}
+    strings,menu,photo=Strings(),VideoMenu(eg),PhotoMenu(chosen)
+    detail,callbacks,photo_row={},{},0
     log_tables,still_provider=None,0
 
     def unit(name):
@@ -46,7 +46,7 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
 
     def merge(feature,source,refinements=()):
         for e in source.edits:
-            if menu.consumed(e):continue
+            if menu.consumed(e) or photo.consumed(e):continue
             overlap=[x for x in img.edits if e['offset']<x['end'] and x['offset']<e['end']]
             if overlap:
                 require(e['offset']+0x40160000 in refinements and len(overlap)==1,'Unregistered feature overlap')
@@ -107,14 +107,21 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
         af,_=load('pixelshift-af',code_source,compiler)
         part,detail['pixelshift']=build_main(eg,code,meta['symbols'],af,strings)
         merge('pixelshift',part)
+    if 'photo-lut' in chosen:
+        from z8photolut.patcher import build_main
+        code,entries=unit('photo-lut')
+        part,detail['photo-lut']=build_main(eg,code,entries,strings)
+        merge('photo-lut',part)
+        photo_row=entries['z8_photo_lut_row_refresh']
     if log_tables or still_provider:
         code,entries=unit('colour')
         detail['colour']=colour_emit(img,code,entries,log_tables,still_provider)
     detail['strings']=strings.emit(img)
-    if callbacks:
+    detail['menu']=None
+    if callbacks or photo.active:
         code,entries=unit('shared')
-        detail['menu']=menu.emit(img,chosen,code,entries,callbacks)
-    else:detail['menu']=None
+        if callbacks:detail['menu']=menu.emit(img,chosen,code,entries,callbacks)
+        if photo.active:detail['photo_menu']=photo.emit(img,chosen,code,entries,photo_row)
     detail['loader']=loader(img,chosen)
     rows = [dict(offset=hex(e['offset']),bytes=len(e['new']),purpose=e['purpose'],
                  old_sha256=sha(e['old']),new_sha256=sha(e['new'])) for e in sorted(img.edits,key=lambda r:r['offset'])]
