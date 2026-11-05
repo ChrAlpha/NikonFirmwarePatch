@@ -2075,8 +2075,8 @@
       "resource": "resources/quality.bin"
     },
     "shared": {
-      "bytes": 248,
-      "sha256": "c5667d69cdf7f2fb9886ebc43f07ded97e4eb42a61e772f4cf2b560636eff2da",
+      "bytes": 336,
+      "sha256": "a2020ef312488c081ff5b7fb07597d935c964b3fe74cf7e5ade85ea5e1afe8ce",
       "symbols": {
         "shared_bank": {
           "va": "0x40980000",
@@ -2085,12 +2085,20 @@
         "shared_refresh": {
           "va": "0x40980090",
           "bytes": 0
+        },
+        "shared_video_end": {
+          "va": "0x409800f8",
+          "bytes": 0
+        },
+        "shared_photo_refresh": {
+          "va": "0x40980100",
+          "bytes": 0
         }
       },
       "source_sha256": {
-        "z8patch/src/shared.S": "2d831aeed33dded53637a104ed600c5767e7aa6eb795c7f731a0953b4170dd98"
+        "z8patch/src/shared.S": "66d9ff02353836d2162bdd05475beae1153b99de64e44f23c61ef55a06e23d75"
       },
-      "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+      "compiler": "Debian clang version 19.1.7 (3+b1)",
       "flags": [
         "-target",
         "aarch64-none-elf",

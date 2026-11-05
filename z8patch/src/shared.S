@@ -1,7 +1,10 @@
 /* Shared menu update and DS bank copy. CONFIG is read-only composition data:
- * +0 u32 mask (1 framing, 2 video-quality, 4 log-colour), +8 four row callbacks.
+ * +0 u32 mask (1 framing, 2 video-quality, 4 log-colour), +8 four row callbacks,
+ * +0x28 photo menu base refresh, +0x30 photo-lut row callback.
  * Copy only the selected extra bytes; DS 120B +2 is a playback cache, never a setting.
  * Each row callback omits its old call to the native refresh. Call native once here.
+ * The video part (up to shared_video_end) and the photo part are installed separately,
+ * each only when its menu has a selected provider (z8patch/shared.py).
  */
 #define CONFIG 0x40980F00
 .text
@@ -65,5 +68,30 @@ shared_refresh:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
+    ret
+.ltorg
+.global shared_video_end
+shared_video_end:
+
+/* Photo shooting menu refresh: the base refresh (pixel-shift's with photo-tools,
+ * else native) keeps its result; the photo-lut row callback follows. */
+.balign 16
+.global shared_photo_refresh
+shared_photo_refresh:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    ldr x8, =(CONFIG + 0x28)
+    ldr x8, [x8]
+    blr x8
+    mov x20, x0
+    ldr x8, =(CONFIG + 0x30)
+    ldr x8, [x8]
+    mov x0, x19
+    blr x8
+    mov x0, x20
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
     ret
 .ltorg
