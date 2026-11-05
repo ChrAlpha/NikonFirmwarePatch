@@ -1,0 +1,5 @@
+# Only for compiling Log-referred photo LUT looks (photo_lut.py library add --basis <log basis>).
+# patch.py, verify.py and nikon-sdr library operations need none of these.
+numpy==2.5.4
+scipy==1.18.1
+colour-science==0.4.7
