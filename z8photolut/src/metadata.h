@@ -10,9 +10,12 @@
  * touched, and nothing implies a host tool should re-apply the transform. */
 #define Z8_META_NS "https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/"
 #define Z8_META_PREFIX "photolut"
-#define Z8_META_SCHEMA "1.0"
-#define Z8_META_INPUT_BASIS "nikon-rendered-sdr"
+#define Z8_META_SCHEMA "1.1"
+/* Rendering by look kind (lut.h Z8_RENDER_*): a cpu-3d grid baked into the
+ * JPEG pixels, or the still developed through fitted ISP tables plus a
+ * residual grid. InputBasis is the look's declared basis key (lut.c). */
 #define Z8_META_RENDERING "baked-into-jpeg-pixels"
+#define Z8_META_RENDERING_ISP "isp-fitted+residual"
 
 #define Z8_META_XMPMETA_NS "adobe:ns:meta/"
 #define Z8_META_RDF_NS "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -30,8 +33,10 @@
 typedef struct {
     char name[64];                      /* UTF-8, NUL-padded, 1..63 bytes */
     uint8_t id[32];                     /* transform SHA-256 */
-    uint32_t grid, strength, identity;  /* strength 0..256, 256 = full */
+    uint32_t grid, strength, identity;  /* strength 0..256, 256 = full; identity: no-op cpu-3d grid */
     char firmware[Z8_META_FIRMWARE_BYTES]; /* optional, all-NUL to omit */
+    uint32_t basis, rendering;          /* lut.h input basis and Z8_RENDER_* (isp: basis != 0) */
+    uint8_t fit[32];                    /* isp+residual: ISP tables SHA-256 */
 } Z8LutProvenance;
 
 enum {

@@ -13,7 +13,7 @@ from pathlib import Path
 import struct
 import unittest
 
-from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,LIBRARY,STATE,desire,native_code,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,LEASE_MUTABLE,LIBRARY,STATE,desire,native_code,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,branch
 
 try:
@@ -161,7 +161,7 @@ class CompiledGraphMachine(NativeGraphMachine):
         if allocated!=OWNER:
             raise AssertionError('Compiled allocator did not initialize the fixture owner')
         self.footer=CACHED+self.capacity-LEASE_BYTES
-        self.private_descriptor=self.footer+192
+        self.private_descriptor=self.footer+LEASE_MUTABLE
 
     def map_cached(self,address,bytes):
         first=address&~4095
@@ -197,7 +197,7 @@ class CompiledGraphMachine(NativeGraphMachine):
         self.map_cached(cached,len(PRIVATE_THUMBNAIL))
         self.m.mem_write(cached,PRIVATE_THUMBNAIL)
         self.descriptor(self.private_descriptor,raw,PRIVATE_THUMBNAIL)
-        self.write32(self.footer+240,1)
+        self.write32(self.footer+LEASE_MUTABLE+48,1)
 
     def compiled_graph(self,file_id,graph,callsite):
         wrapper=self.symbols['z8_photo_lut_file_graph']

@@ -2147,211 +2147,231 @@
       "resource": "resources/colour.bin"
     },
     "photo-lut": {
-      "bytes": 65404,
-      "sha256": "8a70a160f01cd26780ac54b5f13d534fff2710579dad782cf274dbfe84acd846",
+      "bytes": 71316,
+      "sha256": "a3569b5cdf7137be84521eddf9ac96b67b6211e5c092c2582419d05ba3397b18",
       "symbols": {
         "$x": {
-          "va": "0x40b509b0",
+          "va": "0x40b50a20",
           "bytes": 0
         },
         "sha_add": {
-          "va": "0x40b50af8",
+          "va": "0x40b50b68",
           "bytes": 564
         },
         "sha_finish": {
-          "va": "0x40b50d2c",
+          "va": "0x40b50d9c",
           "bytes": 344
         },
         "sha_k": {
-          "va": "0x40b5f4e8",
+          "va": "0x40b60a78",
           "bytes": 256
         },
+        "basis_keys": {
+          "va": "0x40b60390",
+          "bytes": 64
+        },
+        "z8_lut_isp_look_id.domain": {
+          "va": "0x40b603d0",
+          "bytes": 255
+        },
+        "sha_u32": {
+          "va": "0x40b5103c",
+          "bytes": 40
+        },
+        "z8_lut_fit_id.domain": {
+          "va": "0x40b604cf",
+          "bytes": 17
+        },
         "z8_lut_look_id.domain": {
-          "va": "0x40b5ef50",
+          "va": "0x40b604e0",
           "bytes": 139
         },
         "utf8_minimum": {
-          "va": "0x40b5f840",
+          "va": "0x40b60dd0",
           "bytes": 16
         },
         "z8_lut_validate.domain": {
-          "va": "0x40b5efdb",
+          "va": "0x40b6056b",
           "bytes": 21
         },
         "skip_trivia": {
-          "va": "0x40b5b468",
+          "va": "0x40b5ca50",
           "bytes": 428
         },
         "attribute_is": {
-          "va": "0x40b5b614",
+          "va": "0x40b5cbfc",
           "bytes": 716
         },
         "emit_record": {
-          "va": "0x40b5368c",
-          "bytes": 1420
+          "va": "0x40b53d64",
+          "bytes": 2304
         },
         "emit_property": {
-          "va": "0x40b5b8e0",
+          "va": "0x40b5cec8",
           "bytes": 1660
         },
         "emit_hex.hex": {
-          "va": "0x40b5fac7",
+          "va": "0x40b611df",
           "bytes": 17
         },
         "emit_number": {
-          "va": "0x40b5bf5c",
+          "va": "0x40b5d544",
           "bytes": 1000
         },
         "choice": {
-          "va": "0x40b543ac",
-          "bytes": 136
+          "va": "0x40b54df8",
+          "bytes": 180
         },
         "preview_start_worker": {
-          "va": "0x40b54434",
+          "va": "0x40b54eac",
           "bytes": 456
         },
         "preview_source": {
-          "va": "0x40b545fc",
+          "va": "0x40b55074",
           "bytes": 300
         },
         "copy_bytes": {
-          "va": "0x40b54728",
+          "va": "0x40b551a0",
           "bytes": 64
         },
         "no_library": {
-          "va": "0x40b5f0a0",
+          "va": "0x40b60630",
           "bytes": 1088
         },
         "evaluate": {
-          "va": "0x40b5c344",
+          "va": "0x40b5963c",
           "bytes": 504
         },
         "preview_worker": {
-          "va": "0x40b5c53c",
-          "bytes": 3436
+          "va": "0x40b5d92c",
+          "bytes": 3508
         },
         "preview_callback": {
-          "va": "0x40b54da8",
+          "va": "0x40b55820",
           "bytes": 696
         },
         "retire_private": {
-          "va": "0x40b5d474",
+          "va": "0x40b5e8ac",
           "bytes": 340
         },
         "reset_display_queue": {
-          "va": "0x40b55068",
+          "va": "0x40b55ae0",
           "bytes": 628
         },
         "observe_application": {
-          "va": "0x40b552f4",
+          "va": "0x40b55d6c",
           "bytes": 684
         },
         "record_read": {
-          "va": "0x40b55efc",
+          "va": "0x40b56974",
           "bytes": 436
         },
         "record_publish": {
-          "va": "0x40b560b0",
+          "va": "0x40b56b28",
           "bytes": 484
         },
         "persist_bootstrap": {
-          "va": "0x40b564d8",
+          "va": "0x40b56f50",
           "bytes": 584
         },
         "card_worker_start": {
-          "va": "0x40b56720",
+          "va": "0x40b57198",
           "bytes": 400
         },
         "region_state": {
-          "va": "0x40b57ac8",
+          "va": "0x40b58540",
           "bytes": 348
         },
         "persist_decide": {
-          "va": "0x40b56c14",
+          "va": "0x40b5768c",
           "bytes": 2972
         },
         "card_worker": {
-          "va": "0x40b5e028",
+          "va": "0x40b5f460",
           "bytes": 1836
         },
         "record_valid": {
-          "va": "0x40b57f50",
+          "va": "0x40b589e0",
           "bytes": 596
         },
         "menu_text": {
-          "va": "0x40b581a4",
+          "va": "0x40b58c34",
           "bytes": 1284
         },
         "card_text": {
-          "va": "0x40b5f640",
+          "va": "0x40b60bd0",
           "bytes": 264
         },
         "menu_text.representative": {
-          "va": "0x40b5f638",
+          "va": "0x40b60bc8",
           "bytes": 3
         },
         "text_append": {
-          "va": "0x40b5de54",
+          "va": "0x40b5f28c",
           "bytes": 468
         },
         "jpeg_worker": {
-          "va": "0x40b5d5c8",
+          "va": "0x40b5ea00",
           "bytes": 1200
         },
         "jpeg_output": {
-          "va": "0x40b59084",
-          "bytes": 608
+          "va": "0x40b5a408",
+          "bytes": 824
         },
         "jpeg_lease": {
-          "va": "0x40b598ac",
-          "bytes": 612
+          "va": "0x40b5ad4c",
+          "bytes": 668
+        },
+        "developed": {
+          "va": "0x40b5afe8",
+          "bytes": 116
         },
         "jpeg_encode_locked": {
-          "va": "0x40b59b10",
+          "va": "0x40b5b05c",
           "bytes": 1104
         },
         "jpeg_encode_locked.capacities": {
-          "va": "0x40b5f860",
+          "va": "0x40b60df0",
           "bytes": 16
         },
         "jpeg_encode_locked.offsets": {
-          "va": "0x40b5f850",
+          "va": "0x40b60de0",
           "bytes": 16
         },
         "jpeg_transform": {
-          "va": "0x40b5da78",
+          "va": "0x40b5eeb0",
           "bytes": 988
         },
         "z8_photo_lut_text_font.languages": {
-          "va": "0x40b5f4e0",
+          "va": "0x40b60a70",
           "bytes": 5
         },
         "z8_rom_fonts": {
-          "va": "0x40b5f77c",
+          "va": "0x40b60d0c",
           "bytes": 192
         },
         "desire_bank": {
-          "va": "0x40b5af14",
+          "va": "0x40b5c4fc",
           "bytes": 648
         },
         "trim_frames": {
-          "va": "0x40b5d2a8",
+          "va": "0x40b5e6e0",
           "bytes": 460
         },
         "card_publish": {
-          "va": "0x40b5e754",
+          "va": "0x40b5fb8c",
           "bytes": 604
         },
         "card_load": {
-          "va": "0x40b5e9b0",
+          "va": "0x40b5fde8",
           "bytes": 1436
         },
         "card_worker.backoff": {
-          "va": "0x40b5f764",
+          "va": "0x40b60cf4",
           "bytes": 24
         },
         "$d": {
-          "va": "0x40b5f870",
+          "va": "0x40b60e00",
           "bytes": 0
         },
         "z8_photo_lut_jpeg_entry": {
@@ -2359,7 +2379,7 @@
           "bytes": 4
         },
         "z8_photo_lut_jpeg": {
-          "va": "0x40b59020",
+          "va": "0x40b5a3a4",
           "bytes": 100
         },
         "z8_photo_lut_output_alloc_entry": {
@@ -2367,15 +2387,15 @@
           "bytes": 8
         },
         "z8_photo_lut_output_alloc": {
-          "va": "0x40b58890",
-          "bytes": 1936
+          "va": "0x40b59b10",
+          "bytes": 2196
         },
         "z8_photo_lut_medium_entry": {
           "va": "0x40b5000c",
           "bytes": 12
         },
         "z8_photo_lut_medium": {
-          "va": "0x40b592e4",
+          "va": "0x40b5a740",
           "bytes": 188
         },
         "z8_photo_lut_small_entry": {
@@ -2383,7 +2403,7 @@
           "bytes": 12
         },
         "z8_photo_lut_small": {
-          "va": "0x40b593a0",
+          "va": "0x40b5a7fc",
           "bytes": 188
         },
         "z8_photo_lut_xmp_entry": {
@@ -2391,15 +2411,15 @@
           "bytes": 8
         },
         "z8_photo_lut_xmp": {
-          "va": "0x40b5a0c0",
-          "bytes": 1104
+          "va": "0x40b5b60c",
+          "bytes": 1260
         },
         "z8_photo_lut_text_font_entry": {
           "va": "0x40b5002c",
           "bytes": 12
         },
         "z8_photo_lut_text_font": {
-          "va": "0x40b5a510",
+          "va": "0x40b5baf8",
           "bytes": 528
         },
         "z8_photo_lut_boot_entry": {
@@ -2407,15 +2427,15 @@
           "bytes": 164
         },
         "z8_photo_lut_boot": {
-          "va": "0x40b57c24",
-          "bytes": 812
+          "va": "0x40b5869c",
+          "bytes": 836
         },
         "z8_photo_lut_frame_entry": {
           "va": "0x40b500dc",
           "bytes": 172
         },
         "z8_photo_lut_frame": {
-          "va": "0x40b53cc8",
+          "va": "0x40b54714",
           "bytes": 1764
         },
         "z8_photo_lut_queue_entry": {
@@ -2423,7 +2443,7 @@
           "bytes": 252
         },
         "z8_photo_lut_queue": {
-          "va": "0x40b54768",
+          "va": "0x40b551e0",
           "bytes": 1600
         },
         "z8_photo_lut_mode_entry": {
@@ -2431,7 +2451,7 @@
           "bytes": 164
         },
         "z8_photo_lut_mode_enter": {
-          "va": "0x40b555a8",
+          "va": "0x40b56020",
           "bytes": 904
         },
         "z8_photo_lut_mode_exit_entry": {
@@ -2439,7 +2459,7 @@
           "bytes": 164
         },
         "z8_photo_lut_mode_exit": {
-          "va": "0x40b55930",
+          "va": "0x40b563a8",
           "bytes": 160
         },
         "z8_photo_lut_reset_entry": {
@@ -2447,7 +2467,7 @@
           "bytes": 168
         },
         "z8_photo_lut_queue_reset": {
-          "va": "0x40b55060",
+          "va": "0x40b55ad8",
           "bytes": 8
         },
         "z8_photo_lut_construct_entry": {
@@ -2455,7 +2475,7 @@
           "bytes": 168
         },
         "z8_photo_lut_queue_construct": {
-          "va": "0x40b552dc",
+          "va": "0x40b55d54",
           "bytes": 16
         },
         "z8_photo_lut_will_apply_entry": {
@@ -2463,7 +2483,7 @@
           "bytes": 164
         },
         "z8_photo_lut_will_apply": {
-          "va": "0x40b552ec",
+          "va": "0x40b55d64",
           "bytes": 8
         },
         "z8_photo_lut_applied_entry": {
@@ -2471,7 +2491,7 @@
           "bytes": 172
         },
         "z8_photo_lut_applied": {
-          "va": "0x40b555a0",
+          "va": "0x40b56018",
           "bytes": 8
         },
         "z8_photo_lut_pool_init_entry": {
@@ -2487,7 +2507,7 @@
           "bytes": 168
         },
         "z8_photo_lut_shutdown": {
-          "va": "0x40b559d0",
+          "va": "0x40b56448",
           "bytes": 104
         },
         "z8_photo_lut_power_cancel_entry": {
@@ -2495,7 +2515,7 @@
           "bytes": 160
         },
         "z8_photo_lut_power_cancel": {
-          "va": "0x40b55a38",
+          "va": "0x40b564b0",
           "bytes": 196
         },
         "z8_photo_lut_bank_reset_result_entry": {
@@ -2503,139 +2523,183 @@
           "bytes": 168
         },
         "z8_photo_lut_bank_reset_result": {
-          "va": "0x40b5b3d0",
+          "va": "0x40b5c9b8",
           "bytes": 152
         },
+        "z8_photo_lut_still_m_entry": {
+          "va": "0x40b509a4",
+          "bytes": 60
+        },
+        "z8_photo_lut_still_m_begin": {
+          "va": "0x40b59138",
+          "bytes": 1284
+        },
+        "z8_photo_lut_still_m_end": {
+          "va": "0x40b59834",
+          "bytes": 36
+        },
+        "z8_photo_lut_still_curve_entry": {
+          "va": "0x40b509e0",
+          "bytes": 56
+        },
+        "z8_photo_lut_still_curve_begin": {
+          "va": "0x40b59858",
+          "bytes": 168
+        },
+        "z8_photo_lut_still_curve_end": {
+          "va": "0x40b59900",
+          "bytes": 24
+        },
         "z8_lut_crc32": {
-          "va": "0x40b509b0",
+          "va": "0x40b50a20",
           "bytes": 188
         },
         "z8_lut_sha256": {
-          "va": "0x40b50a6c",
+          "va": "0x40b50adc",
           "bytes": 140
         },
+        "z8_lut_basis_key": {
+          "va": "0x40b50ef4",
+          "bytes": 32
+        },
+        "z8_lut_isp_look_id": {
+          "va": "0x40b50f14",
+          "bytes": 296
+        },
+        "z8_lut_fit_id": {
+          "va": "0x40b51064",
+          "bytes": 164
+        },
         "z8_lut_look_id": {
-          "va": "0x40b50e84",
+          "va": "0x40b51108",
           "bytes": 208
         },
         "z8_lut_name_valid": {
-          "va": "0x40b50f54",
+          "va": "0x40b511d8",
           "bytes": 448
         },
+        "z8_lut_isp_valid": {
+          "va": "0x40b51398",
+          "bytes": 688
+        },
         "z8_lut_validate": {
-          "va": "0x40b51114",
-          "bytes": 2140
+          "va": "0x40b51648",
+          "bytes": 2152
         },
         "z8_lut_select": {
-          "va": "0x40b51970",
-          "bytes": 100
+          "va": "0x40b51eb0",
+          "bytes": 108
+        },
+        "z8_lut_isp": {
+          "va": "0x40b51f1c",
+          "bytes": 68
         },
         "z8_lut_rgb": {
-          "va": "0x40b519d4",
+          "va": "0x40b51f60",
           "bytes": 544
         },
         "z8_lut_surface_cancel": {
-          "va": "0x40b51bf4",
+          "va": "0x40b52180",
           "bytes": 1592
         },
         "z8_lut_surface": {
-          "va": "0x40b5222c",
+          "va": "0x40b527b8",
           "bytes": 8
         },
         "z8_lut_preview_build_cancel": {
-          "va": "0x40b52234",
+          "va": "0x40b527c0",
           "bytes": 1248
         },
         "z8_lut_preview_build": {
-          "va": "0x40b52714",
+          "va": "0x40b52ca0",
           "bytes": 8
         },
         "z8_lut_preview_surface_cancel": {
-          "va": "0x40b5271c",
+          "va": "0x40b52ca8",
           "bytes": 776
         },
         "z8_lut_preview_surface": {
-          "va": "0x40b52a24",
+          "va": "0x40b52fb0",
           "bytes": 8
         },
         "z8_meta_append": {
-          "va": "0x40b52a2c",
-          "bytes": 3168
+          "va": "0x40b52fb8",
+          "bytes": 3500
         },
         "memcpy": {
-          "va": "0x40b53c18",
+          "va": "0x40b54664",
           "bytes": 28
         },
         "memset": {
-          "va": "0x40b53c34",
+          "va": "0x40b54680",
           "bytes": 24
         },
         "z8_photo_lut_capture_refresh": {
-          "va": "0x40b53c4c",
+          "va": "0x40b54698",
           "bytes": 124
         },
         "z8_photo_lut_bank_copy": {
-          "va": "0x40b55afc",
+          "va": "0x40b56574",
           "bytes": 1024
         },
         "z8_photo_lut_settings_wait": {
-          "va": "0x40b56294",
+          "va": "0x40b56d0c",
           "bytes": 580
         },
         "z8_photo_lut_settings_restored": {
-          "va": "0x40b568b0",
+          "va": "0x40b57328",
           "bytes": 60
         },
         "z8_photo_lut_restore_defaults": {
-          "va": "0x40b568ec",
+          "va": "0x40b57364",
           "bytes": 116
         },
         "z8_photo_lut_defaults": {
-          "va": "0x40b56960",
+          "va": "0x40b573d8",
           "bytes": 692
         },
         "z8_photo_lut_blob_write": {
-          "va": "0x40b577b0",
+          "va": "0x40b58228",
           "bytes": 792
         },
         "z8_photo_lut_output_budget": {
-          "va": "0x40b586a8",
-          "bytes": 488
+          "va": "0x40b59918",
+          "bytes": 504
         },
         "z8_photo_lut_thumbnail": {
-          "va": "0x40b5945c",
-          "bytes": 1104
+          "va": "0x40b5a8b8",
+          "bytes": 1172
         },
         "z8_photo_lut_file_graph": {
-          "va": "0x40b59f60",
+          "va": "0x40b5b4ac",
           "bytes": 352
         },
         "z8_photo_lut_menu_entry": {
-          "va": "0x40b5a720",
+          "va": "0x40b5bd08",
           "bytes": 764
         },
         "z8_photo_lut_menu_ok": {
-          "va": "0x40b5aa1c",
+          "va": "0x40b5c004",
           "bytes": 1272
         },
         "z8_photo_lut_row_refresh": {
-          "va": "0x40b5b19c",
+          "va": "0x40b5c784",
           "bytes": 564
         },
         "z8_photo_lut_runtime_layout": {
-          "va": "0x40b5eff0",
+          "va": "0x40b60580",
           "bytes": 172
         }
       },
       "source_sha256": {
-        "z8photolut/src/firmware.c": "c7c0912484f1946d94fc2ae71f58b8165414e6edefcc102b7beb3fa4d232a647",
-        "z8photolut/src/firmware.h": "4c4f1229664989526b0082328d0a1308118bbc83fcfa806d78e2a67d4dd02e68",
+        "z8photolut/src/firmware.c": "b105330ab9166cbaaca2585309974957b47ea19aa6af197f06ff65d4fbe49821",
+        "z8photolut/src/firmware.h": "ed8e1b48ba1b1eccb032e3868e644a3e6cf5661c8e552241b05d13a22d3195a1",
         "z8photolut/src/fonts.h": "91980e6e241a0a73c3fcaecf85c979f3c3fb7b057502df88399aa305d9a35864",
-        "z8photolut/src/hooks.S": "3c7f7ff69a319ae200209a4b0447bed7c12ec5bc7c5f1d05fb26a1ac8bc65870",
-        "z8photolut/src/lut.c": "9e1db61d3fcbb36708df9738400798f5936274f5d8c352aff534acde6369f916",
-        "z8photolut/src/lut.h": "34eedd9a10c14133b07fbdf547cfff348549dd3869dbf63a17a4a713a41de121",
-        "z8photolut/src/metadata.c": "44aba7c48d207ea708972dfe81efd3ddbc7ef63980d27c6232a65fa3ebaf55d8",
-        "z8photolut/src/metadata.h": "69803531dca4c79fa476d03766e18676043f20be00d378baf1238e3bc065ba99",
+        "z8photolut/src/hooks.S": "9b45b0358fb2b25a68f1afd378d90e7da67df25d7547404e86c75baeabb67bc2",
+        "z8photolut/src/lut.c": "946122c81fd16fde73fa399ebf3d0b1dea404c1957a03fcb44d513cffd0eb33c",
+        "z8photolut/src/lut.h": "83cb59986ce87b3a32b673787fbcdb0e2e5d7fc66a8cda46dc37cb9980fc00d4",
+        "z8photolut/src/metadata.c": "17bed9631f67a6f5451f75220288cb15c559ec456956f1c17dd03b42811f266c",
+        "z8photolut/src/metadata.h": "c194c7a714c9c548d87a57b19908415202040ce52c02c9f0dafd145037f5bd4a",
         "z8photolut/src/unit.c": "a550f269e948fecc312a16a4563a2424969c12eb7b9b59d0cbe0e598ddbf9c8f"
       },
       "compiler": "Debian clang version 19.1.7 (3+b1)",

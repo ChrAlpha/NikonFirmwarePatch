@@ -8,6 +8,7 @@
  * the region to RAM at 0xa0f800000 + (VA - 0x40200000), writable there. */
 #define Z8_ALIAS UINT64_C(0x9cf600000)
 #define Z8_STATE_VA (UINT64_C(0x40b6b000)+Z8_ALIAS)
+#define Z8_STILL_VA (UINT64_C(0x40b6c000)+Z8_ALIAS)
 #define Z8_STATE_MAGIC UINT64_C(0x32545354554c385a)
 #define Z8_PREPARE_MAGIC (Z8_STATE_MAGIC|UINT64_C(1))
 #define Z8_OPTION_FIRST 0x35b5u
@@ -200,6 +201,40 @@ typedef struct {
 } Z8LutState;
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)
+
+/* Still develop of a Log look (z8photolut/patcher.py STILL page). The shared
+ * colour unit (z8colour CONFIG +0x58) serves `provider` to the native builds
+ * whose context it names; this runtime fills it only around the two native
+ * still-develop builds (BL wrappers at 0x41053c50 and 0x41053da0) when the
+ * selected look is an available isp+residual look, so live view and every
+ * other build keep their native or movie Log tables. The look's tables are
+ * copied here first, so a library publication can never free what a build
+ * reads. served_id names the look of the most recent still develop (zero:
+ * native); the JPEG path applies a residual only to a develop of its own look. */
+typedef struct {
+    uint64_t ctx_m,ctx_c;               /* M1/M2 and curve build contexts; 0 = none */
+    uint64_t rgb,nlg,m2,m1,cpxs;        /* table pointers; 0 keeps the native table */
+} Z8ColourProvider;
+typedef struct {
+    Z8ColourProvider provider;
+    uint32_t pending_curve;             /* the served M1/M2 build's curve build is served too */
+    uint32_t saved_tone;                /* S+0xbc around the served M1/M2 build */
+    uint32_t served_sequence;           /* odd while served_id changes */
+    uint32_t served_choice;             /* telemetry: 1-based look position of the last develop */
+    uint8_t served_id[32];
+    uint64_t m_builds,curve_builds,served_m,served_curve,refused;
+    uint8_t reserved[0x100-0x90];
+    Z8IspTables tables;                 /* the served look's tables */
+} Z8StillDevelop;
+#define Z8_STILL ((volatile Z8StillDevelop *)(uintptr_t)Z8_STILL_VA)
+#define Z8_STILL_TONE 0xbcu             /* S+0xbc: 1 selects the native N-Log M1 row, M2 row and tone */
+uint32_t z8_photo_lut_still_m_begin(uint64_t parameters);
+void z8_photo_lut_still_m_end(uint64_t parameters,uint32_t served);
+uint32_t z8_photo_lut_still_curve_begin(uint64_t parameters);
+void z8_photo_lut_still_curve_end(uint32_t served);
+_Static_assert(offsetof(Z8StillDevelop,tables)==0x100 && sizeof(Z8StillDevelop)<=0x1000 &&
+               offsetof(Z8StillDevelop,served_id)==0x48 && offsetof(Z8StillDevelop,refused)==0x88,
+               "still develop page ABI");
 void z8_photo_lut_boot(void);
 uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,uint64_t configuration);
 uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t special);

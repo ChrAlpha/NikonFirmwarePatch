@@ -2,10 +2,17 @@
 """Manage portable Z8 photo LUT libraries (Z8LUTLIB.BIN) for the photo-lut feature group.
 
 A library file holds up to eight looks. Its camera part is the runtime bundle
-the firmware applies; its host part keeps each look's exact original .cube.
-Copy it to a card root and import it once in the camera; it is restored
-automatically after power cycles. Build firmware with
+the firmware applies; its host part keeps each look's exact original .cube and,
+for Log looks, the fit report. Copy it to a card root and import it once in the
+camera; it is restored automatically after power cycles. Build firmware with
 `patch.py <Z_8_0311.bin> --features photo-lut ...`; the firmware carries no looks.
+
+Each look declares its input basis with --basis: nikon-sdr (default) for cubes
+made for camera-rendered SDR, or the Log encoding and gamut the cube expects
+(n-log/bt2020, s-log3/s-gamut3.cine, log3g10/redwidegamutrgb, f-log2/f-gamut-c,
+arri-logc3/awg3, arri-logc4/awg4, v-log/v-gamut). Log looks are compiled into
+the camera's native Log still-develop tables plus a residual grid; compiling
+needs numpy, scipy and colour-science (pip install -r requirements-photo-lut-log.txt).
 """
 import argparse
 import json
@@ -15,10 +22,13 @@ import sys
 
 from z8prores.package import require, sha
 from z8photolut import library as lib
-from z8photolut.cube import INPUT_BASIS, runtime_cube
+from z8photolut.basis import BASES, parse as parse_basis
+from z8photolut.cube import runtime_cube
 
-NOTES = ('Looks act on the photo the camera has already rendered: 8-bit full-range Y\'CbCr of the JPEG after the '
-         'active Picture Control, in its selected colour space. RAW (NEF) data is never changed. '
+NOTES = ('nikon-sdr looks act on the photo the camera has already rendered: 8-bit full-range Y\'CbCr of the JPEG '
+         'after the active Picture Control, in its selected colour space. Log looks render the still through the '
+         'camera\'s Log develop with the look\'s fitted tables (JPEG and the NEF embedded previews), then the residual '
+         'is applied to the JPEG. RAW (NEF) data is never changed. '
          'Camera menu: Photo shooting menu > Photo LUT > Off, Load LUTs from card, or a look. Import once: the library '
          'source and full transform identities for banks A-D are saved internally. Card libraries restore '
          'automatically after power cycles; keep Z8LUTLIB.BIN on the card. Off retains the imported library. '
@@ -26,9 +36,19 @@ NOTES = ('Looks act on the photo the camera has already rendered: 8-bit full-ran
          'full transform identities, so renaming or reordering looks preserves them.')
 
 
-def load_cubes(paths, grid, accept):
-    return [lib.look_from_cube(Path(p).read_bytes(), source_name=Path(p).name, grid=grid,
-                               accept_input_basis=accept) for p in paths]
+def fit_options(a):
+    return {k: v for k, v in dict(grey=a.grey, smoothness=a.smoothness).items() if v is not None}
+
+
+def load_cube(path, a, name=None):
+    if a.basis != 'nikon-sdr':
+        print(f'Compiling {Path(path).name} for {a.basis} (about a minute)...', file=sys.stderr, flush=True)
+    look = lib.look_from_cube(Path(path).read_bytes(), source_name=Path(path).name, name=name, grid=a.grid,
+                              basis=a.basis, accept_input_basis=a.accept_input_basis, fit_options=fit_options(a))
+    if look.fit:
+        from z8photolut.fit import describe
+        print('\n'.join([f'{look.name}:', *describe(look.fit)]), flush=True)
+    return look
 
 
 def label_notes(library):
@@ -43,9 +63,12 @@ def show(library, as_json):
         print(json.dumps(details, ensure_ascii=False, indent=2))
         return
     print(f'Library {details["library_id"][:16]}  runtime {details["runtime_bytes"]}/{details["runtime_limit"]} bytes')
-    print(f'Input basis: {INPUT_BASIS} (camera-rendered SDR JPEG values)')
     for i, look in enumerate(details['looks'], 1):
-        notes = [f'grid {look["grid"]}', f'id {look["id"][:16]}', f'source {look["source_name"]}']
+        notes = [f'{look["input_basis"]} ({look["rendering"]})', f'grid {look["grid"]}', f'id {look["id"][:16]}',
+                 f'source {look["source_name"]}']
+        if look.get('fit'):
+            r = look['fit']['report']
+            notes.append('dE00 p50/p95 ISP {:.2f}/{:.2f}, final {:.2f}/{:.2f}'.format(*r['isp_de00'][:2], *r['final_de00'][:2]))
         if look['no_op']:
             notes.append('no-op')
         if look['input_basis_override']:
@@ -65,7 +88,7 @@ def write_new(path, raw):
 
 def library_command(a):
     if a.action == 'create':
-        library = lib.Library(tuple(load_cubes(a.lut or (), a.grid, a.accept_input_basis)))
+        library = lib.Library(tuple(load_cube(p, a) for p in a.lut or ()))
         lib.write(a.library, library, mode='create')
     elif a.action == 'verify':
         library = lib.read(a.library, deep=True)
@@ -85,6 +108,9 @@ def library_command(a):
         if a.source:
             raw = look.source
         else:
+            if look.isp:
+                raise ValueError(f'{look.name!r} is a Log look: its runtime grid is a residual after the camera\'s ISP '
+                                 'tables, not a standalone transform; export --source instead')
             raw = runtime_cube(look.name, look.grid, look.samples, (
                 f'Z8 photo LUT runtime grid (resampled; not the original source {look.source_name})',
                 f'look id sha256 {look.id.hex()}', f'semantics {lib.SEMANTICS}'))
@@ -105,9 +131,7 @@ def library_command(a):
     else:
         library = lib.read(a.library)
         if a.action == 'add':
-            look = lib.look_from_cube(Path(a.cube).read_bytes(), source_name=Path(a.cube).name, name=a.name,
-                                      grid=a.grid, accept_input_basis=a.accept_input_basis)
-            library = library.add(look, a.position)
+            library = library.add(load_cube(a.cube, a, a.name), a.position)
         elif a.action == 'rename':
             library = library.rename(a.look, a.name)
         elif a.action == 'move':
@@ -123,18 +147,27 @@ def parser():
     commands = p.add_subparsers(dest='command', required=True)
     library = commands.add_parser('library', help='Create, inspect and edit a portable look library')
     actions = library.add_subparsers(dest='action', required=True)
-    basis = dict(action='store_true', help='Accept a cube whose name/comments suggest log, HDR or another vendor '
-                 'base, confirming it was made for camera-rendered SDR')
-    grid = dict(type=int, choices=lib.GRID_SIZES, default=33, help='Runtime grid (default 33)')
+    accept = dict(action='store_true', help='Accept a nikon-sdr cube whose name/comments suggest log, HDR or another '
+                  'vendor base, confirming it was made for camera-rendered SDR')
+    grid = dict(type=int, choices=lib.GRID_SIZES, default=33,
+                help='Runtime grid: the full look, or a Log look\'s residual (default 33; 65 fits one Log look)')
+
+    def compile_options(c):
+        c.add_argument('--grid', **grid);c.add_argument('--accept-input-basis', **accept)
+        c.add_argument('--basis', default='nikon-sdr', type=lambda t: parse_basis(t).key,
+                       help='Input basis the cube expects: ' + ', '.join(b.key for b in BASES) + ' (default nikon-sdr)')
+        c.add_argument('--grey', type=float, help='Log looks: curve units of scene 18%% grey (default 400, the stock '
+                       'N-Log 0.18 point); raise to render brighter')
+        c.add_argument('--smoothness', type=float, help='Log looks: Cpxs inter-node smoothness weight (default 3)')
     c = actions.add_parser('create', help='Create a new library, empty or from up to 8 .cube files')
     c.add_argument('library', type=Path);c.add_argument('--lut', action='append', type=Path,
                                                         help='Add a .cube named by its TITLE (use add --name to choose)')
-    c.add_argument('--grid', **grid);c.add_argument('--accept-input-basis', **basis)
+    compile_options(c)
     c = actions.add_parser('add', help='Add a .cube as a new look')
     c.add_argument('library', type=Path);c.add_argument('cube', type=Path)
     c.add_argument('--name', help=f'Display name, 1..{lib.NAME_BYTES} UTF-8 bytes (default: cube TITLE or file name)')
     c.add_argument('--position', type=int, help='1-based position (default: last)')
-    c.add_argument('--grid', **grid);c.add_argument('--accept-input-basis', **basis)
+    compile_options(c)
     for action, text in [('list', 'List looks in camera order'),
                          ('verify', 'Check every byte and re-derive every look from its source (slow)')]:
         c = actions.add_parser(action, help=text);c.add_argument('library', type=Path)

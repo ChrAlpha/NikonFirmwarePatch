@@ -212,10 +212,14 @@ static uint32_t selection(const Z8LookBundle *b)
     Z8_STATE->choice=index;
     return index;
 }
+/* The look live view applies on the CPU: the applied cpu-3d look, else 0.
+ * Live view of a Log look stays native: its ISP tables serve the still
+ * develop only, and its residual is defined after those tables. */
 static uint32_t choice(void)
 {
     const Z8LookBundle *b=library_enter();
     uint32_t value=b?selection(b):0;
+    if(value && b->looks[value-1].rendering!=Z8_RENDER_CPU) value=0;
     if(b) library_exit();
     return value;
 }
@@ -1246,6 +1250,8 @@ void z8_photo_lut_boot(void)
     }
     volatile uint8_t *p=(volatile uint8_t *)s;
     for(unsigned i=0;i<sizeof(*s);i++) p[i]=0;
+    volatile uint8_t *still=(volatile uint8_t *)Z8_STILL;
+    for(unsigned i=0;i<sizeof(Z8StillDevelop);i++) still[i]=0;
     s->version=4;s->bytes=sizeof(*s);s->boots=boots+1;s->strength=256;
     s->choice=0;s->ready=1;
     if(keep) { copy_bytes((void *)(uintptr_t)&s->persist.record,&retained,sizeof(retained));s->persist.retained=1; }
@@ -1258,6 +1264,100 @@ void z8_photo_lut_boot(void)
      * mapping seam. Wake that task; its wait continuation restores our tail
      * before this event can serialize any native settings. */
     REQUEST_SAVE();
+}
+
+/* ---- still develop of a Log look -------------------------------------- */
+/* Native C3.11 still develop: 0x41053c50 calls the M1/M2 builder (thunk
+ * 0x41112dcc -> 0x41113a2c) with x0 = parameters, context [x0+0x30] (its
+ * x19) and still settings S = [x0+0x20]; 0x41053da0 then calls the curve
+ * builder (0x41112dd8 -> 0x41113e5c), context [x0+0x30]. S+0xbc = 1 selects
+ * the native N-Log M1 base row, M2 row and, through R+0x31 filled from S
+ * during the first build, the Log curve, NLG and Cpxs arms of the second.
+ * Both builds run on the develop task, one pair per capture. */
+static void served_look(const uint8_t *id)
+{
+    volatile Z8StillDevelop *d=Z8_STILL;
+    __atomic_fetch_add(&d->served_sequence,1,__ATOMIC_ACQ_REL);
+    for(unsigned i=0;i<32;i++) d->served_id[i]=id?id[i]:0;
+    __atomic_fetch_add(&d->served_sequence,1,__ATOMIC_RELEASE);
+}
+
+uint32_t z8_photo_lut_still_m_begin(uint64_t parameters)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8StillDevelop *d=Z8_STILL;
+    d->pending_curve=0;
+    if(s->magic!=Z8_STATE_MAGIC || !s->ready) return 0;
+    __atomic_fetch_add(&d->m_builds,1,__ATOMIC_RELAXED);
+    /* The still settings block lives in pool image RAM's cached alias (observed C3.11 c427a71d8). */
+    uint64_t context=read64(parameters+0x30),settings=read64(parameters+0x20);
+    const Z8LookBundle *b=main_span(context,8) && cpu_span(settings,Z8_STILL_TONE+4) && !(settings&3)?library_enter():0;
+    uint32_t index=0;
+    const Z8IspTables *tables=0;
+    if(b) {
+        if(evaluate(b,&index)==Z8_EFFECTIVE_APPLIED && (tables=z8_lut_isp(b,index))) {
+            copy_bytes((void *)&d->tables,tables,sizeof(*tables));
+            served_look(b->looks[index-1].id);
+        } else served_look(0);
+        library_exit();
+    } else {
+        /* Unreadable parameters or a publication in progress: the develop stays native. */
+        served_look(0);
+        __atomic_fetch_add(&d->refused,1,__ATOMIC_RELAXED);
+    }
+    d->served_choice=tables?index:0;
+    if(!tables) return 0;
+    volatile Z8ColourProvider *v=&d->provider;
+    v->rgb=(uintptr_t)d->tables.rgb;v->nlg=(uintptr_t)d->tables.nlg;v->m2=(uintptr_t)d->tables.m2;
+    v->m1=(uintptr_t)d->tables.m1;v->cpxs=(uintptr_t)d->tables.cpxs;
+    d->saved_tone=read32(settings+Z8_STILL_TONE);
+    *(volatile uint32_t *)(uintptr_t)(settings+Z8_STILL_TONE)=1;
+    __atomic_store_n(&v->ctx_m,context,__ATOMIC_RELEASE);
+    d->pending_curve=1;
+    __atomic_fetch_add(&d->served_m,1,__ATOMIC_RELAXED);
+    return 1;
+}
+
+void z8_photo_lut_still_m_end(uint64_t parameters,uint32_t served)
+{
+    if(!served) return;
+    volatile Z8StillDevelop *d=Z8_STILL;
+    __atomic_store_n(&d->provider.ctx_m,0,__ATOMIC_RELEASE);
+    *(volatile uint32_t *)(uintptr_t)(read64(parameters+0x20)+Z8_STILL_TONE)=d->saved_tone;
+}
+
+uint32_t z8_photo_lut_still_curve_begin(uint64_t parameters)
+{
+    volatile Z8StillDevelop *d=Z8_STILL;
+    if(Z8_STATE->magic!=Z8_STATE_MAGIC) return 0;
+    __atomic_fetch_add(&d->curve_builds,1,__ATOMIC_RELAXED);
+    if(!d->pending_curve) return 0;
+    d->pending_curve=0;
+    uint64_t context=read64(parameters+0x30);
+    if(!main_span(context,8)) return 0;
+    __atomic_store_n(&d->provider.ctx_c,context,__ATOMIC_RELEASE);
+    __atomic_fetch_add(&d->served_curve,1,__ATOMIC_RELAXED);
+    return 1;
+}
+
+void z8_photo_lut_still_curve_end(uint32_t served)
+{
+    if(served) __atomic_store_n(&Z8_STILL->provider.ctx_c,0,__ATOMIC_RELEASE);
+}
+
+/* Whether the most recent still develop used this look's ISP tables. */
+static int developed(const uint8_t id[32])
+{
+    volatile Z8StillDevelop *d=Z8_STILL;
+    for(unsigned attempt=0;attempt<64;attempt++) {
+        uint32_t before=__atomic_load_n(&d->served_sequence,__ATOMIC_ACQUIRE);
+        if(before&1) continue;
+        unsigned same=1;
+        for(unsigned i=0;i<32;i++) same&=d->served_id[i]==id[i];
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if(__atomic_load_n(&d->served_sequence,__ATOMIC_RELAXED)==before) return same;
+    }
+    return 0;
 }
 
 /* Copy the native source into the lease scratch and apply the capture's
@@ -1430,29 +1530,35 @@ static unsigned jpeg_transform(const Z8Surface *f,uint8_t *source_y,uint8_t *sou
 #define JPEG_TINY_BYTES (192u*120u*2u)
 #define JPEG_THUMB_BYTES 0x3600u
 #define JPEG_STORAGE_BYTES (JPEG_SURFACE_BYTES+JPEG_MEDIUM_BYTES+JPEG_SMALL_BYTES+JPEG_TINY_BYTES+JPEG_THUMB_BYTES)
-/* The lease latches the look at reservation: a private copy of its samples
+/* The lease latches the look at reservation: a private copy of its grid
  * (after the JPEG scratch, inside this capture's own output owner) plus its
- * identity and name. Every later JPEG step and its provenance use only this
+ * identity, name, basis, rendering and, for a Log look, the identity of its
+ * ISP tables. Every later JPEG step and its provenance use only this
  * snapshot, so a library change can never retarget an admitted capture. */
 typedef struct {
     uint64_t magic,owner,base,capacity,scratch;
     uint32_t scratch_bytes,choice;
-    uint64_t compressed_bytes,samples;      /* raw address of the sample copy, or 0 */
+    uint64_t compressed_bytes,samples;      /* raw address of the grid copy, or 0 */
     uint32_t grid,identity,reserved,sample_bytes;
     uint8_t id[32];
     char name[64];
-    uint8_t immutable_reserved[16];
+    uint32_t rendering,basis;
+    uint8_t immutable_reserved[8];
+    uint8_t fit[32];                        /* isp+residual: SHA-256 identity of the ISP tables */
+    uint8_t immutable_tail[32];
     /* Keep mutable CPU ownership on a separate cache line. */
     uint64_t thumbnail[4];
     uint32_t locks[4],thumbnail_ready,applied,mutable_reserved[2];
 } JpegLease;
-#define JPEG_LEASE_IMMUTABLE 192u
-_Static_assert(sizeof(JpegLease)==256 && offsetof(JpegLease,thumbnail)==JPEG_LEASE_IMMUTABLE,
-               "JPEG lease: three immutable lines, then one CPU line");
+#define JPEG_LEASE_IMMUTABLE 256u
+_Static_assert(sizeof(JpegLease)==320 && offsetof(JpegLease,thumbnail)==JPEG_LEASE_IMMUTABLE,
+               "JPEG lease: four immutable lines, then one CPU line");
 
+/* The grid the JPEG path applies: a cpu-3d look, or a Log look's residual. */
+static uint32_t grid_bytes(const Z8LookEntry *e) { return e->grid*e->grid*e->grid*6; }
 static uint32_t look_bytes(const Z8LookBundle *b,uint32_t selected)
 {
-    return selected?(b->looks[selected-1].bytes+63u)&~63u:0;
+    return selected?(grid_bytes(&b->looks[selected-1])+63u)&~63u:0;
 }
 
 static uint32_t jpeg_required_bytes(uint32_t bytes,uint64_t format,const Z8LookBundle *b,uint32_t selected,uint32_t *scratch)
@@ -1521,13 +1627,14 @@ uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,u
         .scratch=raw+offset,.scratch_bytes=scratch,.choice=selected,.compressed_bytes=bytes};
     if(selected) {
         const Z8LookEntry *e=&b->looks[selected-1];
-        lease->grid=e->grid;lease->identity=e->identity;
+        lease->grid=e->grid;lease->identity=e->identity;lease->rendering=e->rendering;lease->basis=e->basis;
         copy_bytes(lease->id,e->id,sizeof(lease->id));copy_bytes(lease->name,e->name,sizeof(lease->name));
+        if(e->rendering==Z8_RENDER_ISP) z8_lut_fit_id(z8_lut_isp(b,selected),lease->fit);
         if(scratch) {
             uint8_t *copy=cpu+offset+JPEG_STORAGE_BYTES;
-            lease->samples=raw+offset+JPEG_STORAGE_BYTES;lease->sample_bytes=e->bytes;
+            lease->samples=raw+offset+JPEG_STORAGE_BYTES;lease->sample_bytes=grid_bytes(e);
             invalidate(copy,look_bytes(b,selected));
-            copy_bytes(copy,(const uint8_t *)b+e->offset,e->bytes);
+            copy_bytes(copy,(const uint8_t *)b+e->offset+e->isp_bytes,grid_bytes(e));
             clean(copy,look_bytes(b,selected));
         }
     }
@@ -1559,6 +1666,7 @@ static unsigned jpeg_lease(uint64_t owner,JpegLease *lease,volatile JpegLease **
     if(lease->magic!=JPEG_LEASE_MAGIC || lease->owner!=owner || lease->base!=raw ||
        lease->capacity!=capacity || !lease->compressed_bytes ||
        lease->compressed_bytes>capacity-sizeof(*lease) || lease->choice>Z8_LUT_MAX_LOOKS ||
+       lease->rendering>Z8_RENDER_ISP || lease->basis>=Z8_BASES || (lease->basis!=0)!=(lease->rendering==Z8_RENDER_ISP) ||
        lease->scratch!=raw+((lease->compressed_bytes+511)&~UINT64_C(511)) ||
        !range(lease->scratch,(uint64_t)lease->scratch_bytes+sizeof(*lease),raw,raw+capacity))
         return Z8_LUT_BAD_SPAN;
@@ -1603,6 +1711,15 @@ static void jpeg_error(unsigned kind,unsigned error)
         Z8_STATE->jpeg_preview_error=error;
         __atomic_fetch_add(&Z8_STATE->jpeg_preview_rejected,1,__ATOMIC_RELAXED);
     }
+}
+
+/* 40e82090 returns 1 unless its encode start (40c9b648) failed; with a
+ * result block at params+0x48 it also stores completion (state+0xbc==0)
+ * in that block's first byte (40e8222c..40e82250). */
+static unsigned encode_succeeded(unsigned result,uint64_t parameters)
+{
+    uint64_t status=read64(parameters+0x48);
+    return result==1 && (!status || *(volatile const uint8_t *)(uintptr_t)status==1);
 }
 
 static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned kind,
@@ -1653,11 +1770,7 @@ static unsigned jpeg_encode_locked(uint32_t channel,uint64_t parameters,unsigned
     *(uint64_t *)(uintptr_t)(parameters+8)=(uintptr_t)private_descriptor;
     unsigned result=JPEG_ENCODE(channel,parameters);
     *(uint64_t *)(uintptr_t)(parameters+8)=descriptor;
-    /* 40e82090 returns 1 unless its encode start (40c9b648) failed; with a
-     * result block at params+0x48 it also stores completion (state+0xbc==0)
-     * in that block's first byte (40e8222c..40e82250). */
-    uint64_t status=read64(parameters+0x48);
-    unsigned encoded=result==1 && (!status || *(volatile const uint8_t *)(uintptr_t)status==1);
+    unsigned encoded=encode_succeeded(result,parameters);
     if(kind==0) {
         s->jpeg_finished=ticks();
         __atomic_fetch_add(&s->jpeg_applied,1,__ATOMIC_RELAXED);
@@ -1687,13 +1800,24 @@ static unsigned jpeg_output(uint32_t channel,uint64_t parameters,uint64_t owner,
     Z8Look look;
     error=lease_look(&lease,&look);
     if(error) { jpeg_error(kind,error);return JPEG_ENCODE(channel,parameters); }
-    if(look.identity || !look.strength) return JPEG_ENCODE(channel,parameters);
+    unsigned isp=lease.rendering==Z8_RENDER_ISP;
+    if(!isp && (look.identity || !look.strength)) return JPEG_ENCODE(channel,parameters);
     jpeg_lock(&storage->locks[kind]);
-    /* Which outputs were successfully encoded from the transformed surface:
-     * provenance may describe an applied look only for these. A repeated
-     * encode of the same output first withdraws its earlier success. */
+    /* Which outputs were successfully encoded with the look: provenance may
+     * describe an applied look only for these. A repeated encode of the same
+     * output first withdraws its earlier success. */
     __atomic_fetch_and(&storage->applied,~(1u<<kind),__ATOMIC_ACQ_REL);
-    unsigned applied,result=jpeg_encode_locked(channel,parameters,kind,&lease,&look,&applied);
+    unsigned applied=0,result;
+    if(isp && !developed(lease.id)) {
+        /* The still develop did not use this look's ISP tables, so its residual
+         * does not apply: the output stays native and claims no look. */
+        jpeg_error(kind,Z8_LUT_NOT_DEVELOPED);
+        result=JPEG_ENCODE(channel,parameters);
+    } else if(look.identity || !look.strength) {
+        /* A Log look whose residual is the identity grid: the develop is the look. */
+        result=JPEG_ENCODE(channel,parameters);
+        applied=encode_succeeded(result,parameters);
+    } else result=jpeg_encode_locked(channel,parameters,kind,&lease,&look,&applied);
     if(applied) __atomic_fetch_or(&storage->applied,1u<<kind,__ATOMIC_RELEASE);
     __atomic_store_n(&storage->locks[kind],0,__ATOMIC_RELEASE);
     return result;
@@ -1737,7 +1861,11 @@ unsigned z8_photo_lut_thumbnail(uint32_t channel,uint64_t parameters)
     Z8Look look;
     error=lease_look(&lease,&look);
     if(error) { jpeg_error(3,error);return JPEG_ENCODE(channel,parameters); }
+    /* An identity residual leaves the shared native thumbnail, which carries the develop. */
     if(look.identity || !look.strength) return JPEG_ENCODE(channel,parameters);
+    if(lease.rendering==Z8_RENDER_ISP && !developed(lease.id)) {
+        jpeg_error(3,Z8_LUT_NOT_DEVELOPED);return JPEG_ENCODE(channel,parameters);
+    }
     jpeg_lock(&storage->locks[3]);
     __atomic_store_n(&storage->thumbnail_ready,0,__ATOMIC_RELEASE);
     __atomic_fetch_and(&storage->applied,~(1u<<3),__ATOMIC_ACQ_REL);
@@ -1845,14 +1973,18 @@ uint32_t z8_photo_lut_xmp(uint32_t kind,uint32_t file,uint64_t settings,uint32_t
     if(!packet_span(packet,size)) return xmp_skip(Z8_XMP_PACKET,result);
     uint32_t applied=__atomic_load_n(&storage->applied,__ATOMIC_ACQUIRE);
     s->xmp_last_applied=applied;
-    /* A real look is claimed only for a successful transformed main encode;
-     * a no-op look is recorded as such. Anything else writes nothing. */
-    if(!lease.identity && !(applied&1)) return xmp_skip(Z8_XMP_NOT_APPLIED,result);
+    /* A real look is claimed only for a successful main encode with the look
+     * (transformed, or developed through its ISP tables); a no-op cpu-3d look
+     * is recorded as such. Anything else writes nothing. */
+    unsigned isp=lease.rendering==Z8_RENDER_ISP;
+    if((isp || !lease.identity) && !(applied&1)) return xmp_skip(Z8_XMP_NOT_APPLIED,result);
     Z8LutProvenance record;
     for(unsigned i=0;i<sizeof(record);i++) ((uint8_t *)&record)[i]=0;
     copy_bytes(record.name,lease.name,sizeof(record.name));
     copy_bytes(record.id,lease.id,sizeof(record.id));
-    record.grid=lease.grid;record.strength=256;record.identity=lease.identity;
+    record.grid=lease.grid;record.strength=256;record.identity=isp?0:lease.identity;
+    record.basis=lease.basis;record.rendering=lease.rendering;
+    if(isp) copy_bytes(record.fit,lease.fit,sizeof(record.fit));
     uint32_t appended=0;
     unsigned error=z8_meta_append((char *)(uintptr_t)packet,size,&record,&appended);
     if(error) { s->xmp_error=error;__atomic_fetch_add(&s->xmp_refused,1,__ATOMIC_RELAXED); }

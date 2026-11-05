@@ -3,10 +3,11 @@ import hashlib
 import struct
 
 from z8patch.compiled import load
+from z8photolut import library as lib
 from z8photolut.library import Library, look_from_cube
 from z8photolut.patcher import CODE, CODE_END, STATE_VA, runtime_layout
 
-LEASE_BYTES = 256
+LEASE_BYTES, LEASE_MUTABLE = 320, 256   # firmware.c JpegLease: four immutable lines, then one CPU line
 JPEG_STORAGE = 8256*5504*2+1920*1080*2+640*480*2+192*120*2+0x3600
 
 
@@ -23,6 +24,30 @@ def runtime_bundle(cubes, grid=17, default=0):
     """Runtime bytes for (raw .cube bytes) in order, named by their TITLE."""
     looks = tuple(look_from_cube(raw, source_name=f'look{i}.cube', grid=grid) for i, raw in enumerate(cubes))
     return Library(looks, default).runtime()
+
+
+# Stock factory N-Log M2 row and the identity Cpxs row; the curve is an N-Log-like monotone shape.
+NLOG_M2 = [118, 439, -45, -59, -352, 411, 245, -212, -33]
+
+
+def isp_tables(m1=None, curve_power=0.6):
+    """Valid still-develop tables in their firmware formats (no compiler needed)."""
+    curve = [round(32*(128+(1023-128)*(i/228)**curve_power)) for i in range(229)]
+    return dict(rgb=curve*3, nlg=[(g+4) >> 3 for g in curve], m2=list(NLOG_M2),
+                m1=list(m1 or [1024, 0, 0, 0, 1024, 0, 0, 0, 1024]), cpxs=[256, 0, 0, 256, 0, 0]*32)
+
+
+FIT_RECORD = dict(compiler='z8photolut.fit/1', grey=400.0, smoothness=3.0, samples=500, iterations=1, seed=1,
+                  report=dict(isp_de00=[1.0, 2.0, 3.0], final_de00=[0.5, 1.0, 2.0], slope=[1.0, 2.0], reachable=0.9,
+                              cpxs_min_det=1.0, m1_condition=1.0, m2_condition=2.0, m1_target_q10=[1024, 0, 0, 0, 1024, 0, 0, 0, 1024]))
+
+
+def isp_look(name, basis='s-log3/s-gamut3.cine', residual=None, grid=17, m1=None, source=b'TITLE "Log"\n'):
+    """An isp+residual look from fixed tables: residual is the raw .cube resampled as the residual grid
+    (None: the identity grid). Firmware tests use it without fitting anything."""
+    samples = look_from_cube(residual, source_name='residual.cube', grid=grid).samples if residual else lib.identity_samples(grid)
+    return lib.Look(name, grid, samples, samples == lib.identity_samples(grid), source, 'log.cube', 'Log', 2,
+                    (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), '', basis, lib.pack_isp(isp_tables(m1)), FIT_RECORD)
 
 
 def snapshot_bytes(grid):

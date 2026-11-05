@@ -3,9 +3,10 @@ import random
 import struct
 import unittest
 
-from z8photolut.patcher import CODE,branch
-from photo_lut_fixtures import (CODE_BYTES,JPEG_STORAGE,LEASE_BYTES,LIBRARY,RESUME,STATE,bundle_ids,desire,native_code,
-                                record_bytes,runtime_bundle,snapshot_bytes)
+from z8photolut import library as lib
+from z8photolut.patcher import CODE,STILL_VA,branch
+from photo_lut_fixtures import (CODE_BYTES,JPEG_STORAGE,LEASE_BYTES,LEASE_MUTABLE,LIBRARY,RESUME,STATE,bundle_ids,desire,isp_look,
+                                native_code,record_bytes,runtime_bundle,snapshot_bytes)
 
 
 try:
@@ -186,11 +187,11 @@ class PhotoLutQueueTests(unittest.TestCase):
         m.mem_write(0x40e9a570,bytes.fromhex('c0035fd6'))
         return m,state,slot,request,stack,bytes(original),before,ids
 
-    def call(self,m,name,stack,**arguments):
+    def call(self,m,name,stack,count=100000,**arguments):
         for index,value in arguments.items():m.reg_write(getattr(regs,'UC_ARM64_REG_'+index.upper()),value)
         m.reg_write(regs.UC_ARM64_REG_SP,stack)
         m.reg_write(regs.UC_ARM64_REG_X30,0x65000000)
-        m.emu_start(self.symbols[name],0x65000000,count=100000)
+        m.emu_start(self.symbols[name],0x65000000,count=count)
         self.assertEqual(m.reg_read(regs.UC_ARM64_REG_PC),0x65000000)
 
     def apply_image(self,m,stack,y,uv):
@@ -359,18 +360,22 @@ class PhotoLutQueueTests(unittest.TestCase):
 
     STACKS=(0xa03015000,0xa03017800,0xa0301a000,0xa0301c800,0xa0301f000)
 
-    def jpeg_fixture(self,selected=1,capacity=None,available=True,jpeg_enabled=True,fail=None,width=8,height=8):
+    CYCLE=('TITLE "Cycle"\nLUT_3D_SIZE 2\n'+''.join('%d %d %d\n'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1))).encode()
+
+    def jpeg_fixture(self,selected=1,capacity=None,available=True,jpeg_enabled=True,fail=None,width=8,height=8,
+                     looks=None,transform=None):
+        """looks: a library of Look objects instead of the Cycle and Identity cpu-3d looks; transform: whether the
+        selected look reserves a CPU transform (default: look 1 of the standard library)."""
         m,state,slot,request,stack,original,before,ids=self.fixture()
-        rows=['TITLE "Cycle"','LUT_3D_SIZE 2']+['%d %d %d'%(g,b,r) for b in (0,1) for g in (0,1) for r in (0,1)]
         identity=['TITLE "Identity"','LUT_3D_SIZE 2']+['%d %d %d'%(r,g,b) for b in (0,1) for g in (0,1) for r in (0,1)]
-        data=runtime_bundle([('\n'.join(rows)+'\n').encode(),('\n'.join(identity)+'\n').encode()])
+        data=lib.Library(looks).runtime() if looks else runtime_bundle([self.CYCLE,('\n'.join(identity)+'\n').encode()])
         m.mem_map(LIBRARY+0x1000,0x1f000);m.mem_write(LIBRARY,data)
         m.mem_map(0x41186000,4096);m.mem_map(0xc10000000,4096)
         m.mem_map(0x41059000,4096);m.mem_map(0x40e82000,4096)
         m.mem_write(0x41186718,struct.pack('<3I',0xd2c00088,0x8b080000,0xd65f03c0))
         m.mem_write(0x4105903c,struct.pack('<2I',0x52800000|(int(jpeg_enabled)<<5),0xd65f03c0))
         owner=0xa03009000;allocation_descriptor=owner+0x1000;raw=0x820000000
-        transform=selected==1 and jpeg_enabled
+        transform=(selected==1 if transform is None else transform) and jpeg_enabled
         required=4096+(JPEG_STORAGE+snapshot_bytes(17) if transform else 0)+LEASE_BYTES
         if capacity is None:capacity=(required+511)&~511
         m.mem_write(owner+8,struct.pack('<Q',allocation_descriptor))
@@ -430,7 +435,8 @@ class PhotoLutQueueTests(unittest.TestCase):
                 uc.reg_write(regs.UC_ARM64_REG_X0,int(failure!='start'))
                 uc.reg_write(regs.UC_ARM64_REG_PC,uc.reg_read(regs.UC_ARM64_REG_X30))
         m.hook_add(UC_HOOK_CODE,native)
-        self.call(m,'z8_photo_lut_output_alloc',stack,x0=42,x1=0x38,x2=4096,x3=0xa03000000)
+        # A Log look's reservation also hashes its ISP tables (SHA-256 of 2304 bytes) for provenance.
+        self.call(m,'z8_photo_lut_output_alloc',stack,count=1000000,x0=42,x1=0x38,x2=4096,x3=0xa03000000)
         allocation=m.reg_read(regs.UC_ARM64_REG_X0)
         parameters=0xa03008000;descriptor=parameters+0x100
         m.mem_write(parameters+8,struct.pack('<2Q',descriptor,owner+0x38))
@@ -526,14 +532,47 @@ class PhotoLutQueueTests(unittest.TestCase):
                 result=params+0x400;m.mem_write(params+0x48,struct.pack('<Q',result))
                 self.encode_failures={0:failure} if failure else {}
                 self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
-                self.assertEqual(int.from_bytes(m.mem_read(footer+244,4),'little'),expected)
+                self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+52,4),'little'),expected)
         # A later failed encode of the same output withdraws its earlier success.
         m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture()
         self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
-        self.assertEqual(int.from_bytes(m.mem_read(footer+244,4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+52,4),'little'),1)
         self.encode_failures={1:'start'}
         self.run_jpeg(m,[('STGJPEGC','z8_photo_lut_jpeg',(0,params))],service=False)
-        self.assertEqual(int.from_bytes(m.mem_read(footer+244,4),'little'),0)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+52,4),'little'),0)
+
+    def test_log_look_residual_applies_only_after_its_own_develop(self):
+        # Z8_LUT_NOT_DEVELOPED in jpeg_error when the most recent still develop used other tables.
+        look=isp_look('Cycle Log',residual=self.CYCLE,basis='f-log2/f-gamut-c')
+        for developed in (True,False):
+            with self.subTest(developed=developed):
+                m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(
+                    looks=(look,isp_look('Other')))
+                self.assertEqual(allocations,[(42,0x38,4096+JPEG_STORAGE+snapshot_bytes(17)+LEASE_BYTES)])
+                rendering,basis=struct.unpack('<2I',m.mem_read(footer+176,8))
+                self.assertEqual((rendering,basis),(1,4))
+                self.assertEqual(bytes(m.mem_read(footer+192,32)),lib.fit_id(look.isp))
+                self.assertEqual(bytes(m.mem_read(footer+80,32)),look.id)
+                # The residual copied into the lease is the grid after the ISP tables.
+                self.assertEqual(bytes(m.mem_read(self.snapshot,len(look.samples))),look.samples)
+                m.mem_write(STILL_VA+0x48,look.id if developed else bytes(32))
+                self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
+                self.assertEqual(encodes[0][2],(0x820001000,0x820001040) if developed else (0x810000000,0x810000040))
+                self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+52,4),'little'),int(developed))
+                self.assertEqual(int.from_bytes(m.mem_read(state+92,4),'little'),0 if developed else 8)
+
+    def test_log_look_with_an_identity_residual_reserves_no_transform(self):
+        look=isp_look('Log')
+        for developed in (True,False):
+            with self.subTest(developed=developed):
+                m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(
+                    looks=(look,),transform=False)
+                self.assertEqual(allocations,[(42,0x38,4096+LEASE_BYTES)])
+                m.mem_write(STILL_VA+0x48,look.id if developed else bytes(32))
+                self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
+                # The develop is the look: the native surface is encoded and, only if it was developed, applied.
+                self.assertEqual(encodes[0][2],(0x810000000,0x810000040))
+                self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+52,4),'little'),int(developed))
 
     def test_full_surface_work_runs_in_low_priority_worker_while_cpu1_services_progress(self):
         # 64x32 keeps the worker's LUT computation busy for many ticks.
@@ -757,7 +796,7 @@ class PhotoLutQueueTests(unittest.TestCase):
         m.mem_write(params+0x48,struct.pack('<Q',original_result))
         private=0x820001000+8256*5504*2+1920*1080*2+640*480*2
         m.mem_map((private+0x400000000)&~4095,8192)
-        lock=footer+224+3*4
+        lock=footer+LEASE_MUTABLE+32+3*4
         m.mem_write(lock,struct.pack('<I',1))
         waited=[]
         def release_other_user(task):
@@ -769,10 +808,10 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(waited,['STGPJPEG'])
         self.assertEqual([row[2] for row in encodes],[(0x810000000,0x810000040),(private,private+64)])
         self.assertEqual(int.from_bytes(m.mem_read(original_output+0x10,4),'little'),129)
-        self.assertEqual(int.from_bytes(m.mem_read(footer+192+0x10,4),'little'),130)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+0x10,4),'little'),130)
         self.assertEqual(struct.unpack('<B3xI',m.mem_read(original_result,8)),(1,1))
         self.assertEqual(int.from_bytes(m.mem_read(params+0x48,8),'little'),original_result)
-        self.assertEqual(int.from_bytes(m.mem_read(footer+240,4),'little'),1)
+        self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+48,4),'little'),1)
         self.assertEqual(int.from_bytes(m.mem_read(lock,4),'little'),0)
         self.assertEqual(int.from_bytes(m.mem_read(params+8,8),'little'),desc)
         self.assertEqual(bytes(m.mem_read(desc,0x28)),image)

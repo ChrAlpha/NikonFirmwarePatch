@@ -13,7 +13,7 @@ import struct
 import unittest
 
 from z8photolut.library import look_id
-from photo_lut_fixtures import LEASE_BYTES,LIBRARY,STATE,desire,native_code,record_bytes,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import LEASE_BYTES,LEASE_MUTABLE,LIBRARY,STATE,desire,native_code,record_bytes,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,branch
 
 try:
@@ -206,7 +206,7 @@ class NativeOutputMachine:
 
     def mutable_footer(self,resource):
         raw,capacity=self.owner(resource)
-        address=raw+0x400000000+capacity-LEASE_BYTES+192
+        address=raw+0x400000000+capacity-LEASE_BYTES+LEASE_MUTABLE
         return bytes(self.m.mem_read(address,64))
 
     def latched(self,resource):

@@ -113,6 +113,7 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
         part,detail['photo-lut']=build_main(eg,code,entries,strings)
         merge('photo-lut',part)
         photo_row=entries['z8_photo_lut_row_refresh']
+        still_provider=int(detail['photo-lut']['still']['provider'],16)
     if log_tables or still_provider:
         code,entries=unit('colour')
         detail['colour']=colour_emit(img,code,entries,log_tables,still_provider)

@@ -73,13 +73,46 @@ void z8_lut_sha256(const void *data,uint32_t bytes,uint8_t digest[32])
     sha_finish(&s,digest);
 }
 
+static const char *const basis_keys[Z8_BASES]={"nikon-sdr","n-log/bt2020","s-log3/s-gamut3.cine",
+    "log3g10/redwidegamutrgb","f-log2/f-gamut-c","arri-logc3/awg3","arri-logc4/awg4","v-log/v-gamut"};
+const char *z8_lut_basis_key(uint32_t basis) { return basis<Z8_BASES?basis_keys[basis]:0; }
+
+static void sha_u32(Sha256 *s,uint32_t value)
+{
+    uint8_t b[4]={(uint8_t)value,(uint8_t)(value>>8),(uint8_t)(value>>16),(uint8_t)(value>>24)};
+    sha_add(s,b,4);
+}
+
+void z8_lut_isp_look_id(uint32_t basis,uint32_t grid,const Z8IspTables *isp,const uint16_t *samples,uint8_t digest[32])
+{
+    static const char domain[]="z8photolut/look/2\0" Z8_LUT_ISP_SEMANTICS;
+    const char *key=z8_lut_basis_key(basis);
+    unsigned n=0;
+    while(key[n]) n++;
+    Sha256 s;sha_start(&s);
+    sha_add(&s,domain,sizeof(domain));            /* includes the final NUL separator */
+    sha_add(&s,key,n+1);
+    sha_u32(&s,grid);
+    sha_add(&s,isp,sizeof(*isp));
+    sha_add(&s,samples,grid*grid*grid*6);
+    sha_finish(&s,digest);
+}
+
+void z8_lut_fit_id(const Z8IspTables *isp,uint8_t digest[32])
+{
+    static const char domain[]="z8photolut/fit/1";
+    Sha256 s;sha_start(&s);
+    sha_add(&s,domain,sizeof(domain));
+    sha_add(&s,isp,sizeof(*isp));
+    sha_finish(&s,digest);
+}
+
 void z8_lut_look_id(uint32_t grid,const uint16_t *samples,uint8_t digest[32])
 {
     static const char domain[]="z8photolut/look/1\0" Z8_LUT_SEMANTICS;
-    uint8_t g[4]={(uint8_t)grid,(uint8_t)(grid>>8),(uint8_t)(grid>>16),(uint8_t)(grid>>24)};
     Sha256 s;sha_start(&s);
     sha_add(&s,domain,sizeof(domain));            /* includes the final NUL separator */
-    sha_add(&s,g,4);
+    sha_u32(&s,grid);
     sha_add(&s,samples,grid*grid*grid*6);
     sha_finish(&s,digest);
 }
@@ -116,12 +149,26 @@ static int zero(const uint8_t *p,uint32_t n)
     return 1;
 }
 
+/* Exactly library.py unpack_isp: zero padding, non-decreasing curves within
+ * the 10-bit storage ceiling, NLG derived from the green curve. M1, M2 and
+ * Cpxs take any s16 value, as the native tables do. */
+unsigned z8_lut_isp_valid(const Z8IspTables *t)
+{
+    if(!zero((const uint8_t *)&t->pad0,sizeof(t->pad0)) || !zero((const uint8_t *)t->pad1,sizeof(t->pad1)) ||
+       !zero((const uint8_t *)t->pad2,sizeof(t->pad2)) || !zero((const uint8_t *)t->pad3,sizeof(t->pad3)) ||
+       !zero((const uint8_t *)t->pad4,sizeof(t->pad4))) return 0;
+    for(unsigned c=0;c<3;c++) for(unsigned i=0;i<Z8_CURVE_NODES;i++)
+        if(t->rgb[c][i]>Z8_CURVE_LIMIT || (i && t->rgb[c][i]<t->rgb[c][i-1])) return 0;
+    for(unsigned i=0;i<Z8_CURVE_NODES;i++) if(t->nlg[i]!=(t->rgb[1][i]+4u)>>3) return 0;
+    return 1;
+}
+
 /* Structure, CRCs, names, no-op flags, every transform identity and the
  * library identity: a card file is trusted for nothing. */
 unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available)
 {
     if(!b || ((uintptr_t)b&7) || available<sizeof(*b) ||
-       b->magic!=Z8_LUT_MAGIC || b->version!=3 || b->bytes<sizeof(*b) ||
+       b->magic!=Z8_LUT_MAGIC || b->version!=Z8_LUT_VERSION || b->bytes<sizeof(*b) ||
        b->bytes>available || b->bytes>Z8_LUT_BUNDLE_LIMIT ||
        b->count>Z8_LUT_MAX_LOOKS || b->initial>b->count ||
        b->reserved) return Z8_LUT_BAD_BUNDLE;
@@ -135,14 +182,21 @@ unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available)
             continue;
         }
         uint32_t next=(end+63)&~63u;
+        unsigned isp=e->rendering==Z8_RENDER_ISP;
         if((e->grid!=17 && e->grid!=33 && e->grid!=65) || e->offset!=next ||
-           e->bytes!=e->grid*e->grid*e->grid*6 || e->offset>b->bytes ||
-           e->bytes>b->bytes-e->offset || e->identity>1 || e->flags ||
-           !zero(e->padding,sizeof(e->padding)) || !zero(raw+end,next-end)) return Z8_LUT_BAD_BUNDLE;
+           e->rendering>Z8_RENDER_ISP || e->basis>=Z8_BASES || (e->basis!=0)!=isp ||
+           e->isp_bytes!=(isp?sizeof(Z8IspTables):0u) ||
+           e->bytes!=e->isp_bytes+e->grid*e->grid*e->grid*6 || e->offset>b->bytes ||
+           e->bytes>b->bytes-e->offset || e->identity>1 || e->reserved ||
+           !zero(raw+end,next-end)) return Z8_LUT_BAD_BUNDLE;
         if(!z8_lut_name_valid(e->name,sizeof(e->name))) return Z8_LUT_BAD_BUNDLE;
         if(z8_lut_crc32(raw+e->offset,e->bytes)!=e->crc32) return Z8_LUT_BAD_BUNDLE;
+        const Z8IspTables *tables=(const Z8IspTables *)(raw+e->offset);
+        const uint16_t *table=(const uint16_t *)(raw+e->offset+e->isp_bytes);
+        if(isp && !z8_lut_isp_valid(tables)) return Z8_LUT_BAD_BUNDLE;
         uint8_t digest[32];
-        z8_lut_look_id(e->grid,(const uint16_t *)(raw+e->offset),digest);
+        if(isp) z8_lut_isp_look_id(e->basis,e->grid,tables,table,digest);
+        else z8_lut_look_id(e->grid,table,digest);
         for(unsigned k=0;k<32;k++) if(digest[k]!=e->id[k]) return Z8_LUT_BAD_BUNDLE;
         for(unsigned k=0;k<i;k++) {
             unsigned same=1;
@@ -151,9 +205,8 @@ unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available)
         }
         /* The no-op flag must equal exact sample identity (host
          * library.identity_samples): a corrupted flag must never silently
-         * disable a real look, nor mark a no-op as a transform. */
+         * disable a real grid, nor mark a no-op grid as a transform. */
         unsigned same=1;
-        const uint16_t *table=(const uint16_t *)(raw+e->offset);
         for(unsigned r=0;r<e->grid && same;r++) for(unsigned g=0;g<e->grid && same;g++) for(unsigned v=0;v<e->grid && same;v++) {
             unsigned indices[3]={r,g,v};
             for(unsigned c=0;c<3;c++) {
@@ -170,14 +223,13 @@ unsigned z8_lut_validate(const Z8LookBundle *b,uint32_t available)
         end=e->offset+e->bytes;
     }
     if(end!=b->bytes) return Z8_LUT_BAD_BUNDLE;
-    /* Library identity (host library.py Library.runtime): domain, default,
-     * then every byte after the header. */
-    static const char domain[]="z8photolut/library/1";
-    uint8_t initial[4]={(uint8_t)b->initial,(uint8_t)(b->initial>>8),(uint8_t)(b->initial>>16),(uint8_t)(b->initial>>24)};
+    /* Library identity (host library.py _runtime): domain, default, then
+     * every byte after the header. */
+    static const char domain[]="z8photolut/library/2";
     uint8_t digest[32];
     Sha256 s;sha_start(&s);
     sha_add(&s,domain,sizeof(domain));
-    sha_add(&s,initial,4);
+    sha_u32(&s,b->initial);
     sha_add(&s,raw+64,b->bytes-64);
     sha_finish(&s,digest);
     for(unsigned k=0;k<32;k++) if(digest[k]!=b->library_id[k]) return Z8_LUT_BAD_BUNDLE;
@@ -189,8 +241,15 @@ unsigned z8_lut_select(const Z8LookBundle *b,uint32_t choice,uint32_t strength,Z
     if(!look || !b || choice>b->count || strength>256) return Z8_LUT_BAD_SELECTION;
     if(!choice) { *look=(Z8Look){0,17,1,0}; return Z8_LUT_OK; }
     const Z8LookEntry *e=&b->looks[choice-1];
-    *look=(Z8Look){(const uint16_t *)((const uint8_t *)b+e->offset),e->grid,e->identity,strength};
+    *look=(Z8Look){(const uint16_t *)((const uint8_t *)b+e->offset+e->isp_bytes),e->grid,e->identity,strength};
     return Z8_LUT_OK;
+}
+
+/* The ISP tables of a validated bundle's look, or 0 for Off and cpu-3d looks. */
+const Z8IspTables *z8_lut_isp(const Z8LookBundle *b,uint32_t choice)
+{
+    if(!b || !choice || choice>b->count || b->looks[choice-1].rendering!=Z8_RENDER_ISP) return 0;
+    return (const Z8IspTables *)((const uint8_t *)b+b->looks[choice-1].offset);
 }
 
 /* Tetrahedral interpolation reads four RGB vertices. Fractions have exact

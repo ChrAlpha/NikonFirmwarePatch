@@ -3,6 +3,11 @@
 Format reference: OpenColorIO src/OpenColorIO/fileformats/FileFormatIridasCube.cpp.
 Cube rows are red-fastest; native samples are blue-fastest RGB uint16. Input
 domains are baked into a normalized grid, and outputs clip to the SDR range.
+
+A cube expects one input basis (z8photolut/basis.py). Its file name, TITLE and
+comments may say which; `basis_problem` refuses a cube whose text contradicts
+the basis it is added with, so a Log or HDR cube is never silently applied to
+camera-rendered SDR values, nor a cube for one Log encoding to another.
 """
 from dataclasses import dataclass
 import hashlib
@@ -11,17 +16,9 @@ import re
 import shlex
 import struct
 
-GRID_SIZES = (17, 33, 65)
+from .basis import FOREIGN, NIKON_SDR, families
 
-# The camera applies a look to the photo it has already rendered: 8-bit
-# full-range BT.601 Y'CbCr of the JPEG in its selected colour space, after
-# the active Picture Control. Cubes made for camera log or HDR encodings
-# expect a different input and would be silently wrong there.
-INPUT_BASIS = 'nikon-rendered-sdr'
-FOREIGN_BASIS = re.compile(
-    r'(?<![a-z0-9])(?:[vnsfcdl]-?log[0-9]?|log-?c[0-9]?|log3g10|hlg|pq|st[ ._-]?2084|'
-    r'(?:rec|bt|itu)[ ._-]?2100|(?:rec|bt|itu)[ ._-]?2020|acescc|acescct|cineon)(?![a-z0-9])',
-    re.IGNORECASE)
+GRID_SIZES = (17, 33, 65)
 PANASONIC_STYLE = re.compile(r'^\s*#\s*LUMIXPHOTOSTYLE\b\s*(\S*)', re.IGNORECASE | re.MULTILINE)
 
 
@@ -118,21 +115,54 @@ def parse(raw, name='Look'):
     return Cube(title, size, *limits, tuple(values), hashlib.sha256(raw).hexdigest(), tuple(comments))
 
 
-def foreign_basis(cube, filename=''):
-    """Return why a cube appears to expect input other than Nikon-rendered SDR, or ''."""
-    reasons = []
+def _texts(cube, filename):
+    return [('file name', filename), ('TITLE', cube.title), *(('comment', c) for c in cube.comments)]
+
+
+def _panasonic(cube):
+    """Panasonic Photo Style tags: (style, reason). A missing or invalid tag documents a V-Log base."""
     for comment in cube.comments:
         match = PANASONIC_STYLE.match(comment)
         if match:
-            # Panasonic documents a missing or invalid tag as a V-Log base.
-            style = match.group(1).upper() or 'missing (V-Log)'
-            reasons.append(f'#LUMIXPHOTOSTYLE {style}: made for a Panasonic Photo Style base')
-    for label, text in [('file name', filename), ('TITLE', cube.title), *(('comment', c) for c in cube.comments)]:
-        match = FOREIGN_BASIS.search(text)
+            style = match.group(1).upper()
+            return style, f'#LUMIXPHOTOSTYLE {style or "missing (V-Log)"}: made for a Panasonic Photo Style base'
+    return None, ''
+
+
+def foreign_basis(cube, filename=''):
+    """Why a cube appears to expect input other than Nikon-rendered SDR, or ''."""
+    reasons = []
+    _, panasonic = _panasonic(cube)
+    if panasonic:
+        reasons.append(panasonic)
+    for label, text in _texts(cube, filename):
+        match = FOREIGN.search(text)
         if match:
             reasons.append(f'{label} mentions {match.group(0)}')
     if any(lo < 0 or hi > 1 for lo, hi in zip(cube.minimum, cube.maximum)):
         reasons.append('DOMAIN_MIN/MAX exceeds 0..1 (scene-referred or shaper input)')
+    return '; '.join(dict.fromkeys(reasons))
+
+
+def basis_problem(cube, filename, basis):
+    """Why the cube's own text contradicts a declared Log basis, or ''.
+
+    Names of the declared encoding or gamut agree with it; output spaces such as
+    Rec.709 or Rec.2020 say nothing about the input. A cube naming another Log
+    encoding, an HDR encoding or a Panasonic Photo Style is refused."""
+    if not basis.log:
+        raise ValueError('basis_problem checks Log bases; nikon-sdr uses foreign_basis')
+    reasons = []
+    style, panasonic = _panasonic(cube)
+    if panasonic and (style not in ('', 'VLOG', 'V-LOG') or basis.key != 'v-log/v-gamut'):
+        reasons.append(panasonic)
+    for label, text in _texts(cube, filename):
+        found, other = families(text)
+        for named in found:
+            if named != basis:
+                reasons.append(f'{label} names {named.label}')
+        for word in other:
+            reasons.append(f'{label} mentions {word}')
     return '; '.join(dict.fromkeys(reasons))
 
 

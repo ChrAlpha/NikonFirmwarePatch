@@ -212,3 +212,47 @@ z8_photo_lut_bank_reset_result_entry:
     .inst 0x5283ac95 /* native mov w21,#0x1d64 */
     b original_40d68208
 .size z8_photo_lut_bank_reset_result_entry, .-z8_photo_lut_bank_reset_result_entry
+
+/* Still develop wrappers, entered through the native BL at 0x41053c50
+ * (M1/M2 build, thunk 0x41112dcc) and 0x41053da0 (curve build, thunk
+ * 0x41112dd8) with the builder arguments in x0..x2; both callers only reload
+ * callee-saved registers and return 1 afterwards. The builder runs between
+ * the C begin/end calls with its original arguments. */
+.global z8_photo_lut_still_m_entry
+.type z8_photo_lut_still_m_entry,%function
+z8_photo_lut_still_m_entry:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x19, [sp, #32]
+    bl z8_photo_lut_still_m_begin
+    mov w19, w0
+    ldp x0, x1, [sp, #16]
+    ldr x2, [sp, #32]
+    bl original_41112dcc
+    ldr x0, [sp, #16]
+    mov w1, w19
+    bl z8_photo_lut_still_m_end
+    ldr x19, [sp, #40]
+    ldp x29, x30, [sp], #48
+    ret
+.size z8_photo_lut_still_m_entry, .-z8_photo_lut_still_m_entry
+
+.global z8_photo_lut_still_curve_entry
+.type z8_photo_lut_still_curve_entry,%function
+z8_photo_lut_still_curve_entry:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x19, [sp, #32]
+    bl z8_photo_lut_still_curve_begin
+    mov w19, w0
+    ldp x0, x1, [sp, #16]
+    ldr x2, [sp, #32]
+    bl original_41112dd8
+    mov w0, w19
+    bl z8_photo_lut_still_curve_end
+    ldr x19, [sp, #40]
+    ldp x29, x30, [sp], #48
+    ret
+.size z8_photo_lut_still_curve_entry, .-z8_photo_lut_still_curve_entry

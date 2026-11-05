@@ -13,6 +13,7 @@ import zlib
 
 from z8photolut import library as lib
 from z8photolut.cube import parse, runtime_cube
+from photo_lut_fixtures import isp_look, isp_tables
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -127,6 +128,90 @@ class InputBasisTests(unittest.TestCase):
                 self.assertFalse(look(cube(title)).basis_override)
 
 
+class LogBasisTests(unittest.TestCase):
+    """Declared bases: Log cubes need one, and a cube's own text may not contradict it."""
+    def test_log_cubes_need_a_declared_basis(self):
+        for source, raw in {'flog2c-to-provia.cube': cube('Provia'), 'slog3.cube': cube('SLog3 film'),
+                            'look.cube': cube('Look', comments=('# LogC3 to Rec709',))}.items():
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, '--basis'):
+                look(raw, source=source)
+
+    def test_declared_basis_must_match_the_cube_text(self):
+        options = dict(fit_options=dict(samples=500, iterations=1))
+        mismatches = {
+            ('s-log3', 'flog2c-to-provia.cube', cube('Provia')): 'F-Log2',
+            ('arri-logc4', 'look.cube', cube('LogC3 Film')): 'LogC3',
+            ('arri-logc3', 'look.cube', cube('ARRI LogC4 Film')): 'LogC4',
+            ('v-log', 'look.cube', cube('HLG grade')): 'HLG',
+            ('n-log', 'look.cube', cube('Classic', comments=('#LUMIXPHOTOSTYLE',))): 'LUMIXPHOTOSTYLE',
+            ('v-log', 'look.cube', cube('Classic', comments=('#LUMIXPHOTOSTYLE STD',))): 'LUMIXPHOTOSTYLE',
+            ('s-log3', 'look.cube', cube('S-Log2 grade')): 'S-Log2',
+        }
+        for (basis, source, raw), named in mismatches.items():
+            with self.subTest(basis=basis, source=source), self.assertRaisesRegex(ValueError, named):
+                look(raw, source=source, basis=basis, **options)
+        with self.assertRaisesRegex(ValueError, 'declares --basis'):
+            look(cube('SLog3 film'), basis='s-log3', accept_input_basis=True, **options)
+        with self.assertRaisesRegex(ValueError, 'Unknown input basis'):
+            look(WARM, basis='rec709')
+
+    def test_basis_names(self):
+        from z8photolut.basis import parse as parse_basis
+        for text, key in [('S-Log3', 's-log3/s-gamut3.cine'), ('f-log2/F-Gamut C', 'f-log2/f-gamut-c'),
+                          ('ARRI LogC3/ARRI Wide Gamut 3', 'arri-logc3/awg3'), ('n-log', 'n-log/bt2020'),
+                          ('Log3G10', 'log3g10/redwidegamutrgb'), ('V-Log', 'v-log/v-gamut'), ('nikon-sdr', 'nikon-sdr')]:
+            with self.subTest(text=text):
+                self.assertEqual(parse_basis(text).key, key)
+
+    def test_isp_look_identity_covers_basis_tables_and_residual(self):
+        base = isp_look('Log')
+        self.assertEqual(base.rendering, 'isp+residual')
+        self.assertTrue(base.identity)
+        variants = [isp_look('Log', basis='v-log/v-gamut'), isp_look('Log', residual=SWAP),
+                    isp_look('Log', m1=[1000, 24, 0, 0, 1024, 0, 0, 0, 1024]), isp_look('Log', grid=33)]
+        self.assertEqual(len({base.id, *(v.id for v in variants)}), 5)
+        self.assertEqual(lib.fit_id(base.isp), lib.fit_id(isp_look('Log', residual=SWAP).isp))
+        self.assertEqual(isp_look('Renamed').id, base.id)
+
+    def test_isp_block_rules(self):
+        tables = isp_tables()
+        self.assertEqual(lib.unpack_isp(lib.pack_isp(tables))['m1'], tuple(tables['m1']))
+        broken = [dict(tables, rgb=[0]*686+[1]*1), dict(tables, nlg=[0]*229),
+                  dict(tables, rgb=[32737]*687, nlg=[(32737+4) >> 3]*229), dict(tables, m1=[0]*8)]
+        for bad in broken:
+            with self.assertRaises(ValueError):
+                lib.pack_isp(bad)
+
+
+class FormatTests(unittest.TestCase):
+    def test_runtime_layout(self):
+        raw = lib.Library((look(WARM), isp_look('Log', residual=COOL))).runtime()
+        self.assertEqual(raw[:8], b'Z8LUT004')
+        offset, size, grid, identity, crc, rendering, basis = struct.unpack_from('<5I2H', raw, 64+128)
+        self.assertEqual((rendering, basis, grid, identity), (1, 2, 17, 0))
+        self.assertEqual(struct.unpack_from('<2I', raw, 64+128+120), (lib.ISP_BYTES, 0))
+        self.assertEqual(size, lib.ISP_BYTES+17**3*6)
+        self.assertEqual(offset % 64, 0)
+        self.assertEqual(struct.unpack_from('<5I2H', raw, 64)[5:], (0, 0))
+
+    def test_z8lut003_libraries_import_as_nikon_sdr_looks(self):
+        looks = (look(WARM, source='warm.cube'), look(COOL, source='cool.cube', grid=33))
+        meta = [dict(source_name=l.source_name, source_sha256=__import__('hashlib').sha256(l.source).hexdigest(),
+                     source_bytes=len(l.source), title=l.title, input_size=l.input_size, domain_min=list(l.domain_min),
+                     domain_max=list(l.domain_max), input_basis='nikon-rendered-sdr', input_basis_override='')
+                for l in looks]
+        legacy = lib._file(lib._runtime(looks, 2, legacy=True), 1, meta, looks)
+        self.assertEqual(legacy[:8], b'Z8LUT003')
+        imported = lib.decode(legacy, deep=True)
+        self.assertEqual([(l.basis, l.rendering, l.id) for l in imported.looks],
+                         [('nikon-sdr', 'cpu-3d', l.id) for l in looks])
+        self.assertEqual(imported.default, 2)
+        self.assertEqual(imported.encode()[:8], b'Z8LUT004')
+        self.assertEqual(lib.decode(imported.encode()), imported)
+        with self.assertRaises(ValueError):
+            lib.decode(legacy[:-40]+bytes([legacy[-40] ^ 1])+legacy[-39:])
+
+
 class DecodeTests(unittest.TestCase):
     def setUp(self):
         self.raw = lib.Library((look(WARM, source='warm.cube'), look(COOL, source='cool.cube')), 2).encode()
@@ -222,11 +307,12 @@ class NativeParityTests(unittest.TestCase):
         struct.pack_into('<I', raw, 24, zlib.crc32(bytes(raw[64:])))
         import hashlib
         default = struct.unpack_from('<I', raw, 20)[0]
-        raw[32:64] = hashlib.sha256(b'z8photolut/library/1\0'+struct.pack('<I', default)+bytes(raw[64:])).digest()
+        raw[32:64] = hashlib.sha256(b'z8photolut/library/2\0'+struct.pack('<I', default)+bytes(raw[64:])).digest()
         return bytes(raw)
 
     def test_host_libraries_validate_natively(self):
-        for looks in [(), (look(IDENTITY),), (look(WARM), look(COOL, grid=33), look(SWAP, '冬季 "A"', grid=65))]:
+        for looks in [(), (look(IDENTITY),), (look(WARM), look(COOL, grid=33), look(SWAP, '冬季 "A"', grid=65)),
+                      (isp_look('Log A'), look(WARM), isp_look('Log B', basis='arri-logc3/awg3', residual=SWAP, grid=33))]:
             raw = lib.Library(looks).runtime()
             with self.subTest(count=len(looks)):
                 self.assertEqual(self.validate(raw), 0)
@@ -254,6 +340,35 @@ class NativeParityTests(unittest.TestCase):
                 self.assertNotEqual(self.validate(bad), 0)
         self.assertEqual(self.validate(self.resealed(raw, lambda r: None)), 0)
         self.assertNotEqual(identity, 0)
+
+    def test_native_rejects_isp_looks_the_host_rejects(self):
+        raw = lib.Library((look(WARM), isp_look('Log', residual=SWAP))).runtime()
+        span = struct.unpack_from('<I', raw, 64+128)[0]
+        entry = 64+128
+
+        def table(name, index, value):
+            at, code = next((a, c) for n, a, _, c in lib.ISP_TABLES if n == name)
+            return lambda r: struct.pack_into('<'+code, r, span+at+2*index, value)
+        cases = {
+            'curve decreases': table('rgb', 229+100, 0),
+            'curve above the 10-bit ceiling': table('rgb', 3*229-1, 32737),
+            'NLG off the green curve': table('nlg', 5, 1),
+            'ISP padding': lambda r: r.__setitem__(slice(span+0x55e, span+0x55f), b'\1'),
+            'rendering without basis': lambda r: struct.pack_into('<H', r, entry+22, 0),
+            'basis out of range': lambda r: struct.pack_into('<H', r, entry+22, 8),
+            'cpu-3d with a Log basis': lambda r: struct.pack_into('<H', r, 64+22, 2),
+            'ISP size': lambda r: struct.pack_into('<I', r, entry+120, 0x800),
+            'reserved': lambda r: struct.pack_into('<I', r, entry+124, 1),
+            'M1 under the same id': table('m1', 0, 1000),
+            'Cpxs under the same id': table('cpxs', 7, 300),
+            'residual under the same id': lambda r: r.__setitem__(slice(span+0x900, span+0x901), bytes([r[span+0x900] ^ 1])),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                bad = self.resealed(raw, mutate)
+                with self.assertRaises(ValueError):
+                    lib.validate_runtime(bad)
+                self.assertNotEqual(self.validate(bad), 0)
 
 
 class CommandLineTests(unittest.TestCase):

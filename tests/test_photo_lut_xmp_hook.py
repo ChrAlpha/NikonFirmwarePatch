@@ -11,7 +11,8 @@ import struct
 import unittest
 import xml.etree.ElementTree as ET
 
-from photo_lut_fixtures import LEASE_BYTES, STATE, native_code, runtime_bundle
+from photo_lut_fixtures import LEASE_BYTES, LEASE_MUTABLE, STATE, isp_look, native_code, runtime_bundle
+from z8photolut import library as lib
 from test_photo_lut_native_graph import (CAPTURE, CONFIG, CompiledGraphMachine, JPEG_GRAPH, NEF_GRAPH, OWNER,
                                          PinnedRomTestCase, Uc)
 from z8photolut.library import look_id
@@ -64,8 +65,8 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         cls.code, cls.symbols, cls.metadata = native_code()
         cls.looks = runtime_bundle([cube('Neutral', False), cube(NAME, True)])
 
-    def machine(self, choice=2):
-        machine = CompiledGraphMachine(self.rom, self.code, self.symbols, self.metadata, self.looks, choice=choice)
+    def machine(self, choice=2, looks=None):
+        machine = CompiledGraphMachine(self.rom, self.code, self.symbols, self.metadata, looks or self.looks, choice=choice)
         machine.m.mem_map(PACKET, 0x10000)
         machine.composed = []
         def compose(uc, address, size, user):
@@ -152,7 +153,7 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         file_id = self.file_id(machine) if file_id is None else file_id
         dispatch = machine.graph(file_id, graph)          # original graph builder 0x40eb17e0
         if applied is not None:
-            machine.write32(machine.footer+244, applied)
+            machine.write32(machine.footer+LEASE_MUTABLE+52, applied)
         if kind is None:
             # JPEG files reach the APP1 arm through the original caller chain;
             # any other file is passed its graph dispatch directly as wrapper input.
@@ -192,6 +193,27 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
                 original = native_packet()
                 at = original.index(b'</rdf:RDF>')
                 self.assertEqual(packet[:at], original[:at])
+
+    def test_log_looks_record_basis_rendering_and_fit_only_when_developed(self):
+        log = isp_look(NAME, residual=cube(NAME, True), basis='arri-logc3/awg3')
+        looks = lib.Library((isp_look('Neutral Log'), log)).runtime()
+        for applied in (1, 0):
+            with self.subTest(applied=applied):
+                machine = self.machine(looks=looks)
+                packet = self.compose(machine, applied=applied)
+                if not applied:
+                    # Not developed with its tables (or the encode failed): nothing is claimed.
+                    self.assertEqual(packet, native_packet())
+                    self.assertEqual(self.telemetry(machine)['skipped'], {'not applied': 1})
+                    continue
+                fields = self.provenance(packet)
+                self.assertEqual(fields['LookName'], NAME)
+                self.assertEqual(fields['TransformSHA256'], log.id.hex())
+                self.assertEqual(fields['FitSHA256'], lib.fit_id(log.isp).hex())
+                self.assertEqual((fields['InputBasis'], fields['Rendering'], fields['Applied'], fields['Grid']),
+                                 ('arri-logc3/awg3', 'isp-fitted+residual', 'True', '17'))
+                self.assertEqual(fields['Algorithm'], lib.ISP_SEMANTICS)
+                self.assertNotIn('NoOp', fields)
 
     def test_every_original_jpeg_producer_combination_is_annotated(self):
         # The JPEG graph returns settings+0x130 ? 4 : 0 (0x40eb1b0c..b24) for
@@ -292,7 +314,7 @@ class PhotoLutXmpHookTests(PinnedRomTestCase):
         machine = self.machine()
         file_id = self.file_id(machine)
         machine.graph(file_id, JPEG_GRAPH)
-        machine.write32(machine.footer+244, 1)
+        machine.write32(machine.footer+LEASE_MUTABLE+52, 1)
         expected = {}
         for label, gate, mutate in [('alternate branch', 'branch', lambda: machine.m.mem_write(JPEG_GRAPH+0x4c, b'\x01')),
                                     ('owner+0x80 descriptor', 'lease', lambda: machine.write64(JPEG_GRAPH, OWNER+0x80))]:

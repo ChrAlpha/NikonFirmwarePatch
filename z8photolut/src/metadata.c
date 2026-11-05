@@ -98,12 +98,17 @@ static void emit_number(Sink *s, const char *tag, uint32_t tag_bytes, uint32_t v
 
 /* One self-contained rdf:Description in this project's namespace only. No
  * Nikon, Adobe, Panasonic, photoshop, tiff, exif or dc property is written,
- * and `Rendering` states that the pixels already carry the transform so no
- * host tool should treat this as a recipe to re-apply. */
+ * and `Rendering` states that the pixels already carry the transform (baked
+ * into the JPEG, or developed through fitted ISP tables plus a residual), so
+ * no host tool should treat this as a recipe to re-apply. */
 static void emit_record(Sink *s, const Z8LutProvenance *r,
                         uint32_t name_bytes, uint32_t firmware_bytes)
 {
-    const unsigned noop = r->identity || !r->strength;
+    const unsigned isp = r->rendering == Z8_RENDER_ISP;
+    const unsigned noop = !isp && (r->identity || !r->strength);
+    const char *basis = z8_lut_basis_key(r->basis);
+    uint32_t basis_bytes = 0;
+    while (basis[basis_bytes]) basis_bytes++;
 
     emit(s, LIT("<rdf:Description rdf:about=\"\" xmlns:"
                Z8_META_PREFIX "=\"" Z8_META_NS "\">\n"));
@@ -113,19 +118,26 @@ static void emit_record(Sink *s, const Z8LutProvenance *r,
     } else {
         emit_property(s, LIT("Applied"), LIT("True"), 0);
     }
-    emit_property(s, LIT("Rendering"), LIT(Z8_META_RENDERING), 0);
+    if (isp) emit_property(s, LIT("Rendering"), LIT(Z8_META_RENDERING_ISP), 0);
+    else emit_property(s, LIT("Rendering"), LIT(Z8_META_RENDERING), 0);
     emit_property(s, LIT("LookName"), r->name, name_bytes, 1);
 
     emit(s, LIT(TAG_OPEN "TransformSHA256>"));
     emit_hex(s, r->id, 32);
     emit(s, LIT(TAG_CLOSE "TransformSHA256>\n"));
+    if (isp) {
+        emit(s, LIT(TAG_OPEN "FitSHA256>"));
+        emit_hex(s, r->fit, 32);
+        emit(s, LIT(TAG_CLOSE "FitSHA256>\n"));
+    }
 
-    emit_property(s, LIT("InputBasis"), LIT(Z8_META_INPUT_BASIS), 0);
+    emit_property(s, LIT("InputBasis"), basis, basis_bytes, 0);
     emit_number(s, LIT("Strength"), r->strength);
     emit_property(s, LIT("StrengthScale"), LIT("256"), 0);
     emit_number(s, LIT("Grid"), r->grid);
     emit_property(s, LIT("Schema"), LIT(Z8_META_SCHEMA), 0);
-    emit_property(s, LIT("Algorithm"), LIT(Z8_LUT_SEMANTICS), 1);
+    if (isp) emit_property(s, LIT("Algorithm"), LIT(Z8_LUT_ISP_SEMANTICS), 1);
+    else emit_property(s, LIT("Algorithm"), LIT(Z8_LUT_SEMANTICS), 1);
     if (firmware_bytes) emit_property(s, LIT("FirmwareIdentity"), r->firmware, firmware_bytes, 1);
     emit(s, LIT("</rdf:Description>"));
 }
@@ -306,9 +318,13 @@ static unsigned provenance_valid(const Z8LutProvenance *r,
     uint32_t n = 0;
     while (n < sizeof(r->name) && r->name[n]) n++;
 
-    /* Exactly the grids the bundle contract admits (lut.c z8_lut_validate). */
+    /* Exactly the grids and kinds the bundle contract admits (lut.c z8_lut_validate). */
     if (r->identity > 1u || r->strength > 256u) return 0;
     if (r->grid != 17u && r->grid != 33u && r->grid != 65u) return 0;
+    if (r->rendering > Z8_RENDER_ISP || r->basis >= Z8_BASES ||
+        (r->basis != 0u) != (r->rendering == Z8_RENDER_ISP)) return 0;
+    if (r->rendering != Z8_RENDER_ISP)
+        for (uint32_t i = 0; i < sizeof(r->fit); i++) if (r->fit[i]) return 0;
 
     uint32_t f = 0;
     while (f < Z8_META_FIRMWARE_BYTES && r->firmware[f]) f++;

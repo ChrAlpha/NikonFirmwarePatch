@@ -39,6 +39,9 @@ NS = 'https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/'
 RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
 SEMANTICS = ('input=nikon-rendered-sdr 8-bit full-range BT.601 YCbCr;'
              'model=RGB tetrahedral uint16 grid;output=8-bit clipped;strength=1')
+ISP_SEMANTICS = ('input=camera scene-linear through the native Log still develop;'
+                 'isp=M1 base Q10,RGB 3x229 u16/32,NLG,M2 s16/512,Cpxs 32x6 Q8 slot order;'
+                 'residual=RGB tetrahedral uint16 grid on 8-bit full-range BT.601 YCbCr;output=8-bit clipped;strength=1')
 
 APPENDED, BAD_ARGUMENT, BAD_RECORD, BAD_PACKET, NO_SPACE, DUPLICATE = range(6)
 
@@ -77,10 +80,13 @@ class Provenance(ctypes.Structure):
     _fields_ = [('name', ctypes.c_char * 64), ('id', ctypes.c_ubyte * 32),
                 ('grid', ctypes.c_uint32), ('strength', ctypes.c_uint32),
                 ('identity', ctypes.c_uint32),
-                ('firmware', ctypes.c_char * 32)]
+                ('firmware', ctypes.c_char * 32),
+                ('basis', ctypes.c_uint32), ('rendering', ctypes.c_uint32),
+                ('fit', ctypes.c_ubyte * 32)]
 
 
-def record(name=b'Cycle', digest=None, grid=33, strength=256, identity=0, firmware=b''):
+def record(name=b'Cycle', digest=None, grid=33, strength=256, identity=0, firmware=b'', basis=0, fit=None):
+    """A cpu-3d (basis 0) or, with a Log basis, an isp+residual provenance record."""
     r = Provenance()
     r.name = name
     source = digest if digest is not None else bytes(range(32))
@@ -88,6 +94,9 @@ def record(name=b'Cycle', digest=None, grid=33, strength=256, identity=0, firmwa
         r.id[i] = b
     r.grid, r.strength, r.identity = grid, strength, identity
     r.firmware = firmware
+    r.basis, r.rendering = basis, int(basis != 0)
+    for i, b in enumerate(fit if fit is not None else (bytes(range(100, 132)) if basis else bytes(32))):
+        r.fit[i] = b
     return r
 
 
@@ -217,11 +226,38 @@ class MetadataHelperTests(unittest.TestCase):
         fields = parse_provenance(after)
         self.assertEqual(fields['Applied'], 'True')
         self.assertEqual(fields['Rendering'], 'baked-into-jpeg-pixels')
-        self.assertEqual(fields['Schema'], '1.0')
-        self.assertEqual(fields['InputBasis'], 'nikon-rendered-sdr')
+        self.assertEqual(fields['Schema'], '1.1')
+        self.assertEqual(fields['InputBasis'], 'nikon-sdr')
         self.assertEqual(fields['Algorithm'], SEMANTICS)
         self.assertNotIn('NoOp', fields)
         self.assertNotIn('FirmwareIdentity', fields)
+        self.assertNotIn('FitSHA256', fields)
+
+    def test_log_looks_record_basis_rendering_and_fit(self):
+        bases = ['n-log/bt2020', 's-log3/s-gamut3.cine', 'log3g10/redwidegamutrgb', 'f-log2/f-gamut-c',
+                 'arri-logc3/awg3', 'arri-logc4/awg4', 'v-log/v-gamut']
+        fit = hashlib.sha256(b'isp tables').digest()
+        for code, key in enumerate(bases, 1):
+            for identity in (0, 1):
+                with self.subTest(basis=key, identity=identity):
+                    result, after, _ = self.append(packet(), record(basis=code, fit=fit, identity=identity))
+                    self.assertEqual(result, APPENDED)
+                    fields = parse_provenance(after)
+                    self.assertEqual(fields['InputBasis'], key)
+                    self.assertEqual(fields['Rendering'], 'isp-fitted+residual')
+                    self.assertEqual(fields['FitSHA256'], fit.hex())
+                    self.assertEqual(fields['Algorithm'], ISP_SEMANTICS)
+                    self.assertEqual(fields['Applied'], 'True')
+                    self.assertNotIn('NoOp', fields)
+        for label, bad in (('basis out of range', record(basis=8)), ('fit on a cpu-3d look', record(fit=fit)),
+                           ('Log basis rendered on the CPU', self.with_rendering(record(basis=2), 0))):
+            with self.subTest(label=label):
+                self.assert_refused(packet(), bad, BAD_RECORD)
+
+    @staticmethod
+    def with_rendering(prov, rendering):
+        prov.rendering = rendering
+        return prov
 
     def test_preserves_pre_existing_user_metadata(self):
         original = packet(body=IPTC_BODY)
@@ -671,7 +707,7 @@ class NativeAArch64Tests(unittest.TestCase):
         host = HostHelper(folder.name)
         for prov in (record(), record(name='中文 & "q"'.encode(), identity=1),
                      record(name=b'x' * 63, grid=17, strength=1,
-                            firmware=b'fw')):
+                            firmware=b'fw'), record(basis=5)):
             with self.subTest(name=prov.name):
                 original = packet(body=IPTC_BODY)
                 a = self.native.append(original, prov)

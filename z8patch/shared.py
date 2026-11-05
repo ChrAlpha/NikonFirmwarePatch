@@ -192,7 +192,7 @@ def loader(img,features):
     if 'photo-tools' in features:floor=max(floor,0x409F0000)
     if 'video-quality' in features:floor=max(floor,0x40A42000)
     if 'log-colour' in features:floor=max(floor,0x40B50000)
-    if 'photo-lut' in features:floor=max(floor,0x40B6C000)   # z8photolut.patcher FLOOR: zero private state
+    if 'photo-lut' in features:floor=max(floor,0x40B6D000)   # z8photolut.patcher FLOOR: zero state and still pages
     used=max([floor]+[BASE+e['end'] for e in img.edits if 0x75F8F0<=e['offset']<0xAA0000])
     end=(used+4095)&~4095
     require(end<=0x40C00000,'Text loader exceeds original mapped section')
