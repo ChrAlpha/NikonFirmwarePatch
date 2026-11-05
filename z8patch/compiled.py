@@ -8,36 +8,36 @@ import struct
 import subprocess
 import tempfile
 from z8prores.package import require, sha
-from .linker import link
+from .linker import general_registers_only, link
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS = ['--target=aarch64-none-elf','-O2','-ffreestanding','-fno-builtin','-fno-stack-protector',
          '-fno-unwind-tables','-fno-asynchronous-unwind-tables','-mgeneral-regs-only','-mstrict-align',
          '-Wall','-Wextra','-Werror']
+ASM = ['-target','aarch64-none-elf','-x','assembler-with-cpp']
+# Files hashed for each unit: every file under its folder with one of these suffixes.
+C_SOURCES, ASM_SOURCES = ('.c','.h','.inc','.S'), ('.py','.S','.json','.png')
 SPECS = {
-    'precapture': dict(source='z8precapture/firmware.c', flags=FLAGS, cave=0x409F0000, limit=0x40A00000, entry='precapture_history_entry'),
-    'pixelshift': dict(source='z8pixelshift/src/ps8.c', flags=FLAGS+['-DPS11_REVIEW_LAYOUT=0x409ec800ull'], cave=0x40990000, limit=0x409D8000, entry='psm_menu_action'),
-    'pixelshift-af': dict(source='z8pixelshift/src/af_unit.c', flags=[f for f in FLAGS if f!='-mgeneral-regs-only']+['-ffp-contract=off'], cave=0x409D8000, limit=0x409DA000, entry='ps8_af_one_batch'),
-    'opengate': dict(source='z8opengate/src/d10_hooks.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp','-DFULL_OUTPUT=1','-DWITH_Q3=1','-DQ3_STASH_RAM=0xa0ff50000','-DQ3_FINE_TABLE=0x40953000','-DQ3_BASIC_TABLE=0x409533f0','-DOG_TIER_DELTA=0x4000']),
+    'precapture': dict(source='z8precapture/firmware.c', flags=FLAGS, cave=0x409F0000, limit=0x40A00000, entry='precapture_history_entry', folder='z8precapture', suffixes=C_SOURCES),
+    'pixelshift': dict(source='z8pixelshift/src/ps8.c', flags=FLAGS+['-DPS11_REVIEW_LAYOUT=0x409ec800ull'], cave=0x40990000, limit=0x409D8000, entry='psm_menu_action', folder='z8pixelshift/src', suffixes=C_SOURCES),
+    'pixelshift-af': dict(source='z8pixelshift/src/af_unit.c', flags=[f for f in FLAGS if f!='-mgeneral-regs-only']+['-ffp-contract=off'], cave=0x409D8000, limit=0x409DA000, entry='ps8_af_one_batch', folder='z8pixelshift/src', suffixes=C_SOURCES),
+    'opengate': dict(source='z8opengate/src/d10_hooks.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp','-DFULL_OUTPUT=1','-DWITH_Q3=1','-DQ3_STASH_RAM=0xa0ff50000','-DQ3_FINE_TABLE=0x40953000','-DQ3_BASIC_TABLE=0x409533f0','-DOG_TIER_DELTA=0x4000'], folder='z8opengate/src', suffixes=C_SOURCES),
 }
 SPECS.update({
-    'anamorphic':dict(source='z8anamorphic/src/hooks.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp'],asm_base=0x40970000,limit=0x40974000,folder='z8anamorphic'),
-    'h265':dict(source='z8h265/src/hooks.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp'],asm_base=0x40A10000,limit=0x40A12000,folder='z8h265'),
-    'log':dict(source='z8log/src/hooks.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp'],asm_base=0x40B00000,limit=0x40B08000,folder='z8log'),
-    'quality':dict(source='z8quality/src/hooks.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp'],asm_base=0x40A41000,limit=0x40A50000,folder='z8quality'),
-    'shared':dict(source='z8patch/src/shared.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp'],asm_base=0x40980000,limit=0x40980F00,folder='z8patch/src'),
-    'colour':dict(source='z8colour/src/colour.S', flags=['-target','aarch64-none-elf','-x','assembler-with-cpp'],asm_base=0x40981000,limit=0x40981F00,folder='z8colour'),
+    'anamorphic':dict(source='z8anamorphic/src/hooks.S', flags=ASM,asm_base=0x40970000,limit=0x40974000,folder='z8anamorphic'),
+    'h265':dict(source='z8h265/src/hooks.S', flags=ASM,asm_base=0x40A10000,limit=0x40A12000,folder='z8h265'),
+    'log':dict(source='z8log/src/hooks.S', flags=ASM,asm_base=0x40B00000,limit=0x40B08000,folder='z8log'),
+    'quality':dict(source='z8quality/src/hooks.S', flags=ASM,asm_base=0x40A41000,limit=0x40A50000,folder='z8quality'),
+    'shared':dict(source='z8patch/src/shared.S', flags=ASM,asm_base=0x40980000,limit=0x40980F00,folder='z8patch/src'),
+    'colour':dict(source='z8colour/src/colour.S', flags=ASM,asm_base=0x40981000,limit=0x40981F00,folder='z8colour'),
 })
 
 
 def source_files(name):
-    if 'folder' in SPECS[name]:
-        folder=ROOT/SPECS[name]['folder']
-        return {p.relative_to(ROOT).as_posix():sha(p.read_bytes()) for p in sorted(folder.rglob('*'))
-                if p.is_file() and p.suffix in ('.py','.S','.json','.png')}
-    folder = ROOT/('z8precapture' if name=='precapture' else 'z8opengate/src' if name=='opengate' else 'z8pixelshift/src')
-    return {p.relative_to(ROOT).as_posix():sha(p.read_bytes()) for p in sorted(folder.iterdir()) if p.suffix in ('.c','.h','.inc','.S')}
-
+    spec=SPECS[name]
+    folder=ROOT/spec['folder']
+    return {p.relative_to(ROOT).as_posix():sha(p.read_bytes()) for p in sorted(folder.rglob('*'))
+            if p.is_file() and p.suffix in spec.get('suffixes',ASM_SOURCES)}
 
 
 def compile_unit(name, compiler='clang'):
@@ -49,7 +49,8 @@ def compile_unit(name, compiler='clang'):
     with tempfile.TemporaryDirectory(prefix='nikon-patch-compile-') as folder:
         obj = Path(folder)/'patch.o'
         cmd = [compiler,*spec['flags'],'-c',str(ROOT/spec['source']),'-o',str(obj)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Include paths in the flags are relative to the repository root.
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
         require(result.returncode==0, 'Compiler failed: '+result.stderr[-5000:])
         if 'asm_base' in spec:
             from .asm import link_elf
@@ -69,6 +70,8 @@ def compile_unit(name, compiler='clang'):
             symbols = {k:dict(va=hex(v),bytes=0) for k,v in entries.items()}
         else:
             code, sections, symbols, relocations = link(obj.read_bytes(), spec['cave'], spec['limit'], spec['entry'])
+            if spec.get('general_registers'):
+                general_registers_only(code, sections, spec['cave'])
     return code, dict(bytes=len(code),sha256=sha(code),symbols=symbols,source_sha256=source_files(name),
                       compiler=subprocess.check_output([compiler,'--version'],text=True).splitlines()[0],
                       flags=spec['flags'],resource='resources/'+name+'.bin')

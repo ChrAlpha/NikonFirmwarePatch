@@ -1,4 +1,8 @@
-"""Small checked AArch64 ELF linker; only read-only PROGBITS sections are accepted."""
+"""Small checked AArch64 ELF linker; only read-only PROGBITS sections are accepted.
+
+Undefined symbols named original_<8 hex digits> resolve to that absolute firmware address,
+as in z8patch/asm.py, so hooks name their native continuations without a linker script."""
+import re
 import struct
 from z8prores.package import require
 CAVE, CAVE_END = 0x40960000, 0x40970000
@@ -49,9 +53,12 @@ def link(raw, cave=0x409F0000, limit=0x40A00000, entry="precapture_history_entry
             off, info, addend = struct.unpack_from('<QQq', raw, at)
             typ, idx = (info & 4294967295, info >> 32)
             sym = syms[idx]
-            require(sym['section'] in where, ('unresolved symbol', sym))
             p = where[target] + off
-            s = sym['va'] + addend
+            if sym['section'] in where:
+                s = sym['va'] + addend
+            else:
+                require(sym['section'] == 0 and re.fullmatch('original_[0-9a-f]{8}', sym['name']), ('unresolved symbol', sym))
+                s = int(sym['name'].removeprefix('original_'), 16) + addend
             o = p - CAVE
             before = struct.unpack_from('<I', out, o)[0]
             w = before
@@ -90,3 +97,20 @@ def link(raw, cave=0x409F0000, limit=0x40A00000, entry="precapture_history_entry
     symbols = {s['name']: dict(va=hex(s['va']), bytes=s['size']) for s in syms if s['section'] in where and s['name']}
     require(int(symbols[entry]['va'], 16) == CAVE and CAVE + len(out) <= CAVE_END, 'Invalid AArch64 object or relocation')
     return (bytes(out), sections, symbols, relocations)
+
+
+def general_registers_only(code, sections, cave):
+    """Reject Advanced SIMD, floating-point and SVE instructions and svc/hvc/smc in executable sections.
+
+    Decodes the A64 top-level groups: op0 = bits 28..25 is x111 for SIMD and FP data processing,
+    0010 for SVE, and x1x0 with V = bit 26 for SIMD and FP loads and stores."""
+    for section in sections:
+        if not section['executable']:
+            continue
+        start = int(section['va'], 16) - cave
+        for at in range(start, start + section['bytes'], 4):
+            word = struct.unpack_from('<I', code, at)[0]
+            op0 = word >> 25 & 15
+            vector = op0 & 7 == 7 or op0 == 2 or (op0 & 5 == 4 and word >> 26 & 1)
+            trap = word & 0xFFE0001F in (0xD4000001, 0xD4000002, 0xD4000003)
+            require(not vector and not trap, ('SIMD, FP or system trap instruction', section['name'], hex(cave + at), hex(word)))
