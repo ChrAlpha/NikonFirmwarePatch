@@ -6,34 +6,92 @@
 
 ## 简体中文
 
-照片 LUT 把一个 3D LUT 应用到相机已渲染的照片：即 JPEG 在当前优化校准（Picture Control）之后、所选色彩空间中的 8 位 Y'CbCr 值。实时取景和 JPEG 使用同一风格；**NEF 原始数据不变**。
+照片 LUT 用 3D LUT 给 JPEG 加上风格。每个风格声明其 LUT 制作时针对的输入基准：
+
+- **`nikon-sdr`**（默认）：LUT 作用于相机已渲染的照片，即 JPEG 在当前优化校准（Picture Control）之后、所选色彩空间中的 8 位 Y'CbCr 值。实时取景和 JPEG 使用同一风格。
+- **Log 基准**（N-Log、S-Log3、Log3G10、F-Log2、LogC3、LogC4 或 V-Log，各带其色域）：照片由相机自身的 Log 处理链显影，所用参数表在电脑上针对该风格拟合，再由一个小的残差网格完成 JPEG。见 [Log 风格](#log-风格)。
+
+**NEF 原始数据不变。**
 
 ### 风格库文件
 
 风格库是一个可携带文件 `Z8LUTLIB.BIN`，与固件分开管理，最多 8 个风格：
 
-- 前段是相机实际应用的运行网格（17/33/65 点，总计不超过 2 MiB）；
-- 后段保存每个风格原始 `.cube` 的完整字节，只供电脑端使用。
+- 前段是相机读取的运行数据（格式 `Z8LUT004`，总计不超过 2 MiB）：每个风格的输入基准、渲染方式（`cpu-3d` 或 `isp+residual`）、Log 风格的显影参数表（相机原生格式）及其网格（17/33/65 点）；
+- 后段保存每个风格原始 `.cube` 的完整字节，Log 风格另含拟合设置与报告，只供电脑端使用。
 
-每个风格有一个**变换标识**：对相机实际应用的网格及其语义计算的 SHA-256。改名、调整顺序都不改变它；内容不同则标识不同。风格名为 1–63 字节 UTF-8（可用中文），不能含控制字符或首尾空格。
+每个风格有一个**变换标识**：对相机实际应用的全部内容（语义、基准、参数表和网格）计算的 SHA-256。改名、调整顺序都不改变它；内容不同则标识不同。旧格式 `Z8LUT003` 的库按 `nikon-sdr` 风格读入，标识不变，下一次修改或 `library card` 时保存为 `Z8LUT004`。风格名为 1–63 字节 UTF-8（可用中文），不能含控制字符或首尾空格。
 
 ```sh
 python photo_lut.py library create looks.bin                        # 空库
 python photo_lut.py library add looks.bin film.cube --name "胶片 A"   # 可选 --grid 17|33|65、--position N
+python photo_lut.py library add looks.bin provia.cube --basis f-log2/f-gamut-c   # Log 风格（见下文）
 python photo_lut.py library list looks.bin                          # 顺序、名称、标识、来源
 python photo_lut.py library rename looks.bin "胶片 A" "胶片 B"
 python photo_lut.py library move looks.bin "胶片 B" 1
 python photo_lut.py library remove looks.bin 2                      # 可删到空库
 python photo_lut.py library export looks.bin 1 原始.cube --source    # 与导入时逐字节相同
-python photo_lut.py library export looks.bin 1 运行.cube --runtime   # 相机实际应用的重采样网格
-python photo_lut.py library verify looks.bin                        # 从原始 .cube 重新推导并核对（较慢）
+python photo_lut.py library export looks.bin 1 运行.cube --runtime   # nikon-sdr：相机实际应用的重采样网格
+python photo_lut.py library verify looks.bin                        # 从原始 .cube 重新推导或重新测量并核对（较慢）
 ```
 
 每次修改都先完整写入并读回临时文件，再替换原文件；输入错误时原文件保持不变。
 
 **菜单显示。** 相机菜单以“序号. 名称”显示风格，长名称被截断时可按序号区分。尼康菜单字体只含相机自身菜单用到的字，一个标签只能用一种字体；固件先用当前界面语言的菜单字体，缺字时依次改用英文、简体中文、繁体中文、日文、韩文菜单字体中能完整显示该标签的一种。`library add`、`list`、`card` 会提示这些字体都缺少的字（例如“冬”“季”），这类字可能显示为方框；名称本身仍完整保存在库、导出文件和照片元数据中，需要时可改用能显示的名称。
 
-**输入基准。** 为 Log、HLG/PQ 或其他厂商基准制作的 LUT 不适用于相机渲染后的 SDR 照片。文件名、TITLE 或注释中出现 V-Log、N-Log、S-Log、LogC、F-Log、HLG、PQ、BT.2100/2020 等标记，或带 `#LUMIXPHOTOSTYLE`（松下注释，缺省即 V-Log）、`.vlt` 文件、超出 0..1 的 DOMAIN，都会被拒绝；确认 LUT 确为相机渲染 SDR 制作时，加 `--accept-input-basis`，原因会记录在库中。松下、尼康 NP3 或其他相机的 LUT 与本功能不能互换。
+**输入基准。** `--basis` 声明 LUT 期望的输入：
+
+| `--basis` | Log 编码 / 色域 |
+|---|---|
+| `nikon-sdr`（默认） | 相机渲染后的 SDR JPEG 值 |
+| `n-log/bt2020` | N-Log / ITU-R BT.2020 |
+| `s-log3/s-gamut3.cine` | S-Log3 / S-Gamut3.Cine |
+| `log3g10/redwidegamutrgb` | Log3G10 / REDWideGamutRGB |
+| `f-log2/f-gamut-c` | F-Log2 / F-Gamut C |
+| `arri-logc3/awg3` | ARRI LogC3 / ARRI Wide Gamut 3 |
+| `arri-logc4/awg4` | ARRI LogC4 / ARRI Wide Gamut 4 |
+| `v-log/v-gamut` | V-Log / V-Gamut |
+
+也可用简称（`--basis s-log3`）。未指定 `--basis` 时，看起来为其他输入制作的 cube 会被拒绝：文件名、TITLE 或注释中出现 Log 编码或色域名（V-Log、N-Log、S-Log3、LogC、F-Log2、RWG 等）、HLG、PQ、BT.2100/2020，或带 `#LUMIXPHOTOSTYLE`（松下注释，缺省即 V-Log），或 DOMAIN 超出 0..1。提示会说明发现了什么：请声明基准；若 LUT 确为相机渲染 SDR 制作，加 `--accept-input-basis`（原因记录在库中）。声明 Log 基准时，cube 自身文字不得与之矛盾：写明另一种 Log 编码、HLG/PQ、S-Log2/F-Log 或松下照片风格的 cube 会被拒绝；Rec.709 等输出名称不影响。不支持 `.vlt` 文件，也不支持尼康 NP3 或其他相机的照片风格。
+
+### Log 风格
+
+Log LUT 需要场景参考的 Log 输入，渲染后的 8 位 SDR JPEG 无法提供。对 Log 基准的风格，相机改为用自身的 N-Log 处理链（M1 矩阵、RGB 色调曲线、NLG、M2 矩阵和 32 节点 Cpxs 色相环）显影照片，所用的是**在电脑上针对该风格拟合的参数表**，再对 8 位 JPEG 输入应用一个接近恒等的**残差网格**，修正这些环节表达不了的部分。
+
+```sh
+python -m pip install -r requirements-photo-lut-log.txt              # numpy、scipy、colour-science：仅编译需要
+python photo_lut.py library add looks.bin provia.cube --basis f-log2/f-gamut-c
+python photo_lut.py library add looks.bin teal.cube --basis arri-logc3 --grid 65 --grey 400 --smoothness 3
+```
+
+编译约需一分钟，并输出**拟合报告**，报告也保存在库中、由 `library list` 显示：
+
+- **dE00 p50/p95/p99，仅 ISP**：只用拟合参数表、不加残差时的 JPEG；
+- **dE00 p50/p95/p99，ISP + 残差**：最终 JPEG 路径，经过 8 位 Y'CbCr 和相机的整数运算；
+- **残差斜率 p50/p99**：照片实际落入区域中，残差输出变化与 8 位输入变化之比（1 = 恒等；越大越可能出现色带）；
+- 可达网格节点比例、Cpxs 节点最小行列式、M1/M2 条件数。
+
+误差在 15,000 个留出的场景颜色上测量（灰点附近 −7…+3.5 EV、自然饱和度、BT.2020 色相），参照为对场景精确 Log 编码后应用该 LUT 的结果。编译器在相机的 229 节点曲线网格上拟合有界单调曲线，保持色相环可逆（行列式下限、节点间平滑 `--smoothness`，默认 3）并控制矩阵条件数；**先把各表量化到固件整数格式**，再在每个网格节点对量化后的模型求逆，得到残差。残差若不能改善 JPEG，就改为恒等网格，相机会跳过它。
+
+两个真实 cube 的实测结果（33 点残差；括号内为 65 点）：
+
+| Cube（基准） | 仅 ISP p50/p95/p99 | ISP + 残差 p50/p95/p99 | 残差斜率 p50/p99 |
+|---|---|---|---|
+| 富士 F-Log2 C → Provia（`f-log2/f-gamut-c`） | 1.09 / 3.08 / 4.88 | 0.39 / 1.55 / 3.79（0.34 / 1.42 / 3.25） | 1.14 / 1.63 |
+| ARRI LogC3 → Film Teal & Orange（`arri-logc3/awg3`） | 1.29 / 5.04 / 8.52 | 0.34 / 2.00 / 4.74（0.31 / 1.87 / 4.63） | 1.18 / 2.65 |
+
+仅 8 位 Y'CbCr 交接本身就带来约 0.2 dE00 的中位误差；其余尾部来自被拟合环节折叠或截断的颜色，任何残差都无法再把它们分开。
+
+**相机如何使用参数表。** M1 基础矩阵由相机与机身自身的矩阵和增益合成，方式与 Log 视频模式完全相同；编译器由本项目 Log 功能已校准的 S-Log3 基础矩阵推导（M1 输入 → S-Gamut3.Cine，再 S-Gamut3.Cine → 风格色域），因此每台机身使用自己的校准。18% 灰放在原厂 N-Log 曲线编码 0.18 的位置（`--grey 400` 曲线单位，也是 S-Log3 校准点）；数值越大画面越亮。三条 RGB 曲线相同。
+
+**哪些改变，哪些不变。**
+
+- 只有拍摄时的照片显影使用这些参数表。JPEG 再应用残差；**NEF 内嵌预览带有拟合风格但不含残差**（二者来自同一次显影），NEF 原始数据保持原样。
+- 本版中，Log 风格的实时取景保持相机正常渲染。
+- 与所有风格一样，所选 Log 风格可用时才允许拍摄。若照片显影没有使用该次拍摄自己的参数表（例如正在发布新库），JPEG 保持原样，元数据也不声明风格。
+- Log 风格不能用 `--runtime` 导出：其网格是相机参数表之后的残差，不是独立变换；`--source` 可导出原始 cube。
+
+**尚未实机验证。** QEMU 模拟器运行原厂固件，但其图像管线只做功能模拟、不应用颜色参数表，因此只能证明显影使用了该风格的参数表、JPEG 精确应用了残差，不能证明颜色。仍需实机确认：照片 ISO 下 18% 灰的曝光位置、照片路径最终的 Y'CbCr 编码、各机身校准是否与视频相同地合成、平滑渐变中的色带，以及分通道曲线。
 
 ### 固件与存储卡风格
 
@@ -61,14 +119,14 @@ A–D 拍摄菜单库分别保存完整变换标识，改名或调整顺序后�
 
 首次从旧版升级时，非关闭选择无法还原完整标识，会要求重新选择；带旧版会话标记的关闭选择仍保持关闭。全零的旧配置按从未设置处理，采用固件默认值“关闭”。返回原厂固件后，原厂设置仍可读取，原厂保存会清除本功能的扩展记录。
 
-每次拍摄在分配输出时锁定所选风格：复制其网格、标识和名称，之后改选或载入新库都不影响已开始的拍摄。
+每次拍摄在分配输出时锁定所选风格：复制其网格、标识、名称和基准，之后改选或载入新库都不影响已开始的拍摄。
 
 ### 照片元数据
 
-应用了风格的 JPEG 在其原有 XMP 包中多一个 `photolut` 命名空间（`https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/`）的描述：`LookName`、`TransformSHA256`（即变换标识，可在 `library list` 中对照）、`Applied`、`Rendering=baked-into-jpeg-pixels`、`InputBasis`、`Strength`/`StrengthScale`、`Grid`、`Algorithm`、`Schema`。只占用原包的空白填充，XMP 包、APP1 段和 Exif 偏移的长度都不变；尼康 MakerNote、优化校准、色彩空间、ICC、用户注释和版权信息不动。
+应用了风格的 JPEG 在其原有 XMP 包中多一个 `photolut` 命名空间（`https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/`，`Schema=1.1`）的描述：`LookName`、`TransformSHA256`（即变换标识，可在 `library list` 中对照）、`Applied`、`Rendering`（nikon-sdr 风格为 `baked-into-jpeg-pixels`，Log 风格为 `isp-fitted+residual`）、`InputBasis`（声明的基准，如 `nikon-sdr` 或 `f-log2/f-gamut-c`）、`FitSHA256`（Log 风格：拟合参数表的标识）、`Strength`/`StrengthScale`、`Grid`、`Algorithm`、`Schema`。只占用原包的空白填充，XMP 包、APP1 段和 Exif 偏移的长度都不变；尼康 MakerNote、优化校准、色彩空间、ICC、用户注释和版权信息不动。
 
-- 只在该 JPEG 的主图确实以变换后的像素成功编码时写入；编码失败或风格为“关闭”时不写。
-- 无变化（恒等）风格写入 `Applied=False`、`NoOp=True`。
+- 只在该 JPEG 的主图确实带风格成功编码时写入（像素已变换；Log 风格则已用其参数表显影）；编码失败、Log 风格未按其参数表显影或风格为“关闭”时不写。
+- 无变化（恒等）的 nikon-sdr 风格写入 `Applied=False`、`NoOp=True`。
 - **NEF 不写**，其图像与元数据保持原样。
 - 这是来源记录，不是给 Lightroom 或 NX Studio 的重新套用指令；这些软件不会因此自动套用风格。
 
@@ -76,7 +134,7 @@ A–D 拍摄菜单库分别保存完整变换标识，改名或调整顺序后�
 
 ### 开发者验证
 
-需要 Python 3.10+、`requirements.txt` 中的依赖和 `unicorn==2.1.4`。固件代码是 `z8photolut/src/unit.c` 单一编译单元（含 `hooks.S`），由 `tools/compile_units.py --units photo-lut` 用 clang-19 编译并由仓库自带的链接器链接，审核后的字节记录在 `resources/compiled.json` 与 `resources/photo-lut.bin`；测试执行的就是这份字节。测试用的原厂主程序由官方固件取出：
+需要 Python 3.10+、`requirements.txt` 中的依赖和 `unicorn==2.1.4`；编译器测试另需 `requirements-photo-lut-log.txt`，缺少时自动跳过。固件代码是 `z8photolut/src/unit.c` 单一编译单元（含 `hooks.S`），由 `tools/compile_units.py --units photo-lut` 用 clang-19 编译并由仓库自带的链接器链接，审核后的字节记录在 `resources/compiled.json` 与 `resources/photo-lut.bin`；测试执行的就是这份字节。测试用的原厂主程序由官方固件取出：
 
 ```sh
 python -m pip install -r requirements.txt unicorn==2.1.4
@@ -84,42 +142,100 @@ python -c "from z8prores.package import Package; open('z8-main-payload.bi','wb')
 Z8_PHOTO_LUT_ROM=z8-main-payload.bi python -B -m unittest discover -s tests -p 'test_photo_lut*.py'
 ```
 
-未设置 `Z8_PHOTO_LUT_ROM` 时只运行宿主测试；`Z8_PHOTO_LUT_SAMPLE_JPEG` 可额外指定一张原厂 JPEG 供 XMP 辅助测试使用。
+未设置 `Z8_PHOTO_LUT_ROM` 时只运行宿主测试；`Z8_PHOTO_LUT_SAMPLE_JPEG` 可额外指定一张原厂 JPEG 供 XMP 辅助测试使用；`Z8_PHOTO_LUT_SLOW=1` 在有真实 cube 时以正式设置编译一次。
 
 ### 验证范围
 
-宿主测试覆盖库格式、编辑、导出、错误输入和与相机校验代码的一致性；自动恢复、延迟读取时的选择合并、菜单库默认值、拍摄锁定和 XMP 写入由实际编译的固件代码在 Unicorn 中执行（文件系统和 XMP 合成器为桩）。原厂设置代码测试还在模拟 NOR 上执行第 16 节读写、模式 4 恢复及默认值，覆盖中断写入和原厂前缀保留。QEMU 模拟器另行运行原厂菜单与存储卡。实机菜单显示、存储卡读取、色彩、速度及 Lightroom/NX Studio 的显示均未验证。
+宿主测试覆盖库格式、编辑、导出、错误输入、输入基准规则、编译器（固件整数格式、先量化后求逆、相机运算核）和与相机校验代码的一致性；自动恢复、延迟读取时的选择合并、菜单库默认值、拍摄锁定、照片显影包装与共享颜色钩子、残差 JPEG 路径和 XMP 写入由实际编译的固件代码在 Unicorn 中执行（文件系统和 XMP 合成器为桩）。原厂设置代码测试还在模拟 NOR 上执行第 16 节读写、模式 4 恢复及默认值，覆盖中断写入和原厂前缀保留。QEMU 模拟器另行运行原厂菜单、存储卡，以及带显影追踪的 Log 风格拍摄。实机菜单显示、存储卡读取、色彩、速度及 Lightroom/NX Studio 的显示均未验证。
 
 ## English
 
-Photo LUT applies a 3D LUT to the photo the camera has already rendered: the JPEG's 8-bit Y'CbCr after the active Picture Control, in the selected colour space. Live view and JPEG use the same look; **NEF raw data is never changed**.
+Photo LUT gives JPEGs a look from a 3D LUT. Each look declares the input its LUT was made for:
+
+- **`nikon-sdr`** (default): the LUT acts on the photo the camera has already rendered, the JPEG's 8-bit Y'CbCr after the active Picture Control, in the selected colour space. Live view and JPEG use the same look.
+- **A Log basis** (N-Log, S-Log3, Log3G10, F-Log2, LogC3, LogC4 or V-Log, each with its gamut): the still is developed through the camera's own Log chain with tables fitted to the look on the computer, then a small residual grid finishes the JPEG. See [Log looks](#log-looks).
+
+**NEF raw data is never changed.**
 
 ### Library file
 
 A library is one portable file, `Z8LUTLIB.BIN`, managed independently of firmware, holding up to eight looks:
 
-- its first part is the runtime grid the camera applies (17/33/65 points, at most 2 MiB in total);
-- the rest keeps each look's exact original `.cube` bytes for the host.
+- its first part is the runtime bundle the camera reads (format `Z8LUT004`, at most 2 MiB in total): per look its input basis, rendering (`cpu-3d` or `isp+residual`), for a Log look its still-develop tables in the camera's own formats, and its grid (17/33/65 points);
+- the rest keeps each look's exact original `.cube` bytes and, for a Log look, its fit settings and report, for the host only.
 
-Each look has a **transform identity**: SHA-256 over the grid the camera applies and its semantics. Renaming and reordering keep it; different content changes it. Names are 1–63 bytes of UTF-8 (Chinese works) without control characters or outer spaces.
+Each look has a **transform identity**: SHA-256 over everything the camera applies (semantics, basis, tables and grid). Renaming and reordering keep it; different content changes it. Libraries in the earlier `Z8LUT003` format are read as `nikon-sdr` looks with unchanged identities and saved as `Z8LUT004` by the next change or `library card`. Names are 1–63 bytes of UTF-8 (Chinese works) without control characters or outer spaces.
 
 ```sh
 python photo_lut.py library create looks.bin                       # empty library
 python photo_lut.py library add looks.bin film.cube --name "Film A"  # optional --grid 17|33|65, --position N
+python photo_lut.py library add looks.bin provia.cube --basis f-log2/f-gamut-c   # a Log look (see below)
 python photo_lut.py library list looks.bin                         # order, names, identities, sources
 python photo_lut.py library rename looks.bin "Film A" "Film B"
 python photo_lut.py library move looks.bin "Film B" 1
 python photo_lut.py library remove looks.bin 2                     # down to an empty library
 python photo_lut.py library export looks.bin 1 original.cube --source  # byte-identical to the import
-python photo_lut.py library export looks.bin 1 runtime.cube --runtime  # the resampled grid the camera applies
-python photo_lut.py library verify looks.bin                       # re-derive from the sources (slow)
+python photo_lut.py library export looks.bin 1 runtime.cube --runtime  # nikon-sdr: the resampled grid the camera applies
+python photo_lut.py library verify looks.bin                       # re-derive or re-measure from the sources (slow)
 ```
 
 Every change writes and reads back a complete temporary file before replacing the library; bad input leaves the previous file unchanged.
 
 **Menu labels.** The camera menu shows looks as "N. Name", so clipped long names stay distinguishable. Nikon's menu fonts hold only the characters the camera's own menus use, and a label uses one font: the firmware uses the UI language's menu font, and if that lacks a character, the first of the English, Simplified Chinese, Traditional Chinese, Japanese and Korean menu fonts that has the whole label. `library add`, `list` and `card` point out characters that all of these lack (for example 冬 and 季); they may show as boxes. The name itself is kept in full in the library, exports and photo metadata; rename the look if you want a readable menu label.
 
-**Input basis.** LUTs made for log, HLG/PQ or another vendor's base do not fit the camera's rendered SDR photo. A file name, TITLE or comment mentioning V-Log, N-Log, S-Log, LogC, F-Log, HLG, PQ, BT.2100/2020 and similar, a `#LUMIXPHOTOSTYLE` comment (Panasonic; missing means V-Log), a `.vlt` file, or a DOMAIN outside 0..1 is refused. If the LUT really was made for camera-rendered SDR, add `--accept-input-basis`; the reason is recorded in the library. Panasonic, Nikon NP3 and other cameras' LUTs are not interchangeable with this feature.
+**Input basis.** `--basis` declares what the LUT expects:
+
+| `--basis` | Log encoding / gamut |
+|---|---|
+| `nikon-sdr` (default) | camera-rendered SDR JPEG values |
+| `n-log/bt2020` | N-Log / ITU-R BT.2020 |
+| `s-log3/s-gamut3.cine` | S-Log3 / S-Gamut3.Cine |
+| `log3g10/redwidegamutrgb` | Log3G10 / REDWideGamutRGB |
+| `f-log2/f-gamut-c` | F-Log2 / F-Gamut C |
+| `arri-logc3/awg3` | ARRI LogC3 / ARRI Wide Gamut 3 |
+| `arri-logc4/awg4` | ARRI LogC4 / ARRI Wide Gamut 4 |
+| `v-log/v-gamut` | V-Log / V-Gamut |
+
+Short names work too (`--basis s-log3`). Without `--basis`, a cube that looks made for something else is refused: a file name, TITLE or comment naming a Log encoding or gamut (V-Log, N-Log, S-Log3, LogC, F-Log2, RWG, …), HLG, PQ, BT.2100/2020, a `#LUMIXPHOTOSTYLE` comment (Panasonic; missing means V-Log), or a DOMAIN outside 0..1. The message names what it found; declare the basis, or, if the LUT really was made for camera-rendered SDR, add `--accept-input-basis` (the reason is recorded in the library). With a Log basis, the cube's own text must not contradict it: a cube naming another Log encoding, HLG/PQ, S-Log2/F-Log or a Panasonic Photo Style is refused; output names such as Rec.709 are fine. `.vlt` files and Nikon NP3 or other cameras' picture styles are not supported.
+
+### Log looks
+
+A Log LUT expects scene-referred Log input, which the rendered 8-bit SDR JPEG cannot provide. For a look with a Log basis the camera instead develops the still through its native N-Log chain (M1 matrix, RGB tone curves, NLG, M2 matrix and the 32-node Cpxs hue ring) with **tables fitted to the look on the computer**, then applies a near-identity **residual grid** to the 8-bit JPEG input to correct what those stages cannot express.
+
+```sh
+python -m pip install -r requirements-photo-lut-log.txt              # numpy, scipy, colour-science: compiling only
+python photo_lut.py library add looks.bin provia.cube --basis f-log2/f-gamut-c
+python photo_lut.py library add looks.bin teal.cube --basis arri-logc3 --grid 65 --grey 400 --smoothness 3
+```
+
+Compiling takes about a minute and prints a **fit report**, also kept in the library and shown by `library list`:
+
+- **dE00 p50/p95/p99, ISP only**: the fitted tables alone, as the JPEG would be without the residual;
+- **dE00 p50/p95/p99, ISP + residual**: the final JPEG path, through 8-bit Y'CbCr and the camera's integer kernel;
+- **residual slope p50/p99**: residual output steps per 8-bit input step where photos land (1 = identity; higher values risk banding);
+- reachable grid nodes, the smallest Cpxs node determinant and the M1/M2 condition numbers.
+
+Errors are measured on 15,000 held-out scene colours (−7…+3.5 EV around grey, natural saturation, BT.2020 hues) against the LUT applied to the exact Log encoding of the scene. The compiler fits on the camera's 229-node curve grid with a bounded monotone curve, keeps the hue ring invertible (determinant floor, inter-node smoothness `--smoothness`, default 3) and the matrices well conditioned, **quantises every table to its firmware integer format first**, then builds the residual by inverting the quantised model at each grid node. If the residual would not improve the JPEG it becomes the identity grid, which the camera skips.
+
+Measured on two real cubes (33-point residual; with 65 points in parentheses):
+
+| Cube (basis) | ISP only p50/p95/p99 | ISP + residual p50/p95/p99 | Residual slope p50/p99 |
+|---|---|---|---|
+| Fujifilm F-Log2 C → Provia (`f-log2/f-gamut-c`) | 1.09 / 3.08 / 4.88 | 0.39 / 1.55 / 3.79 (0.34 / 1.42 / 3.25) | 1.14 / 1.63 |
+| ARRI LogC3 → Film Teal & Orange (`arri-logc3/awg3`) | 1.29 / 5.04 / 8.52 | 0.34 / 2.00 / 4.74 (0.31 / 1.87 / 4.63) | 1.18 / 2.65 |
+
+The 8-bit Y'CbCr hand-off alone costs about 0.2 dE00 at the median; the remaining tail comes from colours the fitted stages fold or clip, which no residual can separate again.
+
+**How the camera uses the tables.** The M1 base is composed by the camera with its own body matrix and gain exactly as the Log video modes compose theirs; the compiler derives it from the calibrated S-Log3 base of this project's Log feature (M1 input → S-Gamut3.Cine, then S-Gamut3.Cine → the look's gamut), so each body applies its own calibration. 18 % grey is placed where the stock N-Log curve encodes 0.18 (`--grey 400` curve units, also the S-Log3 calibration point); a larger value renders brighter. All three RGB curves are identical.
+
+**What changes and what does not.**
+
+- Only the still develop of a capture uses the tables. The JPEG gets the residual; **NEF embedded previews carry the fitted look without the residual** (one develop feeds both), while the NEF raw data stays original.
+- Live view stays the camera's normal rendering for Log looks in this release.
+- A capture is admitted only when the selected Log look is available, as for every look. If the still develop did not use the capture's own tables (for example a library publication in progress), the JPEG stays native and its metadata claims no look.
+- The `--runtime` export is refused for Log looks: their grid is a residual after the camera's tables, not a standalone transform. `--source` exports the original cube.
+
+**Not verified on a camera.** The QEMU emulator runs the original firmware with a functional image pipeline that does not apply colour tables, so it proves the develop uses the look's tables and the JPEG gets exactly the residual, not the colours. The physical-camera checks still open: exposure placement of 18 % grey at still ISOs, the still path's final Y'CbCr encoding, whether each body's calibration composes as for video, banding in smooth gradients, and per-channel curves.
 
 ### Firmware and card looks
 
@@ -147,14 +263,14 @@ The menu lists the active library only. Explicitly importing a card library repl
 
 On the first upgrade, legacy non-Off choices need a new selection because their full identities cannot be reconstructed; tagged Off choices stay Off. An all-zero legacy configuration is treated as never set and takes the firmware default, Off. Stock firmware can still read its original settings; saving with stock firmware clears this feature's extension record.
 
-Each capture latches its look when its output is reserved: it copies the grid, identity and name, so changing the selection or loading a library never affects a capture already under way.
+Each capture latches its look when its output is reserved: it copies the grid, identity, name and basis, so changing the selection or loading a library never affects a capture already under way.
 
 ### Photo metadata
 
-A JPEG with a look applied carries one more description in its existing XMP packet, in the `photolut` namespace (`https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/`): `LookName`, `TransformSHA256` (the transform identity shown by `library list`), `Applied`, `Rendering=baked-into-jpeg-pixels`, `InputBasis`, `Strength`/`StrengthScale`, `Grid`, `Algorithm` and `Schema`. It uses only the packet's space padding, so the XMP packet, APP1 segment and Exif offsets keep their lengths; Nikon MakerNotes, Picture Control, colour space, ICC, user comment and copyright are untouched.
+A JPEG with a look applied carries one more description in its existing XMP packet, in the `photolut` namespace (`https://github.com/ChrAlpha/NikonFirmwarePatch/ns/photo-lut/1.0/`, `Schema=1.1`): `LookName`, `TransformSHA256` (the transform identity shown by `library list`), `Applied`, `Rendering` (`baked-into-jpeg-pixels` for nikon-sdr looks, `isp-fitted+residual` for Log looks), `InputBasis` (the declared basis, e.g. `nikon-sdr` or `f-log2/f-gamut-c`), `FitSHA256` (Log looks: identity of the fitted tables), `Strength`/`StrengthScale`, `Grid`, `Algorithm` and `Schema`. It uses only the packet's space padding, so the XMP packet, APP1 segment and Exif offsets keep their lengths; Nikon MakerNotes, Picture Control, colour space, ICC, user comment and copyright are untouched.
 
-- It is written only when the JPEG's main image was successfully encoded from the transformed pixels; a failed encode or Off writes nothing.
-- A no-op (identity) look is recorded as `Applied=False`, `NoOp=True`.
+- It is written only when the JPEG's main image was successfully encoded with the look (transformed pixels; for a Log look, developed through its tables); a failed encode, an undeveloped Log look or Off writes nothing.
+- A no-op (identity) nikon-sdr look is recorded as `Applied=False`, `NoOp=True`.
 - **NEF files get nothing**; their image and metadata stay original.
 - This records provenance; it is not an instruction for Lightroom or NX Studio, which will not re-apply the look from it.
 
@@ -162,7 +278,7 @@ Read it with `exiftool -XMP-photolut:all DSC_0001.JPG` (checked with ExifTool 13
 
 ### Developer checks
 
-Python 3.10+, the dependencies in `requirements.txt` and `unicorn==2.1.4` are required. The firmware code is one translation unit, `z8photolut/src/unit.c` (including `hooks.S`), compiled with clang-19 by `tools/compile_units.py --units photo-lut` and linked by the in-house linker; its reviewed bytes are recorded in `resources/compiled.json` and `resources/photo-lut.bin`, and the tests execute those bytes. The tests take the original main payload from the official firmware:
+Python 3.10+, the dependencies in `requirements.txt` and `unicorn==2.1.4` are required; the compiler tests also need `requirements-photo-lut-log.txt` and skip without it. The firmware code is one translation unit, `z8photolut/src/unit.c` (including `hooks.S`), compiled with clang-19 by `tools/compile_units.py --units photo-lut` and linked by the in-house linker; its reviewed bytes are recorded in `resources/compiled.json` and `resources/photo-lut.bin`, and the tests execute those bytes. The tests take the original main payload from the official firmware:
 
 ```sh
 python -m pip install -r requirements.txt unicorn==2.1.4
@@ -170,8 +286,8 @@ python -c "from z8prores.package import Package; open('z8-main-payload.bi','wb')
 Z8_PHOTO_LUT_ROM=z8-main-payload.bi python -B -m unittest discover -s tests -p 'test_photo_lut*.py'
 ```
 
-Without `Z8_PHOTO_LUT_ROM` only host tests run; `Z8_PHOTO_LUT_SAMPLE_JPEG` may name an original JPEG for the XMP helper tests.
+Without `Z8_PHOTO_LUT_ROM` only host tests run; `Z8_PHOTO_LUT_SAMPLE_JPEG` may name an original JPEG for the XMP helper tests, and `Z8_PHOTO_LUT_SLOW=1` also compiles a real cube at production settings when one is available.
 
 ### Evidence
 
-Original-ROM settings tests additionally execute section-16 read/write, mode-4 restore and defaults over modelled NOR, including interrupted writes and stock-prefix preservation. Host tests cover the library format, editing, exports, malformed input and parity with the camera's validator; automatic restore, pending-change merges, bank defaults, capture latching and XMP insertion run the actual compiled firmware code in Unicorn with stubbed file system and XMP composer. The QEMU emulator separately runs the original menus and card. Physical menu drawing, card reads, colour, speed and Lightroom/NX Studio display are not verified.
+Original-ROM settings tests additionally execute section-16 read/write, mode-4 restore and defaults over modelled NOR, including interrupted writes and stock-prefix preservation. Host tests cover the library format, editing, exports, malformed input, input-basis rules, the compiler (firmware integer formats, quantise-then-invert, the camera kernel) and parity with the camera's validator; automatic restore, pending-change merges, bank defaults, capture latching, the still-develop wrappers with the shared colour hooks, the residual JPEG path and XMP insertion run the actual compiled firmware code in Unicorn with stubbed file system and XMP composer. The QEMU emulator separately runs the original menus, card and a Log-look capture with traced still develop. Physical menu drawing, card reads, colour, speed and Lightroom/NX Studio display are not verified.
