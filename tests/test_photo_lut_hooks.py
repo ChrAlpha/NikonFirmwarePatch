@@ -4,9 +4,9 @@ import struct
 import unittest
 
 from z8photolut import library as lib
-from z8photolut.patcher import CODE,STILL_VA,branch
-from photo_lut_fixtures import (CODE_BYTES,JPEG_STORAGE,LEASE_BYTES,LEASE_MUTABLE,LIBRARY,RESUME,STATE,bundle_ids,desire,isp_look,
-                                native_code,record_bytes,runtime_bundle,snapshot_bytes)
+from z8photolut.patcher import CODE,branch
+from photo_lut_fixtures import (CODE_BYTES,JPEG_STORAGE,LEASE_BYTES,LEASE_MUTABLE,LIBRARY,PRIVATE_BYTES,RESUME,STATE,bundle_ids,
+                                desire,isp_look,lane_record,native_code,record_bytes,runtime_bundle,snapshot_bytes)
 
 
 try:
@@ -156,7 +156,7 @@ class PhotoLutQueueTests(unittest.TestCase):
     def fixture(self,channel=0,ready=True):
         m=Uc(UC_ARCH_ARM64,UC_MODE_ARM)
         state=STATE;context=0xa03000000;request=context+0x1000;stack=context+0x11800
-        for at,size in [(CODE,CODE_BYTES),(LIBRARY,4096),(state,8192),(0xa03d48000,4096),
+        for at,size in [(CODE,CODE_BYTES),(LIBRARY,4096),(state,PRIVATE_BYTES),(0xa03d48000,4096),
                         (context,0x20000),(0x40cd7000,4096),(0x40d2c000,4096),(0x40d2d000,4096),
                         (0x40e9a000,4096),(0x65000000,4096),(0xa02810000,4096),
                         (0xa02e70000,8192),(0xa02c90000,4096),(0xa03f31000,4096),(0x41047000,4096)]:m.mem_map(at,size)
@@ -255,6 +255,25 @@ class PhotoLutQueueTests(unittest.TestCase):
         self.assertEqual(bytes(m.mem_read(request,0x98)),original)
         self.assertEqual(m.reg_read(regs.UC_ARM64_REG_SP),stack)
         self.assertEqual(m.reg_read(regs.UC_ARM64_REG_NZCV),0xa0000000)
+
+    def test_log_look_reaches_live_frames_only_after_served_live_builds(self):
+        # Look 1 is an isp+residual look: live view applies its residual on the CPU only once live builds are
+        # served with its tables (Z8_LIVE_SETTLED consecutive builds), and never an identity residual.
+        cases=[(None,0,False,'live view still native'),('look',1,False,'one served build'),('look',2,True,'settled'),
+               ('look',9,True,'steady'),('other',5,False,'another look served'),('identity',5,False,'identity residual')]
+        for served,streak,applied,label in cases:
+            with self.subTest(label):
+                m,state,slot,request,stack,original,before,ids=self.fixture()
+                entry=LIBRARY+64
+                m.mem_write(entry+12,struct.pack('<I',int(served=='identity')))
+                m.mem_write(entry+20,struct.pack('<H',1))
+                looks=bundle_ids(m)
+                lane_record(m,1,None if served is None else looks[1] if served=='other' else looks[0],streak=streak)
+                m.emu_start(self.symbols['z8_photo_lut_queue_entry'],RESUME['queue_resume'],count=10000)
+                self.assertEqual(m.reg_read(regs.UC_ARM64_REG_PC),RESUME['queue_resume'])
+                private=slot+self.metadata['runtime_layout']['request_offset']
+                self.assertEqual(m.reg_read(ids[1]),private if applied else request)
+                self.assertEqual(int.from_bytes(m.mem_read(slot,4),'little'),5 if applied else 4)
 
     def test_real_apply_and_retire_do_not_override_deferred_cache_pin(self):
         m,state,slot,request,stack,original,before,ids=self.fixture()
@@ -555,7 +574,7 @@ class PhotoLutQueueTests(unittest.TestCase):
                 self.assertEqual(bytes(m.mem_read(footer+80,32)),look.id)
                 # The residual copied into the lease is the grid after the ISP tables.
                 self.assertEqual(bytes(m.mem_read(self.snapshot,len(look.samples))),look.samples)
-                m.mem_write(STILL_VA+0x48,look.id if developed else bytes(32))
+                lane_record(m,0,look.id if developed else None)
                 self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
                 self.assertEqual(encodes[0][2],(0x820001000,0x820001040) if developed else (0x810000000,0x810000040))
                 self.assertEqual(int.from_bytes(m.mem_read(footer+LEASE_MUTABLE+52,4),'little'),int(developed))
@@ -568,7 +587,7 @@ class PhotoLutQueueTests(unittest.TestCase):
                 m,state,stack,params,desc,image,allocations,freed,encodes,owner,footer=self.jpeg_fixture(
                     looks=(look,),transform=False)
                 self.assertEqual(allocations,[(42,0x38,4096+LEASE_BYTES)])
-                m.mem_write(STILL_VA+0x48,look.id if developed else bytes(32))
+                lane_record(m,0,look.id if developed else None)
                 self.run_jpeg(m,[('STGJPEGB','z8_photo_lut_jpeg',(0,params))],service=False)
                 # The develop is the look: the native surface is encoded and, only if it was developed, applied.
                 self.assertEqual(encodes[0][2],(0x810000000,0x810000040))

@@ -19,7 +19,7 @@ import struct
 import unittest
 
 from features import build
-from photo_lut_fixtures import LIBRARY_CARD, STATE, native_code, record_bytes
+from photo_lut_fixtures import LIBRARY_CARD, PRIVATE_BYTES, STATE, native_code, record_bytes
 from z8patch.shared import TABLES, TABLES_END
 from z8photolut import library as lib
 from z8photolut.patcher import ALIAS, BASE, STATE as STATE_PAGE, TEXT
@@ -79,7 +79,7 @@ class BankRecordLifecycleTests(unittest.TestCase):
         source = 0x44c6b000
         m.mem_write(source+DATA_BIAS, self.image[source-BASE:])
         m.mem_map(0xa04800000, 0x100000)
-        m.mem_map(STATE, 0x2000)
+        m.mem_map(STATE, PRIVATE_BYTES)
         # Menu text and its language-table entries are rewritten through the writable RAM alias.
         for first, end in ((TABLES, TABLES_END), (TEXT, STATE_PAGE)):
             m.mem_map(first+ALIAS, end-first)

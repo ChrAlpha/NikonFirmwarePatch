@@ -13,7 +13,7 @@ from pathlib import Path
 import struct
 import unittest
 
-from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,LEASE_MUTABLE,LIBRARY,STATE,desire,native_code,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import JPEG_STORAGE,LEASE_BYTES,LEASE_MUTABLE,LIBRARY,PRIVATE_BYTES,STATE,desire,native_code,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,branch
 
 try:
@@ -148,7 +148,7 @@ class CompiledGraphMachine(NativeGraphMachine):
         self.symbols=symbols
         self.layout=metadata['runtime_layout']
         self.cached_pages=set(range(CACHED,CACHED+0x10000,4096))
-        self.m.mem_map(STATE,0x2000)
+        self.m.mem_map(STATE,PRIVATE_BYTES)
         self.m.mem_write(CODE,code)
         self.m.mem_map(LIBRARY,0x100000)
         self.m.mem_write(LIBRARY,looks)

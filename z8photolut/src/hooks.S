@@ -213,46 +213,41 @@ z8_photo_lut_bank_reset_result_entry:
     b original_40d68208
 .size z8_photo_lut_bank_reset_result_entry, .-z8_photo_lut_bank_reset_result_entry
 
-/* Still develop wrappers, entered through the native BL at 0x41053c50
- * (M1/M2 build, thunk 0x41112dcc) and 0x41053da0 (curve build, thunk
- * 0x41112dd8) with the builder arguments in x0..x2; both callers only reload
- * callee-saved registers and return 1 afterwards. The builder runs between
- * the C begin/end calls with its original arguments. */
-.global z8_photo_lut_still_m_entry
-.type z8_photo_lut_still_m_entry,%function
-z8_photo_lut_still_m_entry:
-    stp x29, x30, [sp, #-48]!
+/* Colour-build wrappers, entered through a native BL in place of a builder
+ * thunk with the builder arguments in x0..x3 (the curve builders read x3:
+ * still caller x19, live caller x20); every caller only reloads callee-saved
+ * registers and returns 1 afterwards. begin(x0[, caller]) decides whether the
+ * build is served, the builder runs with its original arguments, then
+ * end(x0, served). The live M1/M2 caller 0x41052b3c keeps its argument
+ * block in x20, passed as `caller`.
+ *   still_m 0x41053c50 -> 0x41112dcc   still_curve 0x41053da0 -> 0x41112dd8
+ *   live_m  0x41052c14 -> 0x41112dc0   live_curve  0x41052e04 -> 0x41112dd0 */
+.macro build_entry name, thunk, caller
+.global z8_photo_lut_\name\()_entry
+.type z8_photo_lut_\name\()_entry,%function
+z8_photo_lut_\name\()_entry:
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x0, x1, [sp, #16]
-    stp x2, x19, [sp, #32]
-    bl z8_photo_lut_still_m_begin
+    stp x2, x3, [sp, #32]
+    str x19, [sp, #48]
+    .ifnb \caller
+    mov x1, \caller
+    .endif
+    bl z8_photo_lut_\name\()_begin
     mov w19, w0
     ldp x0, x1, [sp, #16]
-    ldr x2, [sp, #32]
-    bl original_41112dcc
+    ldp x2, x3, [sp, #32]
+    bl original_\thunk
     ldr x0, [sp, #16]
     mov w1, w19
-    bl z8_photo_lut_still_m_end
-    ldr x19, [sp, #40]
-    ldp x29, x30, [sp], #48
+    bl z8_photo_lut_\name\()_end
+    ldr x19, [sp, #48]
+    ldp x29, x30, [sp], #64
     ret
-.size z8_photo_lut_still_m_entry, .-z8_photo_lut_still_m_entry
-
-.global z8_photo_lut_still_curve_entry
-.type z8_photo_lut_still_curve_entry,%function
-z8_photo_lut_still_curve_entry:
-    stp x29, x30, [sp, #-48]!
-    mov x29, sp
-    stp x0, x1, [sp, #16]
-    stp x2, x19, [sp, #32]
-    bl z8_photo_lut_still_curve_begin
-    mov w19, w0
-    ldp x0, x1, [sp, #16]
-    ldr x2, [sp, #32]
-    bl original_41112dd8
-    mov w0, w19
-    bl z8_photo_lut_still_curve_end
-    ldr x19, [sp, #40]
-    ldp x29, x30, [sp], #48
-    ret
-.size z8_photo_lut_still_curve_entry, .-z8_photo_lut_still_curve_entry
+.size z8_photo_lut_\name\()_entry, .-z8_photo_lut_\name\()_entry
+.endm
+build_entry still_m, 41112dcc
+build_entry still_curve, 41112dd8
+build_entry live_m, 41112dc0, x20
+build_entry live_curve, 41112dd0

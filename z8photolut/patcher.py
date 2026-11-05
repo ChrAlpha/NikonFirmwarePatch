@@ -3,8 +3,8 @@
 The group owns 0x40b50000..0x40c00000. The firmware carries no looks: the library comes only from
 the card (Z8LUTLIB.BIN). Shared owners in z8patch/shared.py provide the language-table entries
 (Strings), the photo-menu hide list and refresh dispatch (PhotoMenu) and the text loader floor; the
-shared colour unit (z8colour) serves this group's still-develop provider block to the native
-colour builders.
+shared colour unit (z8colour) serves this group's provider lanes (still develop, live view) to the
+native colour builders.
 """
 import struct
 
@@ -18,16 +18,22 @@ CODE, CODE_END = 0x40B50000, 0x40B68000
 PAGE, PAGE_END = 0x40B68000, 0x40B69000
 TEXT, TEXT_BLOCK, TEXT_GROUPS = 0x40B69000, 0x800, 3
 STATE, STATE_BYTES = 0x40B6B000, 0x1000
-# Still develop page (firmware.h Z8StillDevelop): the colour provider block (z8colour CONFIG +0x58)
-# first, then the develop record and the served Log look's ISP table copy. Zero in the image.
-STILL, STILL_BYTES = 0x40B6C000, 0x1000
+# Develop pages (firmware.h Z8Develop): the colour provider block (z8colour CONFIG +0x58, lane 0 still
+# develop, lane 1 live view), the lane records, then each lane's copy of its served Log look's ISP
+# tables. Zero in the image.
+DEVELOP, DEVELOP_BYTES = 0x40B6C000, 0x2000
 REGION_END = 0x40C00000
-FLOOR = STILL+STILL_BYTES               # z8patch/shared.py loader floor: both zero pages are loaded
-STATE_VA, STILL_VA = STATE+ALIAS, STILL+ALIAS
-PROVIDER = STILL_VA
-# Native still-develop builder calls the wrappers replace (call site, native target, entry).
-STILL_CALLS = ((0x41053C50, 0x41112DCC, 'z8_photo_lut_still_m_entry'),
-               (0x41053DA0, 0x41112DD8, 'z8_photo_lut_still_curve_entry'))
+FLOOR = DEVELOP+DEVELOP_BYTES           # z8patch/shared.py loader floor: the zero state and develop pages are loaded
+STATE_VA, DEVELOP_VA = STATE+ALIAS, DEVELOP+ALIAS
+PROVIDER = DEVELOP_VA
+LANES, LANE_BYTES, LANE_RECORDS, TABLES = 2, 0x38, DEVELOP_VA+0x80, DEVELOP_VA+0x200
+STILL_LANE, LIVE_LANE = 0, 1
+# Native colour-builder calls the wrappers replace (call site, native thunk, entry): the still develop's
+# M1/M2 and curve builds, then live view's.
+BUILD_CALLS = ((0x41053C50, 0x41112DCC, 'z8_photo_lut_still_m_entry'),
+               (0x41053DA0, 0x41112DD8, 'z8_photo_lut_still_curve_entry'),
+               (0x41052C14, 0x41112DC0, 'z8_photo_lut_live_m_entry'),
+               (0x41052E04, 0x41112DD0, 'z8_photo_lut_live_curve_entry'))
 LOOK_SLOTS, OPTION_FIRST = 8, 0x35B5
 # Photo shooting menu row 2 (item 0x2caa, hidden in stock) opens state 0xf8, otherwise unreachable.
 PHOTO_ROWS, ROW, ITEM = 0x3C6F790, 2, 0x2CAA
@@ -316,22 +322,24 @@ def build_main(stock, code, entries, strings):
                                   (0x41012558, 0x40d6c628, 'blob_write', 'blob-16 store with the bank record')]:
         img.put(at-BASE, branch(at, entries[f'z8_photo_lut_{name}'], True), 'photo LUT bank record: '+why,
                 expect=branch(at, target, True))
-    # Log looks: the still develop runs the native Log chain with the look's tables (served through
-    # the shared colour unit to these two builds only); live view and other builds stay native.
-    for at, native, entry in STILL_CALLS:
-        img.put(at-BASE, branch(at, entries[entry], True), 'photo LUT still develop of Log looks: '+entry[14:-6],
+    # Log looks: the still develop and photo-mode live view run the native Log chain with the look's
+    # tables, served through the shared colour unit to these builds only; other builds stay native.
+    for at, native, entry in BUILD_CALLS:
+        img.put(at-BASE, branch(at, entries[entry], True), 'photo LUT Log looks through native colour build: '+entry[14:-6],
                 expect=branch(at, native, True))
     menu = add_menu(img, entries, strings)
     return img, dict(code_bytes=len(code), menu=menu, library='card only (Z8LUTLIB.BIN); no built-in looks',
-                     still=dict(provider=hex(PROVIDER), page=hex(STILL), tables=hex(STILL_VA+0x100),
-                                calls={hex(at): entry for at, _, entry in STILL_CALLS}, tone='S+0xbc'),
-                     region=dict(code=hex(CODE), page=hex(PAGE), text=hex(TEXT), state=hex(STATE), still=hex(STILL),
+                     develop=dict(provider=hex(PROVIDER), pages=hex(DEVELOP), bytes=DEVELOP_BYTES, lanes=['still', 'live'],
+                                  lane_records=hex(LANE_RECORDS), tables=[hex(TABLES+0x900*lane) for lane in range(LANES)],
+                                  calls={hex(at): entry for at, _, entry in BUILD_CALLS}, selectors='S+0xbc, R+0x31',
+                                  live_modes=[6, 9, 11]),
+                     region=dict(code=hex(CODE), page=hex(PAGE), text=hex(TEXT), state=hex(STATE), develop=hex(DEVELOP),
                                  end=hex(REGION_END)),
                      runtime=dict(address=hex(STATE_VA), source=hex(STATE), bytes=STATE_BYTES, layout=layout),
                      persistence=persistence(layout),
                      colour_contract=dict(stage='nikon-sdr: native rendered 8-bit photo YUV before display or JPEG; '
-                                          'Log looks: native Log still develop with the look ISP tables, residual on the '
-                                          'JPEG input',
+                                          'Log looks: native Log still develop and photo-mode live view with the look ISP '
+                                          'tables, residual on the JPEG input and on live frames after served live builds',
                                           model_conversion='integer BT.601 full-range YCbCr', camera_colorimetry_verified=False,
                                           preview='65x65 chroma cache with all256 luma samples; bilinear approximation',
                                           jpeg='RGB tetrahedral interpolation per pixel'))

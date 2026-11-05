@@ -13,7 +13,7 @@ import struct
 import unittest
 
 from z8photolut.library import look_id
-from photo_lut_fixtures import LEASE_BYTES,LEASE_MUTABLE,LIBRARY,STATE,desire,native_code,record_bytes,runtime_bundle,snapshot_bytes
+from photo_lut_fixtures import LEASE_BYTES,LEASE_MUTABLE,LIBRARY,PRIVATE_BYTES,STATE,desire,native_code,record_bytes,runtime_bundle,snapshot_bytes
 from z8photolut.patcher import BASE,CODE,branch
 
 try:
@@ -59,7 +59,7 @@ class NativeOutputMachine:
         self.m.mem_write(BASE,rom)
         self.m.mem_map(0xa02000000,0x2000000)
         self.m.mem_map(self.heap,0x800000)
-        self.m.mem_map(STATE,0x2000)
+        self.m.mem_map(STATE,PRIVATE_BYTES)
         # Complete C3.11 boot puts capture settings in pool0x22's cached
         # image-RAM payload, not the main metadata arena.
         self.m.mem_map(INFO&~4095,0x4000)

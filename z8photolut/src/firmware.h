@@ -8,7 +8,7 @@
  * the region to RAM at 0xa0f800000 + (VA - 0x40200000), writable there. */
 #define Z8_ALIAS UINT64_C(0x9cf600000)
 #define Z8_STATE_VA (UINT64_C(0x40b6b000)+Z8_ALIAS)
-#define Z8_STILL_VA (UINT64_C(0x40b6c000)+Z8_ALIAS)
+#define Z8_DEVELOP_VA (UINT64_C(0x40b6c000)+Z8_ALIAS)
 #define Z8_STATE_MAGIC UINT64_C(0x32545354554c385a)
 #define Z8_PREPARE_MAGIC (Z8_STATE_MAGIC|UINT64_C(1))
 #define Z8_OPTION_FIRST 0x35b5u
@@ -202,39 +202,63 @@ typedef struct {
 
 #define Z8_STATE ((volatile Z8LutState *)(uintptr_t)Z8_STATE_VA)
 
-/* Still develop of a Log look (z8photolut/patcher.py STILL page). The shared
- * colour unit (z8colour CONFIG +0x58) serves `provider` to the native builds
- * whose context it names; this runtime fills it only around the two native
- * still-develop builds (BL wrappers at 0x41053c50 and 0x41053da0) when the
- * selected look is an available isp+residual look, so live view and every
- * other build keep their native or movie Log tables. The look's tables are
- * copied here first, so a library publication can never free what a build
- * reads. served_id names the look of the most recent still develop (zero:
- * native); the JPEG path applies a residual only to a develop of its own look. */
+/* Log looks through the native colour builds (z8photolut/patcher.py DEVELOP
+ * pages). The shared colour unit (z8colour CONFIG +0x58) serves provider lane
+ * 0 to the still develop and lane 1 to live view, each only to the build whose
+ * context the lane names. This runtime fills a lane around the native builds
+ * of its pipeline (BL wrappers at 0x41053c50/0x41053da0 for the still develop,
+ * 0x41052c14/0x41052e04 for live view) when the selected look is an available
+ * isp+residual look, and live view only in photo modes; every other build
+ * keeps its native or movie Log tables. Each lane copies the look's tables
+ * into its own slot first, so a library publication can never free what a
+ * build reads, and the lanes are independent of each other. served_id names
+ * the look of the lane's last M1/M2 build (zero: native): the JPEG path
+ * applies a residual only to a still develop of its own look, and live view
+ * only to frames after served live builds. */
 typedef struct {
-    uint64_t ctx_m,ctx_c;               /* M1/M2 and curve build contexts; 0 = none */
+    uint64_t ctx_m,ctx_c;               /* M1/M2 and curve build contexts being served; 0 = none */
     uint64_t rgb,nlg,m2,m1,cpxs;        /* table pointers; 0 keeps the native table */
 } Z8ColourProvider;
+enum { Z8_LANE_STILL,Z8_LANE_LIVE,Z8_LANES };
 typedef struct {
-    Z8ColourProvider provider;
-    uint32_t pending_curve;             /* the served M1/M2 build's curve build is served too */
-    uint32_t saved_tone;                /* S+0xbc around the served M1/M2 build */
-    uint32_t served_sequence;           /* odd while served_id changes */
-    uint32_t served_choice;             /* telemetry: 1-based look position of the last develop */
+    uint32_t served_sequence;           /* odd while served_choice, streak and served_id change */
+    uint32_t served_choice;             /* 1-based look position of the last M1/M2 build; 0: native */
+    uint32_t streak;                    /* consecutive M1/M2 builds served with served_id */
+    uint32_t mode;                      /* live view: native live-view mode at the last M1/M2 build */
     uint8_t served_id[32];
-    uint64_t m_builds,curve_builds,served_m,served_curve,refused;
-    uint8_t reserved[0x100-0x90];
-    Z8IspTables tables;                 /* the served look's tables */
-} Z8StillDevelop;
-#define Z8_STILL ((volatile Z8StillDevelop *)(uintptr_t)Z8_STILL_VA)
-#define Z8_STILL_TONE 0xbcu             /* S+0xbc: 1 selects the native N-Log M1 row, M2 row and tone */
+    uint64_t settings,context,record;   /* S and context of the served M1/M2 build, R of the served curve build */
+    uint32_t saved_tone,saved_curve_tone;   /* S+0xbc and R+0x31 around the served builds */
+    uint64_t m_builds,curve_builds,served_m,served_curve,refused,other_modes;
+} Z8DevelopLane;
+typedef struct {
+    Z8ColourProvider provider[Z8_LANES];
+    uint8_t reserved0[0x10];
+    Z8DevelopLane lanes[Z8_LANES];
+    uint8_t reserved1[0x80];
+    Z8IspTables tables[Z8_LANES];       /* each lane's copy of its served look's tables */
+} Z8Develop;
+#define Z8_DEVELOP ((volatile Z8Develop *)(uintptr_t)Z8_DEVELOP_VA)
+#define Z8_SETTINGS_TONE 0xbcu          /* S+0xbc: 1 selects the native N-Log M1 row, M2 row and, packed, the tone */
+#define Z8_RECORD_TONE 0x31u            /* R+0x31: the tone of the curve build (Log RGB curve, NLG, Cpxs arms) */
+#define Z8_BUILD_RECORD 0xb8u           /* M1/M2 build context +0xb8: the record R it packs S into */
+/* Native live-view modes whose live build takes photo settings (0x40e9361c: mask 0xa40 -> 0x4105e5d8);
+ * 7, 8 and 10 take movie settings (0x4105dfcc). */
+#define Z8_PHOTO_LIVE_MODES ((1u<<6)|(1u<<9)|(1u<<11))
+/* Live frames receive a Log look's residual once this many consecutive live
+ * builds were served with its tables: frames already in the pipeline were
+ * developed with the previous ones. */
+#define Z8_LIVE_SETTLED 2u
 uint32_t z8_photo_lut_still_m_begin(uint64_t parameters);
 void z8_photo_lut_still_m_end(uint64_t parameters,uint32_t served);
 uint32_t z8_photo_lut_still_curve_begin(uint64_t parameters);
-void z8_photo_lut_still_curve_end(uint32_t served);
-_Static_assert(offsetof(Z8StillDevelop,tables)==0x100 && sizeof(Z8StillDevelop)<=0x1000 &&
-               offsetof(Z8StillDevelop,served_id)==0x48 && offsetof(Z8StillDevelop,refused)==0x88,
-               "still develop page ABI");
+void z8_photo_lut_still_curve_end(uint64_t parameters,uint32_t served);
+uint32_t z8_photo_lut_live_m_begin(uint64_t parameters,uint64_t caller);
+void z8_photo_lut_live_m_end(uint64_t parameters,uint32_t served);
+uint32_t z8_photo_lut_live_curve_begin(uint64_t parameters);
+void z8_photo_lut_live_curve_end(uint64_t parameters,uint32_t served);
+_Static_assert(sizeof(Z8ColourProvider)==0x38 && offsetof(Z8Develop,lanes)==0x80 && sizeof(Z8DevelopLane)==0x80 &&
+               offsetof(Z8DevelopLane,served_id)==0x10 && offsetof(Z8DevelopLane,m_builds)==0x50 &&
+               offsetof(Z8Develop,tables)==0x200 && sizeof(Z8Develop)<=0x2000, "develop pages ABI");
 void z8_photo_lut_boot(void);
 uint64_t z8_photo_lut_output_alloc(uint32_t frame,uint32_t pool,uint32_t bytes,uint64_t configuration);
 uint32_t z8_photo_lut_output_budget(uint64_t settings,uint64_t format,uint32_t special);

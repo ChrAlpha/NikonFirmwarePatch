@@ -5,7 +5,8 @@ import struct
 from z8patch.compiled import load
 from z8photolut import library as lib
 from z8photolut.library import Library, look_from_cube
-from z8photolut.patcher import CODE, CODE_END, STATE_VA, runtime_layout
+from z8photolut.patcher import (CODE, CODE_END, DEVELOP, DEVELOP_BYTES, LANE_RECORDS, STATE as STATE_IMAGE, STATE_VA,
+                                runtime_layout)
 
 LEASE_BYTES, LEASE_MUTABLE = 320, 256   # firmware.c JpegLease: four immutable lines, then one CPU line
 JPEG_STORAGE = 8256*5504*2+1920*1080*2+640*480*2+192*120*2+0x3600
@@ -57,6 +58,8 @@ def snapshot_bytes(grid):
 
 CODE_BYTES = CODE_END-CODE
 STATE = STATE_VA
+PRIVATE_BYTES = DEVELOP+DEVELOP_BYTES-STATE_IMAGE      # the zero state page, then the develop pages
+LANE_BYTES = 0x80                                       # firmware.h Z8DevelopLane
 # A published card library in the general heap; the firmware itself carries no looks.
 LIBRARY = 0xa1e000000
 BANK_INDEX = 0xa03d48164
@@ -109,3 +112,13 @@ def desire(m, layout, look, bank=0, bundle=LIBRARY, ready=True, restore=RESTORE_
     m.mem_write(persist+layout['persist_ready_offset'], struct.pack('<I', int(ready)))
     m.mem_write(persist+layout['persist_authoritative_offset'], struct.pack('<I', int(ready)))
     m.mem_write(persist+layout['persist_restore_offset'], struct.pack('<I', restore))
+
+
+def lane_record(m, lane, look_id=None, choice=1, streak=1):
+    """Make develop lane `lane` (0 still, 1 live) report its last M1/M2 build as served with look_id
+    (None: native), as the build wrappers do."""
+    at = LANE_RECORDS+lane*LANE_BYTES
+    if look_id is None:
+        m.mem_write(at, struct.pack('<4I', 0, 0, 0, 0)+bytes(32))
+    else:
+        m.mem_write(at, struct.pack('<4I', 0, choice, streak, 0)+look_id)

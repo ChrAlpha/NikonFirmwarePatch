@@ -38,7 +38,7 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
     img = Image(eg)
     strings,menu,photo=Strings(),VideoMenu(eg),PhotoMenu(chosen)
     detail,callbacks,photo_row={},{},0
-    log_tables,still_provider=None,0
+    log_tables,provider=None,0
 
     def unit(name):
         code,meta=load(name,code_source,compiler)
@@ -113,10 +113,10 @@ def compose(eg, features, compiler='clang', code_source='prebuilt', *, check_rec
         part,detail['photo-lut']=build_main(eg,code,entries,strings)
         merge('photo-lut',part)
         photo_row=entries['z8_photo_lut_row_refresh']
-        still_provider=int(detail['photo-lut']['still']['provider'],16)
-    if log_tables or still_provider:
+        provider=int(detail['photo-lut']['develop']['provider'],16)
+    if log_tables or provider:
         code,entries=unit('colour')
-        detail['colour']=colour_emit(img,code,entries,log_tables,still_provider)
+        detail['colour']=colour_emit(img,code,entries,log_tables,provider)
     detail['strings']=strings.emit(img)
     detail['menu']=None
     if callbacks or photo.active:

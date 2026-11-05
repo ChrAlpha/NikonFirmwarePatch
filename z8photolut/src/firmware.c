@@ -212,14 +212,18 @@ static uint32_t selection(const Z8LookBundle *b)
     Z8_STATE->choice=index;
     return index;
 }
-/* The look live view applies on the CPU: the applied cpu-3d look, else 0.
- * Live view of a Log look stays native: its ISP tables serve the still
- * develop only, and its residual is defined after those tables. */
+static int lane_serves(unsigned lane,const uint8_t id[32],uint32_t settled);
+/* The look live view applies on the CPU, else 0: the applied cpu-3d look, or
+ * the applied Log look whose residual is not the identity once live builds
+ * are served with its tables (the residual is defined after them). */
 static uint32_t choice(void)
 {
     const Z8LookBundle *b=library_enter();
     uint32_t value=b?selection(b):0;
-    if(value && b->looks[value-1].rendering!=Z8_RENDER_CPU) value=0;
+    if(value) {
+        const Z8LookEntry *e=&b->looks[value-1];
+        if(e->rendering!=Z8_RENDER_CPU && (e->identity || !lane_serves(Z8_LANE_LIVE,e->id,Z8_LIVE_SETTLED))) value=0;
+    }
     if(b) library_exit();
     return value;
 }
@@ -232,9 +236,13 @@ static int admitted(const Z8LookBundle *b,uint32_t *index)
 static int cpu_span(uint64_t p,uint64_t n)
 {
     /* Native pool0x23 job bodies use raw image RAM; pool0x22 capture settings
-     * use its cached alias. Both also have General-heap fallback paths. */
+     * use its cached alias. Both also have General-heap fallback paths. The
+     * live-view task keeps its update messages (and the S and R blocks of
+     * their colour builds) in the heap and in a ring in the main arena's
+     * cached alias (observed C3.11 e3ff04898 + n * 0x14000). */
     return main_span(p,n) || range(p,n,UINT64_C(0x840000000),UINT64_C(0x900000000)) ||
-           range(p,n,UINT64_C(0xc40000000),UINT64_C(0xd00000000));
+           range(p,n,UINT64_C(0xc40000000),UINT64_C(0xd00000000)) ||
+           range(p,n,UINT64_C(0xe00000000),UINT64_C(0xe40000000));
 }
 
 static unsigned preview_source(uint64_t descriptor,Z8Surface *f)
@@ -1250,8 +1258,8 @@ void z8_photo_lut_boot(void)
     }
     volatile uint8_t *p=(volatile uint8_t *)s;
     for(unsigned i=0;i<sizeof(*s);i++) p[i]=0;
-    volatile uint8_t *still=(volatile uint8_t *)Z8_STILL;
-    for(unsigned i=0;i<sizeof(Z8StillDevelop);i++) still[i]=0;
+    volatile uint8_t *develop=(volatile uint8_t *)Z8_DEVELOP;
+    for(unsigned i=0;i<sizeof(Z8Develop);i++) develop[i]=0;
     s->version=4;s->bytes=sizeof(*s);s->boots=boots+1;s->strength=256;
     s->choice=0;s->ready=1;
     if(keep) { copy_bytes((void *)(uintptr_t)&s->persist.record,&retained,sizeof(retained));s->persist.retained=1; }
@@ -1266,99 +1274,189 @@ void z8_photo_lut_boot(void)
     REQUEST_SAVE();
 }
 
-/* ---- still develop of a Log look -------------------------------------- */
-/* Native C3.11 still develop: 0x41053c50 calls the M1/M2 builder (thunk
- * 0x41112dcc -> 0x41113a2c) with x0 = parameters, context [x0+0x30] (its
- * x19) and still settings S = [x0+0x20]; 0x41053da0 then calls the curve
- * builder (0x41112dd8 -> 0x41113e5c), context [x0+0x30]. S+0xbc = 1 selects
- * the native N-Log M1 base row, M2 row and, through R+0x31 filled from S
- * during the first build, the Log curve, NLG and Cpxs arms of the second.
- * Both builds run on the develop task, one pair per capture. */
-static void served_look(const uint8_t *id)
+/* ---- Log looks through the native colour builds ------------------------ */
+/* Native C3.11 builds the colour parameters of a pipeline in two builders. The
+ * M1/M2 build reads settings S: S+0xbc = 1 selects the native N-Log M1 base
+ * row and M2 row; it then packs S into the record R named at its context
+ * +0xb8 (0x411135f4: R+0x31 = S+0xbc). The curve build reads R+0x31, which
+ * selects the Log RGB-curve, NLG and Cpxs arms. Context = the builder's x19.
+ *   still develop  0x41053c50 -> 0x41112dcc -> 0x41113a2c  S [x0+0x20], context [x0+0x30]
+ *                  0x41053da0 -> 0x41112dd8 -> 0x41113e5c  R [x0+8], context [x0+0x30]
+ *   live view      0x41052c14 -> 0x41112dc0 -> 0x411134f8  S [x0+0x10], context [x0+0x18]
+ *                  0x41052e04 -> 0x41112dd0 -> 0x41113d84  R [x0+8], context [x0+0x30]
+ * A served build runs that native N-Log chain with the look's tables: its
+ * selector is 1 for the build only, and its lane names its context, so the
+ * shared colour unit serves the lane's tables to exactly that build. After
+ * the M1/M2 build S+0xbc and the packed R+0x31 are native again, after the
+ * curve build R+0x31, so no other reader ever sees a non-SDR tone. The
+ * builds of one pipeline are serialized by its native task; the two lanes,
+ * their contexts and table copies are independent, so the still develop and
+ * live view may build at the same time on different CPUs. */
+static void lane_served(volatile Z8DevelopLane *l,const uint8_t *id,uint32_t choice)
 {
-    volatile Z8StillDevelop *d=Z8_STILL;
-    __atomic_fetch_add(&d->served_sequence,1,__ATOMIC_ACQ_REL);
-    for(unsigned i=0;i<32;i++) d->served_id[i]=id?id[i]:0;
-    __atomic_fetch_add(&d->served_sequence,1,__ATOMIC_RELEASE);
+    __atomic_fetch_add(&l->served_sequence,1,__ATOMIC_ACQ_REL);
+    unsigned same=id && l->served_choice;
+    for(unsigned i=0;i<32 && same;i++) same=l->served_id[i]==id[i];
+    l->streak=same?l->streak+1:id?1:0;
+    l->served_choice=id?choice:0;
+    for(unsigned i=0;i<32;i++) l->served_id[i]=id?id[i]:0;
+    __atomic_fetch_add(&l->served_sequence,1,__ATOMIC_RELEASE);
 }
 
-uint32_t z8_photo_lut_still_m_begin(uint64_t parameters)
+/* Whether the lane's last M1/M2 build used this look's tables, with at least
+ * `settled` consecutive such builds. */
+static int lane_serves(unsigned lane,const uint8_t id[32],uint32_t settled)
 {
-    volatile Z8LutState *s=Z8_STATE;
-    volatile Z8StillDevelop *d=Z8_STILL;
-    d->pending_curve=0;
-    if(s->magic!=Z8_STATE_MAGIC || !s->ready) return 0;
-    __atomic_fetch_add(&d->m_builds,1,__ATOMIC_RELAXED);
-    /* The still settings block lives in pool image RAM's cached alias (observed C3.11 c427a71d8). */
-    uint64_t context=read64(parameters+0x30),settings=read64(parameters+0x20);
-    const Z8LookBundle *b=main_span(context,8) && cpu_span(settings,Z8_STILL_TONE+4) && !(settings&3)?library_enter():0;
-    uint32_t index=0;
-    const Z8IspTables *tables=0;
-    if(b) {
-        if(evaluate(b,&index)==Z8_EFFECTIVE_APPLIED && (tables=z8_lut_isp(b,index))) {
-            copy_bytes((void *)&d->tables,tables,sizeof(*tables));
-            served_look(b->looks[index-1].id);
-        } else served_look(0);
-        library_exit();
-    } else {
-        /* Unreadable parameters or a publication in progress: the develop stays native. */
-        served_look(0);
-        __atomic_fetch_add(&d->refused,1,__ATOMIC_RELAXED);
-    }
-    d->served_choice=tables?index:0;
-    if(!tables) return 0;
-    volatile Z8ColourProvider *v=&d->provider;
-    v->rgb=(uintptr_t)d->tables.rgb;v->nlg=(uintptr_t)d->tables.nlg;v->m2=(uintptr_t)d->tables.m2;
-    v->m1=(uintptr_t)d->tables.m1;v->cpxs=(uintptr_t)d->tables.cpxs;
-    d->saved_tone=read32(settings+Z8_STILL_TONE);
-    *(volatile uint32_t *)(uintptr_t)(settings+Z8_STILL_TONE)=1;
-    __atomic_store_n(&v->ctx_m,context,__ATOMIC_RELEASE);
-    d->pending_curve=1;
-    __atomic_fetch_add(&d->served_m,1,__ATOMIC_RELAXED);
-    return 1;
-}
-
-void z8_photo_lut_still_m_end(uint64_t parameters,uint32_t served)
-{
-    if(!served) return;
-    volatile Z8StillDevelop *d=Z8_STILL;
-    __atomic_store_n(&d->provider.ctx_m,0,__ATOMIC_RELEASE);
-    *(volatile uint32_t *)(uintptr_t)(read64(parameters+0x20)+Z8_STILL_TONE)=d->saved_tone;
-}
-
-uint32_t z8_photo_lut_still_curve_begin(uint64_t parameters)
-{
-    volatile Z8StillDevelop *d=Z8_STILL;
-    if(Z8_STATE->magic!=Z8_STATE_MAGIC) return 0;
-    __atomic_fetch_add(&d->curve_builds,1,__ATOMIC_RELAXED);
-    if(!d->pending_curve) return 0;
-    d->pending_curve=0;
-    uint64_t context=read64(parameters+0x30);
-    if(!main_span(context,8)) return 0;
-    __atomic_store_n(&d->provider.ctx_c,context,__ATOMIC_RELEASE);
-    __atomic_fetch_add(&d->served_curve,1,__ATOMIC_RELAXED);
-    return 1;
-}
-
-void z8_photo_lut_still_curve_end(uint32_t served)
-{
-    if(served) __atomic_store_n(&Z8_STILL->provider.ctx_c,0,__ATOMIC_RELEASE);
-}
-
-/* Whether the most recent still develop used this look's ISP tables. */
-static int developed(const uint8_t id[32])
-{
-    volatile Z8StillDevelop *d=Z8_STILL;
+    volatile Z8DevelopLane *l=&Z8_DEVELOP->lanes[lane];
     for(unsigned attempt=0;attempt<64;attempt++) {
-        uint32_t before=__atomic_load_n(&d->served_sequence,__ATOMIC_ACQUIRE);
+        uint32_t before=__atomic_load_n(&l->served_sequence,__ATOMIC_ACQUIRE);
         if(before&1) continue;
-        unsigned same=1;
-        for(unsigned i=0;i<32;i++) same&=d->served_id[i]==id[i];
+        unsigned same=l->served_choice && l->streak>=settled;
+        for(unsigned i=0;i<32;i++) same&=l->served_id[i]==id[i];
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if(__atomic_load_n(&d->served_sequence,__ATOMIC_RELAXED)==before) return same;
+        if(__atomic_load_n(&l->served_sequence,__ATOMIC_RELAXED)==before) return same;
     }
     return 0;
 }
+
+static uint32_t develop_m_begin(unsigned lane,uint64_t settings,uint64_t context,int eligible)
+{
+    volatile Z8LutState *s=Z8_STATE;
+    volatile Z8Develop *d=Z8_DEVELOP;
+    volatile Z8DevelopLane *l=&d->lanes[lane];
+    if(s->magic!=Z8_STATE_MAGIC || !s->ready) {
+        if(l->served_choice) lane_served(l,0,0);
+        return 0;
+    }
+    __atomic_fetch_add(&l->m_builds,1,__ATOMIC_RELAXED);
+    const Z8IspTables *tables=0;
+    if(!eligible) {
+        lane_served(l,0,0);
+        __atomic_fetch_add(&l->other_modes,1,__ATOMIC_RELAXED);
+        return 0;
+    }
+    /* S lives in pool image RAM's cached alias (still develop, observed C3.11
+     * c427a71d8) or in a live-view update message (cpu_span). */
+    const Z8LookBundle *b=main_span(context,Z8_BUILD_RECORD+8) && cpu_span(settings,Z8_SETTINGS_TONE+4) &&
+                          !(settings&3)?library_enter():0;
+    if(b) {
+        uint32_t index=0;
+        if(evaluate(b,&index)==Z8_EFFECTIVE_APPLIED && (tables=z8_lut_isp(b,index))) {
+            copy_bytes((void *)&d->tables[lane],tables,sizeof(*tables));
+            lane_served(l,b->looks[index-1].id,index);
+        } else lane_served(l,0,0);
+        library_exit();
+    } else {
+        /* Unreadable parameters or a publication in progress: the build stays native. */
+        lane_served(l,0,0);
+        __atomic_fetch_add(&l->refused,1,__ATOMIC_RELAXED);
+    }
+    if(!tables) return 0;
+    volatile Z8ColourProvider *v=&d->provider[lane];
+    volatile Z8IspTables *copy=&d->tables[lane];
+    v->rgb=(uintptr_t)copy->rgb;v->nlg=(uintptr_t)copy->nlg;v->m2=(uintptr_t)copy->m2;
+    v->m1=(uintptr_t)copy->m1;v->cpxs=(uintptr_t)copy->cpxs;
+    l->settings=settings;l->context=context;
+    l->saved_tone=read32(settings+Z8_SETTINGS_TONE);
+    *(volatile uint32_t *)(uintptr_t)(settings+Z8_SETTINGS_TONE)=1;
+    __atomic_store_n(&v->ctx_m,context,__ATOMIC_RELEASE);
+    __atomic_fetch_add(&l->served_m,1,__ATOMIC_RELAXED);
+    return 1;
+}
+
+static void develop_m_end(unsigned lane,uint32_t served)
+{
+    if(!served) return;
+    volatile Z8Develop *d=Z8_DEVELOP;
+    volatile Z8DevelopLane *l=&d->lanes[lane];
+    __atomic_store_n(&d->provider[lane].ctx_m,0,__ATOMIC_RELEASE);
+    *(volatile uint32_t *)(uintptr_t)(l->settings+Z8_SETTINGS_TONE)=l->saved_tone;
+    /* The build packed S into R; the native byte is that of the native S+0xbc. */
+    uint64_t record=read64(l->context+Z8_BUILD_RECORD);
+    if(cpu_span(record,Z8_RECORD_TONE+1)) *(volatile uint8_t *)(uintptr_t)(record+Z8_RECORD_TONE)=(uint8_t)l->saved_tone;
+}
+
+/* A curve build follows the lane's last M1/M2 build: served while that build
+ * was (eligible: the lane's own condition still holds). */
+static uint32_t develop_curve_begin(unsigned lane,uint64_t record,uint64_t context,int eligible)
+{
+    volatile Z8Develop *d=Z8_DEVELOP;
+    volatile Z8DevelopLane *l=&d->lanes[lane];
+    if(Z8_STATE->magic!=Z8_STATE_MAGIC) return 0;
+    __atomic_fetch_add(&l->curve_builds,1,__ATOMIC_RELAXED);
+    if(!l->served_choice || !eligible || !main_span(context,8) || !cpu_span(record,Z8_RECORD_TONE+1)) return 0;
+    l->record=record;
+    l->saved_curve_tone=*(volatile const uint8_t *)(uintptr_t)(record+Z8_RECORD_TONE);
+    *(volatile uint8_t *)(uintptr_t)(record+Z8_RECORD_TONE)=1;
+    __atomic_store_n(&d->provider[lane].ctx_c,context,__ATOMIC_RELEASE);
+    __atomic_fetch_add(&l->served_curve,1,__ATOMIC_RELAXED);
+    return 1;
+}
+
+static void develop_curve_end(unsigned lane,uint32_t served)
+{
+    if(!served) return;
+    volatile Z8Develop *d=Z8_DEVELOP;
+    volatile Z8DevelopLane *l=&d->lanes[lane];
+    __atomic_store_n(&d->provider[lane].ctx_c,0,__ATOMIC_RELEASE);
+    *(volatile uint8_t *)(uintptr_t)(l->record+Z8_RECORD_TONE)=(uint8_t)l->saved_curve_tone;
+}
+
+/* Still develop: one M1/M2 then one curve build per capture, on the develop
+ * task. Its curve build uses the look and tables of its M1/M2 build. */
+uint32_t z8_photo_lut_still_m_begin(uint64_t parameters)
+{ return develop_m_begin(Z8_LANE_STILL,read64(parameters+0x20),read64(parameters+0x30),1); }
+void z8_photo_lut_still_m_end(uint64_t parameters,uint32_t served)
+{ (void)parameters;develop_m_end(Z8_LANE_STILL,served); }
+uint32_t z8_photo_lut_still_curve_begin(uint64_t parameters)
+{ return develop_curve_begin(Z8_LANE_STILL,read64(parameters+8),read64(parameters+0x30),1); }
+void z8_photo_lut_still_curve_end(uint64_t parameters,uint32_t served)
+{ (void)parameters;develop_curve_end(Z8_LANE_STILL,served); }
+
+/* Live view: the live-view task rebuilds both on every update (about once per
+ * frame); each update message carries its own S (+0x98) and R (+0x1fe0).
+ * 0x41052b3c keeps its argument block in x20 (`caller`); its first word is
+ * the update's live-view object, whose +0x10 word is the live-view mode. */
+static int photo_live_view(uint64_t caller)
+{
+    volatile Z8DevelopLane *l=&Z8_DEVELOP->lanes[Z8_LANE_LIVE];
+    if(!main_span(caller,8) || (caller&7)) return 0;
+    uint64_t view=read64(caller);
+    if(!main_span(view,0x14) || (view&3)) return 0;
+    uint32_t mode=read32(view+0x10);
+    l->mode=mode;
+    return mode<32 && ((Z8_PHOTO_LIVE_MODES>>mode)&1);
+}
+
+uint32_t z8_photo_lut_live_m_begin(uint64_t parameters,uint64_t caller)
+{ return develop_m_begin(Z8_LANE_LIVE,read64(parameters+0x10),read64(parameters+0x18),photo_live_view(caller)); }
+void z8_photo_lut_live_m_end(uint64_t parameters,uint32_t served)
+{ (void)parameters;develop_m_end(Z8_LANE_LIVE,served); }
+
+/* A live curve build may also run without an M1/M2 build. It is served only
+ * while the selected look is still the one the lane's tables hold; otherwise
+ * the lane returns to native here rather than at the next M1/M2 build. */
+uint32_t z8_photo_lut_live_curve_begin(uint64_t parameters)
+{
+    volatile Z8DevelopLane *l=&Z8_DEVELOP->lanes[Z8_LANE_LIVE];
+    int current=0;
+    if(Z8_STATE->magic==Z8_STATE_MAGIC && l->served_choice) {
+        const Z8LookBundle *b=library_enter();
+        uint32_t index=0;
+        if(b && evaluate(b,&index)==Z8_EFFECTIVE_APPLIED && z8_lut_isp(b,index)) {
+            current=1;
+            for(unsigned i=0;i<32;i++) current&=b->looks[index-1].id[i]==l->served_id[i];
+        }
+        if(b) library_exit();
+        if(!current) lane_served(l,0,0);
+    }
+    return develop_curve_begin(Z8_LANE_LIVE,read64(parameters+8),read64(parameters+0x30),current);
+}
+void z8_photo_lut_live_curve_end(uint64_t parameters,uint32_t served)
+{ (void)parameters;develop_curve_end(Z8_LANE_LIVE,served); }
+
+/* Whether the most recent still develop used this look's ISP tables. */
+static int developed(const uint8_t id[32]) { return lane_serves(Z8_LANE_STILL,id,1); }
 
 /* Copy the native source into the lease scratch and apply the capture's
  * look. The NEF/native source is only read; the encoder sees cleaned lines. */

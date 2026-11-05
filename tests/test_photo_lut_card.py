@@ -23,7 +23,7 @@ from features import build
 from z8patch.shared import PRIVATE_IDS, TABLES, TABLES_END
 from z8photolut import library as lib
 from z8photolut.patcher import ALIAS, BASE, CODE, STATE as STATE_PAGE, STATE_BYTES, TEXT
-from photo_lut_fixtures import CODE_BYTES, STATE, native_code, record_bytes
+from photo_lut_fixtures import CODE_BYTES, PRIVATE_BYTES, STATE, native_code, record_bytes
 from test_photo_lut_hooks import NativeScheduler, Uc
 from test_photo_lut_library import COOL, IDENTITY, SWAP, WARM, cube, look
 
@@ -94,7 +94,7 @@ class PhotoLutCardSessionTests(unittest.TestCase):
             m.mem_map(at, 4096)
         for at in (*FS.values(), ROW_DISABLE, SAVE, REPLY, SECTION, DEFAULTS, GROUP_LOADED, SECTION_READ, 0x403ae0f8, 0x403b0048, 0x403b00b8):
             m.mem_write(at, bytes.fromhex('c0035fd6'))
-        m.mem_map(STATE, 0x2000)
+        m.mem_map(STATE, PRIVATE_BYTES)
         m.mem_map(0xa03000000, 0x20000)
         for copy in range(5):
             m.mem_write(OWNED+copy*0x2e0, b'\xff\xff')

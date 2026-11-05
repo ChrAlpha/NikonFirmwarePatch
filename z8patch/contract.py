@@ -74,14 +74,22 @@ def verify_contract(old,new,features):
         need([e[3] for e in events if e[0] in (0x286,0x29F,0x2AE)]==[0xF8]*3,'photo LUT row opens state 0xf8')
         callbacks,page=read(new,'<Q',0x4C059C0+40)[0],read(new,'<Q',0x4C059C0+80)[0]
         need(0x40B68000<=callbacks<0x40B69000 and 0x40B68000<=page<0x40B69000,'photo LUT option page')
-    # Still develop of Log looks: both native builder calls reach photo LUT code, and the shared colour
-    # unit serves the provider block at the start of the zero still page (RAM alias of 0x40B6C000).
-    for site in (0x41053C50,0x41053DA0):
+    # Log looks: the still-develop and live-view colour builder calls reach photo LUT code, and the shared
+    # colour unit serves the provider lanes at the start of the zero develop pages (RAM alias of 0x40B6C000)
+    # through its lane hooks; without photo-lut it is the base part alone, entered directly.
+    def target(site):
         word=read(new,'<I',site-base)[0]
-        target=site+(((word&0x3FFFFFF)^0x2000000)-0x2000000)*4
-        need(word>>26==0x25 and (0x40B50000<=target<0x40B68000 if lut else new[site-base:site-base+4]==old[site-base:site-base+4]),
-             'photo LUT still develop call')
-    need(read(new,'<Q',0x40981F58-base)[0]==(0xA1016C000 if lut else 0),'colour still-develop provider')
+        return word>>26,site+(((word&0x3FFFFFF)^0x2000000)-0x2000000)*4
+    for site in (0x41053C50,0x41053DA0,0x41052C14,0x41052E04):
+        kind,to=target(site)
+        need(kind==0x25 and (0x40B50000<=to<0x40B68000 if lut else new[site-base:site-base+4]==old[site-base:site-base+4]),
+             'photo LUT colour build call')
+    need(read(new,'<Q',0x40981F58-base)[0]==(0xA1016C000 if lut else 0),'colour provider lanes')
+    if log or lut:
+        entries=[target(site) for site in (0x4111A508,0x4111A6D4,0x41116CB4,0x41116010,0x4111A198)]
+        need(all(kind==5 for kind,_ in entries),'colour chain sites')
+        need(all((0x40981268<=to<0x40981F00) if lut else (0x40981000<=to<0x40981268) for _,to in entries),'colour lane hooks')
+        if not lut:need(not any(new[0x40981268-base:0x40981F00-base]),'colour base part alone')
     if not lut:
         need(not any(new[0x40B50000-base:0x40C00000-base]),'photo LUT region unused')
         need(0x40990000<=refresh<0x409D8000 if photo else refresh==0x405D9808,'photo menu refresh')
@@ -89,7 +97,7 @@ def verify_contract(old,new,features):
     end=((loader[0]>>5)&65535)|(((loader[1]>>5)&65535)<<16)
     need(0x40AE2000<=end<=0x40C00000 and end%4096==0,'copy boundary covers strings')
     if log:need(end>=0x40B50000 and not any(new[0x40B0E000-base:0x40B0F100-base]),'Log private state initialized')
-    if lut:need(end>=0x40B6D000 and not any(new[0x40B6B000-base:0x40B6D000-base]),'Photo LUT private state initialized')
+    if lut:need(end>=0x40B6E000 and not any(new[0x40B6B000-base:0x40B6E000-base]),'Photo LUT private state and develop pages initialized')
     if quality:need(new[0x40A40000-base]==0,'star force initially clear')
     if framing:need(not any(new[0x4097F000-base:0x40980000-base]),'AP state initialized')
     return dict(status='PASS',video_menu=video,photo_menu_hidden=[hex(i) for i in hidden],language_tables=36,offsets_per_language=entries,
