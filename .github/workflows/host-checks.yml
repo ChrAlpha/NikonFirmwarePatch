@@ -49,6 +49,42 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -B tests/test_compiled_paths.py
 
+  photo-lut:
+    # Every host test that runs without the original firmware: Z8_PHOTO_LUT_ROM stays unset, so ROM-backed
+    # classes skip. The toolkit tier proves the Log look compiler dependencies stay optional.
+    strategy:
+      fail-fast: false
+      matrix:
+        dependencies: [toolkit, log-compiler]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install clang 19
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19
+      - name: Install pinned emulator test dependencies
+        run: python -m pip install -r requirements.txt unicorn==2.1.4
+      - name: Install pinned Log look compiler dependencies
+        if: matrix.dependencies == 'log-compiler'
+        run: |
+          python -m pip install -r requirements-photo-lut-log.txt
+          python -B -c "import z8photolut.fit"
+      - name: Compile the units clang 19 reproduces and check their reviewed bytes
+        # The photo-tools C units were reviewed with Apple clang and are not needed by these tests.
+        run: |
+          python -B tools/compile_units.py --output "$RUNNER_TEMP/units" --compiler clang-19 --units opengate anamorphic h265 log quality shared colour photo-lut
+          cp "$RUNNER_TEMP"/units/*.bin resources/
+          python -B -c "from z8patch.compiled import load; [load(n) for n in ('opengate','anamorphic','h265','log','quality','shared','colour','photo-lut')]"
+      - name: Run the host tests without the original firmware
+        run: python -B -m unittest discover -s tests
+
   windows-toolkit:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.firmware_smoke
     needs: paths

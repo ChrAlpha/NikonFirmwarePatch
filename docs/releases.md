@@ -50,6 +50,8 @@ for unit in precapture pixelshift pixelshift-af; do cp /path/to/NikonFirmwarePat
 
 `tools/build_release.py` 目前用同一个编译器重编全部单元，并要求编译器记录完全一致，所以还不能为当前源码生成工具包。
 
+[Host checks](https://github.com/XinmiaoZhao/NikonFirmwarePatch/actions/workflows/host-checks.yml) 的 `photo-lut` 作业在 Ubuntu 24.04 上用 clang 19 编译上述八个单元并核对审阅字节，然后在没有原厂固件的情况下运行全部宿主测试：一档只装 `requirements.txt` 与 `unicorn==2.1.4`，确认 Log 风格编译依赖可以缺省；另一档再装 `requirements-photo-lut-log.txt`。需要原厂主程序（`Z8_PHOTO_LUT_ROM`）的测试在 CI 中跳过。
+
 ## Windows 状态
 
 [Host checks](https://github.com/XinmiaoZhao/NikonFirmwarePatch/actions/workflows/host-checks.yml) 包含跨平台路径检查。手动 Windows 作业按发布 SHA-256 下载最终 ZIP、对照当前提交核对全部成员，再分别用 Python 3.12 和 3.13 从解压目录构建两种组合，并把全选固件与指定回归输入的哈希比对。运行状态见上述 Actions 链接。
@@ -76,3 +78,5 @@ for unit in precapture pixelshift pixelshift-af; do cp /path/to/NikonFirmwarePat
 ```
 
 `tools/build_release.py` recompiles every unit with one compiler and requires identical compiler records, so it cannot yet package the current source.
+
+The `photo-lut` job in [Host checks](https://github.com/XinmiaoZhao/NikonFirmwarePatch/actions/workflows/host-checks.yml) compiles those eight units with clang 19 on Ubuntu 24.04, checks their reviewed bytes and runs every host test without the original firmware: one tier installs only `requirements.txt` and `unicorn==2.1.4`, confirming the Log look compiler dependencies stay optional, and the other adds `requirements-photo-lut-log.txt`. Tests that need the original main payload (`Z8_PHOTO_LUT_ROM`) skip in CI.
