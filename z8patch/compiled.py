@@ -44,6 +44,11 @@ def source_files(name):
             if p.is_file() and p.suffix in spec.get('suffixes',ASM_SOURCES)}
 
 
+def compiler_identity(compiler):
+    """First line of `<compiler> --version`, the identity a reviewed unit records."""
+    return subprocess.check_output([compiler,'--version'],text=True).splitlines()[0]
+
+
 def compile_unit(name, compiler='clang'):
     """Maintainer primitive; callers must compare output against a reviewed recipe."""
     spec = dict(SPECS[name])
@@ -77,7 +82,7 @@ def compile_unit(name, compiler='clang'):
             if spec.get('general_registers'):
                 general_registers_only(code, sections, spec['cave'])
     return code, dict(bytes=len(code),sha256=sha(code),symbols=symbols,source_sha256=source_files(name),
-                      compiler=subprocess.check_output([compiler,'--version'],text=True).splitlines()[0],
+                      compiler=compiler_identity(compiler),
                       flags=spec['flags'],resource='resources/'+name+'.bin')
 
 

@@ -71,6 +71,16 @@ def main():
                     return raw
                 write([(e,reseal(e,raw)) for e,raw in altered]);reject('resealed changed '+code,lambda:check_release(bad))
             reject('wrong source commit',lambda:check_release(a.archive,'0'*40))
+            # Inherited-unit provenance may only name reviewed units of this checkout.
+            def inherit(units):
+                def edit(e,raw):
+                    if e.filename!=prefix+'/'+MANIFEST:return raw
+                    record=json.loads(raw)
+                    record['inherited_units']=dict(tag='v0.4.0-rc.2',source_commit='0'*40,archive_sha256='0'*64,units=units)
+                    return json.dumps(record).encode()
+                return [(e,edit(e,raw)) for e,raw in members]
+            write(inherit(['unreviewed']));reject('inherited provenance names an unreviewed unit',lambda:check_release(bad))
+            write(inherit([]));reject('empty inherited provenance',lambda:check_release(bad))
     except Exception as e:
         failures.append(str(e));raise
     finally:

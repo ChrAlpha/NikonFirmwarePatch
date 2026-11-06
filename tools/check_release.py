@@ -292,10 +292,14 @@ def check_release(path,expected_commit=None):
     units=json.loads((ROOT/'resources/compiled.json').read_text())['units']
     need(set(CODE_FILES)=={u['resource'] for u in units.values()},'Code allowlist differs')
     need(record['compiled_units']==units,'Compiler/source provenance mismatch')
+    inherit=record.get('inherited_units')
+    need(inherit is None or (set(inherit)=={'tag','source_commit','archive_sha256','units'} and re.fullmatch(TAG,inherit['tag'])
+         and re.fullmatch('[0-9a-f]{40}',inherit['source_commit']) and re.fullmatch('[0-9a-f]{64}',inherit['archive_sha256'])
+         and inherit['units'] and set(inherit['units'])<=set(units)),'Invalid inherited-unit provenance')
     for name,unit in units.items():
         raw=files[unit['resource']]
         need(len(raw)==unit['bytes'] and digest(raw)==unit['sha256'],'Unreviewed machine code: '+name)
-    return dict(status='PASS',tag=record['tag'],source_commit=record['source_commit'],source_files=len(SOURCE_FILES),binary_files=list(CODE_FILES),code_bytes=sum(len(files[n]) for n in CODE_FILES),archive_sha256=digest(path.read_bytes()),firmware_included=False,scope='Archive members, source identity and pinned patch bytes')
+    return dict(status='PASS',tag=record['tag'],source_commit=record['source_commit'],source_files=len(SOURCE_FILES),binary_files=list(CODE_FILES),code_bytes=sum(len(files[n]) for n in CODE_FILES),archive_sha256=digest(path.read_bytes()),inherited_units=inherit['units'] if inherit else [],firmware_included=False,scope='Archive members, source identity and pinned patch bytes')
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('archive',type=Path);ap.add_argument('--commit');a=ap.parse_args()

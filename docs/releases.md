@@ -48,7 +48,11 @@ cp build/units/*.bin resources/
 for unit in precapture pixelshift pixelshift-af; do cp /path/to/NikonFirmwarePatch-v0.4.0-rc.2/resources/$unit.bin resources/; done
 ```
 
-`tools/build_release.py` 目前用同一个编译器重编全部单元，并要求编译器记录完全一致，所以还不能为当前源码生成工具包。
+`tools/build_release.py` 为每个单元选用身份与 `resources/compiled.json` 记录完全一致的编译器（`--compiler` 可给多个）。加 `--inherit` 指向此前发布的工具包 ZIP（同目录须有其 `SHA256SUMS.txt`）时，审阅记录与该包 manifest 完全相同的单元直接取自该包，新 manifest 的 `inherited_units` 记录来源发布、提交和包哈希。当前源码在 Debian clang 19.1.7 下即可打包：七个未变单元继承自 v0.4.0-rc.2，其余四个重新编译。
+
+```sh
+python tools/build_release.py --tag VERSION --compiler clang-19 --inherit /path/to/v0.4.0-rc.2/NikonFirmwarePatch-v0.4.0-rc.2-toolkit.zip --output /path/to/new-assets
+```
 
 [Host checks](https://github.com/XinmiaoZhao/NikonFirmwarePatch/actions/workflows/host-checks.yml) 的 `photo-lut` 作业在 Ubuntu 24.04 上用 clang 19 编译上述八个单元并核对审阅字节，然后在没有原厂固件的情况下运行全部宿主测试：一档只装 `requirements.txt` 与 `unicorn==2.1.4`，确认 Log 风格编译依赖可以缺省；另一档再装 `requirements-photo-lut-log.txt`。需要原厂主程序（`Z8_PHOTO_LUT_ROM`）的测试在 CI 中跳过。
 
@@ -77,6 +81,10 @@ cp build/units/*.bin resources/
 for unit in precapture pixelshift pixelshift-af; do cp /path/to/NikonFirmwarePatch-v0.4.0-rc.2/resources/$unit.bin resources/; done
 ```
 
-`tools/build_release.py` recompiles every unit with one compiler and requires identical compiler records, so it cannot yet package the current source.
+`tools/build_release.py` compiles each unit with the supplied compiler whose identity is exactly the one `resources/compiled.json` records (`--compiler` accepts several). With `--inherit` naming an earlier release toolkit ZIP (its `SHA256SUMS.txt` beside it), units whose reviewed record is identical in that toolkit's manifest are taken from it, and the new manifest's `inherited_units` records the source release, commit and archive digest. The current source packages with Debian clang 19.1.7: the seven unchanged units are inherited from v0.4.0-rc.2 and the other four are recompiled.
+
+```sh
+python tools/build_release.py --tag VERSION --compiler clang-19 --inherit /path/to/v0.4.0-rc.2/NikonFirmwarePatch-v0.4.0-rc.2-toolkit.zip --output /path/to/new-assets
+```
 
 The `photo-lut` job in [Host checks](https://github.com/XinmiaoZhao/NikonFirmwarePatch/actions/workflows/host-checks.yml) compiles those eight units with clang 19 on Ubuntu 24.04, checks their reviewed bytes and runs every host test without the original firmware: one tier installs only `requirements.txt` and `unicorn==2.1.4`, confirming the Log look compiler dependencies stay optional, and the other adds `requirements-photo-lut-log.txt`. Tests that need the original main payload (`Z8_PHOTO_LUT_ROM`) skip in CI.
