@@ -1,5 +1,37 @@
 # 更新日志 / Changelog
 
+## 未发布 / Unreleased
+
+尚未发布，也没有工具包；照片 LUT **未经实机验证**。以下变化相对于 v0.4.0-rc.2。
+
+### 新增
+
+- **照片 LUT（`photo-lut`，第五组）。** 照片拍摄菜单新增“照片 LUT”。风格库 `Z8LUTLIB.BIN`（`Z8LUT004` 格式）最多 8 个风格，由 `photo_lut.py` 在电脑上管理，从任一存储卡载入；A–D 拍摄菜单库按完整变换标识保存选择，正常关机后自动恢复。`nikon-sdr` 风格在 CPU 上以 3D LUT 作用于 JPEG 和实时取景。Log 风格（N-Log、S-Log3、Log3G10、F-Log2、LogC3、LogC4、V-Log 基准）在电脑上拟合为相机原生参数表和残差网格，用于照片显影和照片模式实时取景，并附拟合报告。应用风格的 JPEG 在 XMP 中记录风格来源。NEF 原始数据不变；Log 风格的 NEF 内嵌预览带有拟合参数表。五组共 31 种非空组合。见[照片 LUT](docs/photo-lut.md)。
+- **Log 风格编译依赖。** `requirements-photo-lut-log.txt` 固定 numpy、scipy 和 colour-science，只在编译 Log 风格时需要；构建、核验固件及 `nikon-sdr` 风格操作不需要。
+
+### 修改
+
+- **共享色彩单元 `z8colour`。** 录像色彩链的五个位置（M1、RGB 曲线、NLG、M2、Cpxs）不再由 `log-colour` 自己的钩子处理，改由共享单元处理；照片 LUT 通过其两条参数表通道（照片显影、实时取景）提供参数表。Log 录像行为不变，与 v0.4.0-rc.2 钩子的 95 种 Unicorn 对照结果一致。含 `log-colour` 的 8 种组合固件字节因此与 v0.4.0-rc.2 不同；其余 7 种逐字节相同。
+- **共享照片菜单和私有字符串。** 选择 `photo-lut` 时，照片拍摄菜单的隐藏项和刷新回调由共享单元统一处理，像素偏移入口保持不变；字符串表增加照片 LUT 自行改写的私有编号。未选 `photo-lut` 的组合不含这些修改。
+- **工具。** `patch.py --interactive` 新增第 5 项，第 6 项为全选；`verify.py` 能识别 `photo-lut`，改以文件标签钩子识别 `log-colour`。`tools/compile_units.py --units` 可只重编部分单元；组合回归覆盖 31 种组合，并对使用所选编译器审阅过的单元核对源码与预编译字节。C 单元链接器解析 `original_<地址>` 续接符号。
+- **CI。** Host checks 新增 `photo-lut` 作业：用 clang 19 编译可复现的八个单元并核对审阅字节，再在没有原厂固件的情况下运行全部宿主测试，分为不含与包含 Log 风格编译依赖两档。
+
+### English
+
+Unreleased, with no toolkit; Photo LUT **has not been verified on a camera**. Changes are relative to v0.4.0-rc.2.
+
+**Added**
+
+- Photo LUT (`photo-lut`) is the fifth build group, adding Photo LUT to the photo shooting menu. A `Z8LUTLIB.BIN` library (format `Z8LUT004`) holds up to eight looks, is managed on the computer with `photo_lut.py` and loads from either card. Shooting banks A–D save full transform identities and restore after a normal power cycle. `nikon-sdr` looks apply a CPU 3D LUT to JPEGs and live view. Log looks (N-Log, S-Log3, Log3G10, F-Log2, LogC3, LogC4 and V-Log bases) are fitted on the computer into native camera tables plus a residual grid, used by the still develop and photo-mode live view, with a fit report. JPEGs with a look record its provenance in XMP. NEF raw data is unchanged; NEF embedded previews of Log looks carry the fitted tables. The five groups give 31 nonempty combinations. See [Photo LUT](docs/photo-lut.md#english).
+- `requirements-photo-lut-log.txt` pins numpy, scipy and colour-science, needed only to compile Log looks. Building and verifying firmware and editing `nikon-sdr` looks need none of them.
+
+**Changed**
+
+- The shared `z8colour` unit now owns the five recording colour-chain sites (M1, RGB curves, NLG, M2, Cpxs) instead of `log-colour`'s own hooks. Photo LUT supplies its tables through the unit's two provider lanes (still develop and live view). Log recording behaves the same: the hooks agree with those of v0.4.0-rc.2 in 95 Unicorn comparisons. The 8 combinations with `log-colour` therefore differ in firmware bytes from v0.4.0-rc.2; the other 7 are byte-identical.
+- With `photo-lut`, one shared owner handles the photo shooting menu's hidden items and refresh callback, keeping the pixel-shift entry unchanged, and the string tables gain private IDs that Photo LUT rewrites itself. Combinations without `photo-lut` carry none of these edits.
+- `patch.py --interactive` offers choice 5 and 6 for all; `verify.py` detects `photo-lut` and now detects `log-colour` by its file-tag hook. `tools/compile_units.py --units` rebuilds a subset of units. The combination regression covers all 31 combinations and checks source against prebuilt bytes for the units reviewed with the selected compiler. The C unit linker resolves `original_<address>` continuations.
+- Host checks add a `photo-lut` job that compiles the eight units clang 19 reproduces, checks their reviewed bytes and runs every host test without the original firmware, once without and once with the Log look compiler dependencies.
+
 ## v0.4.0 — 四组补丁 / Four feature groups
 
 当前预发布：[v0.4.0-rc.2](https://github.com/XinmiaoZhao/NikonFirmwarePatch/releases/tag/v0.4.0-rc.2)。以下变化相对于上一公开功能系列 v0.3.0／v0.3.0-r1。RC2 补全 README 使用说明、致谢和模拟器截图；固件补丁与 RC1 相同。
