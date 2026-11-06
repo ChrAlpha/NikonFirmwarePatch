@@ -140,6 +140,8 @@ A–D 拍摄菜单库分别保存完整变换标识，改名或调整顺序后�
 
 ```sh
 python -m pip install -r requirements.txt unicorn==2.1.4
+python tools/compile_units.py --output build/units --compiler clang-19 --units shared colour photo-lut
+cp build/units/*.bin resources/                                     # Git 源码不含单元字节；加载时仍按审阅记录核对
 python -c "from z8prores.package import Package; open('z8-main-payload.bi','wb').write(Package(open('Z_8_0311.bin','rb').read()).eg[:-2])"
 Z8_PHOTO_LUT_ROM=z8-main-payload.bi python -B -m unittest discover -s tests -p 'test_photo_lut*.py'
 ```
@@ -286,6 +288,8 @@ Python 3.10+, the dependencies in `requirements.txt` and `unicorn==2.1.4` are re
 
 ```sh
 python -m pip install -r requirements.txt unicorn==2.1.4
+python tools/compile_units.py --output build/units --compiler clang-19 --units shared colour photo-lut
+cp build/units/*.bin resources/                                     # Git source has no unit bytes; loading still checks the reviewed record
 python -c "from z8prores.package import Package; open('z8-main-payload.bi','wb').write(Package(open('Z_8_0311.bin','rb').read()).eg[:-2])"
 Z8_PHOTO_LUT_ROM=z8-main-payload.bi python -B -m unittest discover -s tests -p 'test_photo_lut*.py'
 ```
