@@ -35,6 +35,21 @@ python tools/check_repository.py --all
 
 发布工具只纳入明确列出的已提交文件。独立检查器核对成员、源码字节、代码及来源，额外固件、缺失文件和错误身份会被拒绝。附件保持不可变，修订发布新版本。
 
+## 当前源码（未发布）
+
+照片 LUT（`photo-lut`）和共享色彩单元 `z8colour` 尚未发布，也没有对应的工具包。当前源码共十一个单元：在 v0.4.0-rc.2 的九个之外新增 `colour.bin`、`photo-lut.bin`，`shared.bin` 和 `log.bin` 也已改变。`resources/compiled.json` 记录各单元审阅时的编译器：`shared`、`log`、`colour`、`photo-lut` 为 clang 19（Debian 19.1.7；Ubuntu 24.04 的 19.1.1 产出相同字节），其余七个沿用 v0.4.0-rc.2 的 Apple clang 21.0.0。
+
+clang 19 也能复现 `opengate`、`anamorphic`、`h265`、`quality`，但不能复现照片工具组的 `precapture`、`pixelshift`、`pixelshift-af`。`--code-source source` 对所有单元使用同一个编译器，因此不含 `photo-tools` 的组合可直接加 `--code-source source --compiler clang-19` 构建。含 `photo-tools` 时先组装预编译单元，再使用默认预编译模式；构建时仍按 `resources/compiled.json` 核对每个单元的字节：
+
+```sh
+python tools/compile_units.py --output build/units --compiler clang-19 --units opengate anamorphic h265 log quality shared colour photo-lut
+cp build/units/*.bin resources/
+# 这三个单元与 v0.4.0-rc.2 工具包中的字节相同。
+for unit in precapture pixelshift pixelshift-af; do cp /path/to/NikonFirmwarePatch-v0.4.0-rc.2/resources/$unit.bin resources/; done
+```
+
+`tools/build_release.py` 目前用同一个编译器重编全部单元，并要求编译器记录完全一致，所以还不能为当前源码生成工具包。
+
 ## Windows 状态
 
 [Host checks](https://github.com/XinmiaoZhao/NikonFirmwarePatch/actions/workflows/host-checks.yml) 包含跨平台路径检查。手动 Windows 作业按发布 SHA-256 下载最终 ZIP、对照当前提交核对全部成员，再分别用 Python 3.12 和 3.13 从解压目录构建两种组合，并把全选固件与指定回归输入的哈希比对。运行状态见上述 Actions 链接。
@@ -46,3 +61,18 @@ python tools/check_repository.py --all
 The four groups ship in v0.4.0-rc.2. A complete toolkit packages public source, documentation, bilingual colour figures/data, the optional F LUT and nine matching compiled patch units. Original/full modified firmware, camera media, runtimes and compilers are not distributed.
 
 Source checkouts use explicit source compilation or a matching complete toolkit. Independent verification checks the exact input, declared edits, untouched bytes, other modules and identities. Release assets are built from a clean reviewed commit and retain that identity. Windows firmware jobs verify the published toolkit digest and source commit, then build from its extracted files on Python 3.12 and 3.13.
+
+### Current source (unreleased)
+
+Photo LUT (`photo-lut`) and the shared colour unit `z8colour` are unreleased, and no toolkit contains them. The current source has eleven units: `colour.bin` and `photo-lut.bin` join the nine of v0.4.0-rc.2, and `shared.bin` and `log.bin` have changed. `resources/compiled.json` records each unit's reviewed compiler: clang 19 for `shared`, `log`, `colour` and `photo-lut` (Debian 19.1.7; Ubuntu 24.04's 19.1.1 produces the same bytes) and Apple clang 21.0.0, as in v0.4.0-rc.2, for the other seven.
+
+clang 19 also reproduces `opengate`, `anamorphic`, `h265` and `quality`, but not the photo-tools units `precapture`, `pixelshift` and `pixelshift-af`. `--code-source source` compiles every unit with one compiler, so selections without `photo-tools` build directly with `--code-source source --compiler clang-19`. With `photo-tools`, assemble the prebuilt units first and use the default prebuilt mode, which still checks every unit against `resources/compiled.json`:
+
+```sh
+python tools/compile_units.py --output build/units --compiler clang-19 --units opengate anamorphic h265 log quality shared colour photo-lut
+cp build/units/*.bin resources/
+# These three units are byte-identical to the v0.4.0-rc.2 toolkit.
+for unit in precapture pixelshift pixelshift-af; do cp /path/to/NikonFirmwarePatch-v0.4.0-rc.2/resources/$unit.bin resources/; done
+```
+
+`tools/build_release.py` recompiles every unit with one compiler and requires identical compiler records, so it cannot yet package the current source.
